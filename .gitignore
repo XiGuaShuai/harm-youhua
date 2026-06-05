@@ -1,0 +1,27 @@
+# 依赖
+node_modules/
+oh_modules/
+
+# 构建产物
+**/build/
+dist/
+.hvigor/
+.cxx/
+
+# HarmonyOS / DevEco 本机文件
+local.properties
+.idea/
+.clangd
+.clang-format
+.clang-tidy
+.appanalyzer
+**/.test/
+
+# 后台运行时数据(服务端自动生成,含账号/会话/离线包,勿上传)
+admin/server/data/
+admin/server/bundles/
+
+# 日志 / 系统文件
+*.log
+.DS_Store
+Thumbs.db

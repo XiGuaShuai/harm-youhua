@@ -1,0 +1,46 @@
+/* 全局主题 —— 品牌色 + 基础排版 + 细节打磨 */
+:root {
+  --el-color-primary: #4f5bd5;
+  --el-color-primary-light-3: #7079e0;
+  --el-color-primary-light-5: #9ba2ea;
+  --el-color-primary-light-7: #c5c9f4;
+  --el-color-primary-light-8: #d8dbf8;
+  --el-color-primary-light-9: #ecedfc;
+  --el-color-primary-dark-2: #3f49b3;
+
+  --brand-1: #4f5bd5;
+  --brand-2: #7c3aed;
+  --brand-grad: linear-gradient(135deg, #4f5bd5 0%, #7c3aed 100%);
+
+  --app-bg: #f4f6fb;
+  --card-radius: 12px;
+}
+
+* { box-sizing: border-box; }
+html, body, #app { height: 100%; margin: 0; }
+body {
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Microsoft YaHei', 'PingFang SC', sans-serif;
+  background: var(--app-bg);
+  color: #1f2433;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* 细滚动条 */
+::-webkit-scrollbar { width: 8px; height: 8px; }
+::-webkit-scrollbar-thumb { background: #c7ccd9; border-radius: 8px; }
+::-webkit-scrollbar-thumb:hover { background: #aab1c4; }
+::-webkit-scrollbar-track { background: transparent; }
+
+/* 卡片更柔和 */
+.el-card { border: none; border-radius: var(--card-radius); box-shadow: 0 2px 12px rgba(31, 36, 51, .06); }
+.el-table { border-radius: 10px; overflow: hidden; }
+.el-button { font-weight: 500; }
+
+/* 通用页面块 */
+.page-card {
+  background: #fff;
+  border-radius: var(--card-radius);
+  box-shadow: 0 2px 12px rgba(31, 36, 51, .06);
+  padding: 20px;
+}
+.muted { color: #8a90a2; }
