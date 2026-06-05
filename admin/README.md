@@ -61,3 +61,12 @@ npm run dev
 - 配置存 `server/data/config.json`(纯文件,改完即生效,无需数据库)。
 - 离线包存 `server/bundles/<id>/`,通过 `/bundles` 静态托管。
 - 生产部署:`server` 用 pm2/systemd 常驻;`web` 跑 `npm run build` 出静态文件,用 nginx 托管并反代 `/api`、`/bundles` 到 server。
+
+## 更新日志
+
+### 2026-06-05 —— 后台升级为正式管理系统
+
+- **登录鉴权**:从「单一 token」改为**账号 + 密码**登录。密码用 scrypt 加盐哈希存 `data/users.json`(不存明文);登录后颁发会话 token 存 `data/sessions.json`,有效期 7 天,服务重启不掉线。
+- **修改密码**:新增 `POST /api/admin/password`,登录后在后台右上角用户菜单即可改。
+- **默认账号**:`admin` / `admin123`(可用环境变量 `ADMIN_USER` / `ADMIN_PASS` 改);原 `ADMIN_TOKEN` 降级为可选的「脚本主令牌」,默认不开启。
+- **界面美化**:全新分栏登录页;新增「概览」仪表盘(统计卡 + 应用速览 + 系统信息);侧边栏改深色带图标、当前项渐变高亮;顶栏加配置版本标签与用户头像下拉(改密 / 退出);统一品牌主色与卡片样式。
