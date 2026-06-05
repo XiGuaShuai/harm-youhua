@@ -1,17 +1,14 @@
 import { router } from '@kit.ArkUI';
 import { webPool } from '../webview/WebPreRender';
-
-interface WebApp {
-  name: string;
-  url: string;
-}
+import { RemoteApp } from '../config/RemoteConfig';
 
 @Entry
 @Component
 struct Index {
-  // 你的网页应用列表 —— 以后加新 App 只要在这里加一行
-  private apps: WebApp[] = [
-    { name: '印尼海关 e-CD', url: 'https://ecd.beacukai.go.id/' }
+  // 应用列表来自后台远程配置(EntryAbility 开机写入 AppStorage('apps'));拉到新配置会自动刷新。
+  // 这里的默认值仅作服务器首次不可达时的兜底。
+  @StorageLink('apps') apps: RemoteApp[] = [
+    { id: 'beacukai', name: '印尼海关 e-CD', url: 'https://ecd.beacukai.go.id/' }
   ];
 
   aboutToAppear(): void {
@@ -28,7 +25,7 @@ struct Index {
         .fontSize(22)
         .fontWeight(FontWeight.Bold)
         .margin({ top: 48, bottom: 16 })
-      ForEach(this.apps, (a: WebApp) => {
+      ForEach(this.apps, (a: RemoteApp) => {
         Button(a.name)
           .width('80%')
           .height(50)
@@ -38,7 +35,7 @@ struct Index {
             const p: Record<string, string> = { 'url': a.url };
             router.pushUrl({ url: 'pages/WebPage', params: p });
           })
-      }, (a: WebApp) => a.url)
+      }, (a: RemoteApp) => a.url)
     }
     .width('100%')
     .height('100%')

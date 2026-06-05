@@ -6,6 +6,7 @@ import { resourceManager } from '@kit.LocalizationKit';
 import { webview } from '@kit.ArkWeb';
 import { BusinessError } from '@kit.BasicServicesKit';
 import { hilog } from '@kit.PerformanceAnalysisKit';
+import { RemoteSettings } from '../config/RemoteConfig';
 
 const TAG: string = 'WebCache';
 const DOMAIN: number = 0x0001;
@@ -100,6 +101,13 @@ class WebCacheManager {
   private indexPath: string = '';
   private resMgr: resourceManager.ResourceManager | null = null;
 
+  // —— 以下三项默认值见文件顶部常量;接入后台后由 applySettings / setBlockHosts 远程注入覆盖 ——
+  private blockHosts: string[] = BLOCK_HOSTS;       // 过滤黑名单(可远程下发)
+  private diskCapBytes: number = DISK_CAP_BYTES;    // 沙箱缓存上限(可远程下发)
+  private docCheckMs: number = DOC_CHECK_MS;        // 主文档校验节流(可远程下发)
+  private codeCacheEnabled: boolean = true;         // 字节码缓存开关(可远程下发)
+  private bundleReadyHandler: ((origin: string) => void) | null = null; // 远程离线包下载完成回调
+
   private rawIndex: Map<string, RawEntry> = new Map();
   private diskIndex: Map<string, DiskEntry> = new Map();
   private inflight: Set<string> = new Set();
@@ -114,6 +122,7 @@ class WebCacheManager {
   private docUrls: Set<string> = new Set();                       // 走 SWR 的主文档 URL
   private docUpdateHandler: ((url: string) => void) | null = null; // 检测到主文档新版本时回调(页面刷新)
   private prefetchedOrigins: Set<string> = new Set();             // 已预取过全部 chunk 的站点
+  private loadedBundles: Set<string> = new Set();                 // 本次会话已拉过远程离线包的站点(按 origin)
 
   /** 启动时调用一次(EntryAbility.onCreate) */
   init(context: common.UIAbilityContext): void {
@@ -147,6 +156,42 @@ class WebCacheManager {
     this.docUpdateHandler = cb;
   }
 
+  /** 远程下发过滤黑名单(覆盖默认内置列表;传空则保留默认) */
+  setBlockHosts(hosts: string[]): void {
+    if (hosts && hosts.length > 0) {
+      this.blockHosts = hosts;
+      hilog.info(DOMAIN, TAG, 'blockHosts injected: %{public}d', hosts.length);
+    }
+  }
+
+  /** 远程下发全局设置(缓存上限 / 文档校验节流 / 字节码开关) */
+  applySettings(s: RemoteSettings): void {
+    if (!s) {
+      return;
+    }
+    if (typeof s.diskCapMB === 'number' && s.diskCapMB > 0) {
+      this.diskCapBytes = s.diskCapMB * 1024 * 1024;
+    }
+    if (typeof s.docCheckSec === 'number' && s.docCheckSec >= 0) {
+      this.docCheckMs = s.docCheckSec * 1000;
+    }
+    if (typeof s.bytecodeCache === 'boolean') {
+      this.codeCacheEnabled = s.bytecodeCache;
+    }
+    hilog.info(DOMAIN, TAG, 'settings applied cap=%{public}dB docCheck=%{public}dms codeCache=%{public}s',
+      this.diskCapBytes, this.docCheckMs, this.codeCacheEnabled ? 'on' : 'off');
+  }
+
+  /** 字节码缓存是否开启(WebShared 注入前查询) */
+  isCodeCacheEnabled(): boolean {
+    return this.codeCacheEnabled;
+  }
+
+  /** 注册"远程离线包某站下载完成"的回调(用于对已建节点补注入字节码) */
+  setBundleReadyHandler(cb: (origin: string) => void): void {
+    this.bundleReadyHandler = cb;
+  }
+
   /**
    * 构造某站内置 JS chunk 的离线资源表。配合 WebviewController.injectOfflineResources 注入,
    * WebView 会预生成**字节码缓存**,加载时跳过 JS 解析+编译 → 二级页面渲染更快。
@@ -154,36 +199,58 @@ class WebCacheManager {
    */
   buildOfflineResources(siteUrl: string): Array<webview.OfflineResourceMap> {
     const maps: Array<webview.OfflineResourceMap> = [];
-    const rm = this.resMgr;
-    if (!rm) {
-      return maps;
-    }
     const om = siteUrl.match(/^https?:\/\/[^\/]+/);
     const origin: string = om ? om[0] : '';
-    this.rawIndex.forEach((e: RawEntry) => {
+    if (origin.length === 0) {
+      return maps;
+    }
+    const headersOf = (etag: string): Array<webview.WebHeader> => {
+      return [
+        { headerKey: 'Content-Type', headerValue: 'application/javascript' },
+        { headerKey: 'E-Tag', headerValue: etag }
+      ];
+    };
+
+    // ① 优先用沙箱里(从服务器下载的)JS —— 字节码资源不再依赖打进 HAP 的内置包
+    this.diskIndex.forEach((e: DiskEntry) => {
       if (e.url.indexOf(origin) === 0 && e.mime.indexOf('javascript') >= 0) {
-        try {
-          const raw: Uint8Array = rm.getRawFileContentSync(RAW_DIR + '/' + e.file);
-          if (raw.length > 0) {
-            const u8: Uint8Array = new Uint8Array(raw.length); // 拷成独立 buffer(API 不收内存映射的共享 buffer)
-            u8.set(raw);
-            const headers: Array<webview.WebHeader> = [
-              { headerKey: 'Content-Type', headerValue: 'application/javascript' },
-              { headerKey: 'E-Tag', headerValue: e.file }
-            ];
-            const map: webview.OfflineResourceMap = {
-              urlList: [e.url],
-              resource: u8,
-              responseHeaders: headers,
-              type: webview.OfflineResourceType.CLASSIC_JS
-            };
-            maps.push(map);
-          }
-        } catch (err) {
+        const buf: ArrayBuffer | null = this.readFile(this.cacheDir + '/' + e.file);
+        if (buf && buf.byteLength > 0) {
+          const map: webview.OfflineResourceMap = {
+            urlList: [e.url],
+            resource: new Uint8Array(buf),
+            responseHeaders: headersOf(e.file),
+            type: webview.OfflineResourceType.CLASSIC_JS
+          };
+          maps.push(map);
         }
       }
     });
-    hilog.info(DOMAIN, TAG, 'offline resources(JS) built: %{public}d', maps.length);
+
+    // ② 沙箱还没有(如离线包未下完)→ 回退打进 HAP 的内置包(若有,纯兜底)
+    const rm = this.resMgr;
+    if (maps.length === 0 && rm) {
+      this.rawIndex.forEach((e: RawEntry) => {
+        if (e.url.indexOf(origin) === 0 && e.mime.indexOf('javascript') >= 0) {
+          try {
+            const raw: Uint8Array = rm.getRawFileContentSync(RAW_DIR + '/' + e.file);
+            if (raw.length > 0) {
+              const u8: Uint8Array = new Uint8Array(raw.length); // 拷成独立 buffer(API 不收内存映射的共享 buffer)
+              u8.set(raw);
+              const map: webview.OfflineResourceMap = {
+                urlList: [e.url],
+                resource: u8,
+                responseHeaders: headersOf(e.file),
+                type: webview.OfflineResourceType.CLASSIC_JS
+              };
+              maps.push(map);
+            }
+          } catch (err) {
+          }
+        }
+      });
+    }
+    hilog.info(DOMAIN, TAG, 'offline resources(JS) built: %{public}d (disk-first)', maps.length);
     return maps;
   }
 
@@ -308,9 +375,9 @@ class WebCacheManager {
           this.hitDisk++;
           // 后台做版本校验(节流 60s):重拉 HTML 算指纹,变了=站点更新 → 覆盖缓存并通知页面刷新
           const age: number = Date.now() - (doc.storedAt > 0 ? doc.storedAt : 0);
-          if (age > DOC_CHECK_MS) {
+          if (age > this.docCheckMs) {
             hilog.info(DOMAIN, TAG, 'doc HIT + version check %{public}d B', doc.size);
-            this.fetchAndStore(url, 'text/html', true);
+            this.fetchAndStore(url, '', 'text/html', true);
           } else {
             hilog.info(DOMAIN, TAG, 'doc HIT (checked recently) %{public}d B', doc.size);
           }
@@ -327,7 +394,7 @@ class WebCacheManager {
           const dbuf: ArrayBuffer = u8.buffer.slice(u8.byteOffset, u8.byteOffset + u8.byteLength);
           this.hitRaw++;
           hilog.info(DOMAIN, TAG, 'doc HIT (bundle) %{public}d B', dbuf.byteLength);
-          this.fetchAndStore(url, 'text/html', false);
+          this.fetchAndStore(url, '', 'text/html', false);
           return this.buildResponse(dbuf, 'text/html', false);
         } catch (e) {
           // 落到网络
@@ -336,7 +403,7 @@ class WebCacheManager {
       // 都没有:本次透传走网络,同时后台抓存,供下次秒出首屏
       this.miss++;
       hilog.info(DOMAIN, TAG, 'doc MISS -> network + background store');
-      this.fetchAndStore(url, 'text/html', false);
+      this.fetchAndStore(url, '', 'text/html', false);
       return null;
     }
 
@@ -423,8 +490,8 @@ class WebCacheManager {
 
   /** 是否命中黑名单(会挂死的外部请求) */
   private isBlocked(url: string): boolean {
-    for (let i = 0; i < BLOCK_HOSTS.length; i++) {
-      if (url.indexOf(BLOCK_HOSTS[i]) >= 0) {
+    for (let i = 0; i < this.blockHosts.length; i++) {
+      if (url.indexOf(this.blockHosts[i]) >= 0) {
         return true;
       }
     }
@@ -487,22 +554,25 @@ class WebCacheManager {
   }
 
   private download(url: string): void {
-    this.fetchAndStore(url, '', false);
+    this.fetchAndStore(url, '', '', false);
   }
 
   /**
-   * 抓取并写入沙箱缓存。
-   * @param forceMime 非空则强制用该 mime(主文档用 text/html)
+   * 抓取并写入沙箱缓存。来源与缓存 key 分离,使"从后台服务器下载、按原站 URL 缓存"成为可能。
+   * @param cacheKey  缓存键(= 原站 URL;拦截器按它命中)
+   * @param sourceUrl 实际下载地址(空则 = cacheKey;远程离线包时 = 后台 /bundles/<id>/<file>)
+   * @param forceMime 非空则强制用该 mime(主文档用 text/html;离线包用 manifest 里的 mime)
    * @param overwrite 为 true 时即使已缓存也重新抓(SWR revalidate);否则已缓存则跳过
    */
-  private fetchAndStore(url: string, forceMime: string, overwrite: boolean): void {
-    if (this.inflight.has(url)) {
+  private fetchAndStore(cacheKey: string, sourceUrl: string, forceMime: string, overwrite: boolean): void {
+    const src: string = sourceUrl && sourceUrl.length > 0 ? sourceUrl : cacheKey;
+    if (this.inflight.has(cacheKey)) {
       return;
     }
-    if (!overwrite && (this.diskIndex.has(url) || this.rawIndex.has(url))) {
+    if (!overwrite && (this.diskIndex.has(cacheKey) || this.rawIndex.has(cacheKey))) {
       return; // 已在沙箱或内置包里,不重复下(预取全量 chunk 时靠这个跳过已有的)
     }
-    this.inflight.add(url);
+    this.inflight.add(cacheKey);
     const client = http.createHttp();
     const reqHeader: Record<string, string> = {
       'Accept': 'text/html,image/avif,image/webp,application/javascript,text/css,*/*',
@@ -515,27 +585,27 @@ class WebCacheManager {
       connectTimeout: 15000,
       readTimeout: 30000
     };
-    client.request(url, options, (err: BusinessError, data: http.HttpResponse) => {
-      this.inflight.delete(url);
+    client.request(src, options, (err: BusinessError, data: http.HttpResponse) => {
+      this.inflight.delete(cacheKey);
       try {
         if (!err && data && data.responseCode === 200 && data.result instanceof ArrayBuffer) {
           const body: ArrayBuffer = data.result as ArrayBuffer;
-          const mime: string = forceMime && forceMime.length > 0 ? forceMime : this.pickMime(url, data.header);
+          const mime: string = forceMime && forceMime.length > 0 ? forceMime : this.pickMime(cacheKey, data.header);
           const newVersion: string = this.fingerprint(body);
-          const old: DiskEntry | undefined = this.diskIndex.get(url);
-          const isDoc: boolean = this.docUrls.has(url);
+          const old: DiskEntry | undefined = this.diskIndex.get(cacheKey);
+          const isDoc: boolean = this.docUrls.has(cacheKey);
           const changed: boolean = old !== undefined && old.version.length > 0 && old.version !== newVersion;
 
-          const file: string = this.fileNameFor(url);
+          const file: string = this.fileNameFor(cacheKey);
           this.writeBinary(this.cacheDir + '/' + file, body);
           if (old) {
             this.totalBytes -= old.size; // 覆盖:先扣旧体积
           }
           const now: number = Date.now();
           const entry: DiskEntry = {
-            url: url, file: file, mime: mime, size: body.byteLength, atime: now, storedAt: now, version: newVersion
+            url: cacheKey, file: file, mime: mime, size: body.byteLength, atime: now, storedAt: now, version: newVersion
           };
-          this.diskIndex.set(url, entry);
+          this.diskIndex.set(cacheKey, entry);
           this.totalBytes += body.byteLength;
           this.evictIfNeeded();
           this.saveDiskIndex();
@@ -543,9 +613,9 @@ class WebCacheManager {
 
           // 主文档版本变了 = 站点更新 → 通知(池)刷新对应节点,立即用上新版
           if (isDoc && changed) {
-            hilog.info(DOMAIN, TAG, 'doc VERSION CHANGED %{public}s', url);
+            hilog.info(DOMAIN, TAG, 'doc VERSION CHANGED %{public}s', cacheKey);
             if (this.docUpdateHandler) {
-              this.docUpdateHandler(url);
+              this.docUpdateHandler(cacheKey);
             }
           }
         }
@@ -557,9 +627,81 @@ class WebCacheManager {
     });
   }
 
+  /**
+   * 远程离线包:从后台 manifest 把该站资源下载进沙箱(缓存 key = 原站 URL)。
+   * 这是"App 缓存去服务器下载"的核心入口,替代打进 HAP 的内置包。
+   * @param siteUrl     站点任意 URL(取 origin,完成后通知补注入字节码)
+   * @param manifestUrl 后台 manifest 全地址(如 http://server:8787/bundles/<id>/manifest.json)
+   */
+  async loadRemoteBundle(siteUrl: string, manifestUrl: string): Promise<void> {
+    const om = siteUrl.match(/^https?:\/\/[^\/]+/);
+    const origin: string = om ? om[0] : '';
+    if (origin.length === 0 || manifestUrl.length === 0) {
+      return;
+    }
+    if (this.loadedBundles.has(origin)) {
+      return; // 本次会话已拉过该站离线包,不重复拉 manifest
+    }
+    this.loadedBundles.add(origin);
+    const base: string = manifestUrl.replace(/\/manifest\.json.*$/, ''); // 后台资源目录
+    const txt: string = await this.httpGetText(manifestUrl);
+    if (txt.length === 0) {
+      hilog.warn(DOMAIN, TAG, 'remote bundle manifest unreachable: %{public}s', manifestUrl);
+      return;
+    }
+    let arr: RawEntry[] = [];
+    try {
+      arr = JSON.parse(txt) as RawEntry[];
+    } catch (e) {
+      const er = e as BusinessError;
+      hilog.error(DOMAIN, TAG, 'remote manifest parse failed: %{public}s', er.message);
+      return;
+    }
+    let queued: number = 0;
+    for (let i = 0; i < arr.length; i++) {
+      const e: RawEntry = arr[i];
+      if (!e || !e.url || !e.file) {
+        continue;
+      }
+      // 来源 = 后台文件,缓存 key = 原站 URL(拦截器按原站 URL 命中)
+      this.fetchAndStore(e.url, base + '/' + e.file, e.mime, false);
+      queued++;
+    }
+    hilog.info(DOMAIN, TAG, 'remote bundle queued %{public}d from %{public}s', queued, manifestUrl);
+    // 下载是异步的;稍后通知对已建节点补注入字节码(此时多数资源已落盘)
+    if (this.bundleReadyHandler) {
+      const handler = this.bundleReadyHandler;
+      setTimeout(() => {
+        handler(origin);
+      }, 5000);
+    }
+  }
+
+  private httpGetText(url: string): Promise<string> {
+    return new Promise<string>((resolve) => {
+      const client = http.createHttp();
+      const header: Record<string, string> = { 'Accept': 'application/json,text/plain,*/*' };
+      const options: http.HttpRequestOptions = {
+        method: http.RequestMethod.GET,
+        expectDataType: http.HttpDataType.STRING,
+        header: header,
+        connectTimeout: 15000,
+        readTimeout: 30000
+      };
+      client.request(url, options, (err: BusinessError, data: http.HttpResponse) => {
+        let out: string = '';
+        if (!err && data && data.responseCode === 200 && typeof data.result === 'string') {
+          out = data.result as string;
+        }
+        client.destroy();
+        resolve(out);
+      });
+    });
+  }
+
   /** 超过容量上限时按 LRU(最久未访问)逐个淘汰 */
   private evictIfNeeded(): void {
-    while (this.totalBytes > DISK_CAP_BYTES && this.diskIndex.size > 0) {
+    while (this.totalBytes > this.diskCapBytes && this.diskIndex.size > 0) {
       let oldestUrl: string = '';
       let oldestAt: number = Number.MAX_SAFE_INTEGER;
       this.diskIndex.forEach((v: DiskEntry, k: string) => {

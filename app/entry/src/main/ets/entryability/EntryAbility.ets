@@ -4,6 +4,7 @@ import { window } from '@kit.ArkUI';
 import { webview } from '@kit.ArkWeb';
 import { BusinessError } from '@kit.BasicServicesKit';
 import { webCache } from '../cache/WebCacheManager';
+import { remoteConfig } from '../config/RemoteConfig';
 
 const DOMAIN = 0x0000;
 
@@ -32,6 +33,19 @@ export default class EntryAbility extends UIAbility {
     // 拦截 _next/static 等不可变资源,二次启动直接走本地,绕过 No-Store 的跨境慢链路。
     // 注意:每个网页的"预连接 + 主文档 SWR + 离屏预渲染"现在统一在 WebPool.prewarm() 里按 URL 处理。
     webCache.init(this.context);
+
+    // —— 接入后台远程配置:只拉「配置」(应用列表/黑名单/设置);离线包不在这里下,改为打开网页应用时按需下载 ——
+    // ① 同步:先用上次缓存(或内置兜底),不阻塞首屏
+    remoteConfig.load(this.context);
+    webCache.setBlockHosts(remoteConfig.getBlockHosts());
+    webCache.applySettings(remoteConfig.getSettings());
+    // ② 异步:拉服务器最新配置,成功后注入黑名单/设置(离线包由 WebPool.obtain 在打开某 app 时按需拉)
+    remoteConfig.refresh().then((ok: boolean) => {
+      if (ok) {
+        webCache.setBlockHosts(remoteConfig.getBlockHosts());
+        webCache.applySettings(remoteConfig.getSettings());
+      }
+    });
 
     hilog.info(DOMAIN, 'testTag', '%{public}s', 'Ability onCreate');
   }

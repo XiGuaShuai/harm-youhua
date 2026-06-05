@@ -194,7 +194,18 @@ app.use(cors());
 app.use(express.json({ limit: '4mb' }));
 
 // 鸿蒙 App 开机拉取(公开)
-app.get('/api/config', (req, res) => res.json(loadConfig()));
+// 对启用离线包且服务端已打包的 app,附上 manifestUrl —— App 据此去服务器下载离线资源(替代打进 HAP 的内置包)
+app.get('/api/config', (req, res) => {
+  const c = loadConfig();
+  const apps = (c.apps || []).map((a) => {
+    const hasBundle = fs.existsSync(path.join(BUNDLES_DIR, a.id, 'manifest.json'));
+    if (a.bundle && hasBundle) {
+      return Object.assign({}, a, { manifestUrl: `/bundles/${a.id}/manifest.json` });
+    }
+    return a;
+  });
+  res.json(Object.assign({}, c, { apps }));
+});
 
 // 离线包静态托管:App 从 /bundles/<id>/manifest.json 拉取
 app.use('/bundles', express.static(BUNDLES_DIR));
