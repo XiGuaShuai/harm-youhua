@@ -1,0 +1,9 @@
+{
+  "name": "webaccel",
+  "version": "1.0.0",
+  "description": "网页应用加速 SDK:离线缓存 / 请求拦截 / 字节码 / 离屏预渲染 / 远程配置。元服务(Atomic Service)可依赖。",
+  "main": "Index.ets",
+  "author": "",
+  "license": "Apache-2.0",
+  "dependencies": {}
+}

@@ -6,7 +6,7 @@ import { resourceManager } from '@kit.LocalizationKit';
 import { webview } from '@kit.ArkWeb';
 import { BusinessError } from '@kit.BasicServicesKit';
 import { hilog } from '@kit.PerformanceAnalysisKit';
-import { RemoteSettings } from '../config/RemoteConfig';
+import { RemoteSettings } from './RemoteConfig';
 
 const TAG: string = 'WebCache';
 const DOMAIN: number = 0x0001;
@@ -86,6 +86,19 @@ export interface CacheStats {
   bytes: number;   // 沙箱已用字节
 }
 
+/** 某站离线包下载进度(对外只读) */
+export interface BundleProgress {
+  total: number; // 该站离线包资源总数
+  done: number;  // 已就绪(已缓存或刚下完)数
+}
+
+/** 内部进度记录:expected 为"还没下、待完成"的原站 URL 集合 */
+interface BundleProgressEntry {
+  total: number;
+  done: number;
+  expected: Set<string>;
+}
+
 /**
  * Web 离线缓存管理器(单例)。两层只读/可写缓存:
  *
@@ -105,8 +118,6 @@ class WebCacheManager {
   private blockHosts: string[] = BLOCK_HOSTS;       // 过滤黑名单(可远程下发)
   private diskCapBytes: number = DISK_CAP_BYTES;    // 沙箱缓存上限(可远程下发)
   private docCheckMs: number = DOC_CHECK_MS;        // 主文档校验节流(可远程下发)
-  private codeCacheEnabled: boolean = true;         // 字节码缓存开关(可远程下发)
-  private bundleReadyHandler: ((origin: string) => void) | null = null; // 远程离线包下载完成回调
 
   private rawIndex: Map<string, RawEntry> = new Map();
   private diskIndex: Map<string, DiskEntry> = new Map();
@@ -123,6 +134,7 @@ class WebCacheManager {
   private docUpdateHandler: ((url: string) => void) | null = null; // 检测到主文档新版本时回调(页面刷新)
   private prefetchedOrigins: Set<string> = new Set();             // 已预取过全部 chunk 的站点
   private loadedBundles: Set<string> = new Set();                 // 本次会话已拉过远程离线包的站点(按 origin)
+  private bundleProgress: Map<string, BundleProgressEntry> = new Map(); // 各站离线包下载进度(按 origin)
 
   /** 启动时调用一次(EntryAbility.onCreate) */
   init(context: common.UIAbilityContext): void {
@@ -164,7 +176,7 @@ class WebCacheManager {
     }
   }
 
-  /** 远程下发全局设置(缓存上限 / 文档校验节流 / 字节码开关) */
+  /** 远程下发全局设置(缓存上限 / 文档校验节流)。bytecodeCache 在元服务不支持,已忽略 */
   applySettings(s: RemoteSettings): void {
     if (!s) {
       return;
@@ -175,83 +187,27 @@ class WebCacheManager {
     if (typeof s.docCheckSec === 'number' && s.docCheckSec >= 0) {
       this.docCheckMs = s.docCheckSec * 1000;
     }
-    if (typeof s.bytecodeCache === 'boolean') {
-      this.codeCacheEnabled = s.bytecodeCache;
+    hilog.info(DOMAIN, TAG, 'settings applied cap=%{public}dB docCheck=%{public}dms',
+      this.diskCapBytes, this.docCheckMs);
+  }
+
+  /** 查询某站离线包下载进度(无则返回 null) */
+  getBundleProgress(origin: string): BundleProgress | null {
+    const p: BundleProgressEntry | undefined = this.bundleProgress.get(origin);
+    if (!p) {
+      return null;
     }
-    hilog.info(DOMAIN, TAG, 'settings applied cap=%{public}dB docCheck=%{public}dms codeCache=%{public}s',
-      this.diskCapBytes, this.docCheckMs, this.codeCacheEnabled ? 'on' : 'off');
+    return { total: p.total, done: p.done };
   }
 
-  /** 字节码缓存是否开启(WebShared 注入前查询) */
-  isCodeCacheEnabled(): boolean {
-    return this.codeCacheEnabled;
-  }
-
-  /** 注册"远程离线包某站下载完成"的回调(用于对已建节点补注入字节码) */
-  setBundleReadyHandler(cb: (origin: string) => void): void {
-    this.bundleReadyHandler = cb;
-  }
-
-  /**
-   * 构造某站内置 JS chunk 的离线资源表。配合 WebviewController.injectOfflineResources 注入,
-   * WebView 会预生成**字节码缓存**,加载时跳过 JS 解析+编译 → 二级页面渲染更快。
-   * @param siteUrl 该站任意 URL(用于按 origin 过滤,避免把别的站的 JS 注进来)
-   */
-  buildOfflineResources(siteUrl: string): Array<webview.OfflineResourceMap> {
-    const maps: Array<webview.OfflineResourceMap> = [];
-    const om = siteUrl.match(/^https?:\/\/[^\/]+/);
-    const origin: string = om ? om[0] : '';
-    if (origin.length === 0) {
-      return maps;
-    }
-    const headersOf = (etag: string): Array<webview.WebHeader> => {
-      return [
-        { headerKey: 'Content-Type', headerValue: 'application/javascript' },
-        { headerKey: 'E-Tag', headerValue: etag }
-      ];
-    };
-
-    // ① 优先用沙箱里(从服务器下载的)JS —— 字节码资源不再依赖打进 HAP 的内置包
-    this.diskIndex.forEach((e: DiskEntry) => {
-      if (e.url.indexOf(origin) === 0 && e.mime.indexOf('javascript') >= 0) {
-        const buf: ArrayBuffer | null = this.readFile(this.cacheDir + '/' + e.file);
-        if (buf && buf.byteLength > 0) {
-          const map: webview.OfflineResourceMap = {
-            urlList: [e.url],
-            resource: new Uint8Array(buf),
-            responseHeaders: headersOf(e.file),
-            type: webview.OfflineResourceType.CLASSIC_JS
-          };
-          maps.push(map);
-        }
+  /** 某资源下完后:若属于某站离线包,推进其完成计数 */
+  private markBundleResource(cacheKey: string): void {
+    this.bundleProgress.forEach((p: BundleProgressEntry) => {
+      if (p.expected.has(cacheKey)) {
+        p.expected.delete(cacheKey);
+        p.done++;
       }
     });
-
-    // ② 沙箱还没有(如离线包未下完)→ 回退打进 HAP 的内置包(若有,纯兜底)
-    const rm = this.resMgr;
-    if (maps.length === 0 && rm) {
-      this.rawIndex.forEach((e: RawEntry) => {
-        if (e.url.indexOf(origin) === 0 && e.mime.indexOf('javascript') >= 0) {
-          try {
-            const raw: Uint8Array = rm.getRawFileContentSync(RAW_DIR + '/' + e.file);
-            if (raw.length > 0) {
-              const u8: Uint8Array = new Uint8Array(raw.length); // 拷成独立 buffer(API 不收内存映射的共享 buffer)
-              u8.set(raw);
-              const map: webview.OfflineResourceMap = {
-                urlList: [e.url],
-                resource: u8,
-                responseHeaders: headersOf(e.file),
-                type: webview.OfflineResourceType.CLASSIC_JS
-              };
-              maps.push(map);
-            }
-          } catch (err) {
-          }
-        }
-      });
-    }
-    hilog.info(DOMAIN, TAG, 'offline resources(JS) built: %{public}d (disk-first)', maps.length);
-    return maps;
   }
 
   /**
@@ -609,6 +565,7 @@ class WebCacheManager {
           this.totalBytes += body.byteLength;
           this.evictIfNeeded();
           this.saveDiskIndex();
+          this.markBundleResource(cacheKey); // 若属于某站离线包,推进其下载进度
           hilog.info(DOMAIN, TAG, 'cached %{public}s %{public}d B', mime, body.byteLength);
 
           // 主文档版本变了 = 站点更新 → 通知(池)刷新对应节点,立即用上新版
@@ -657,24 +614,27 @@ class WebCacheManager {
       hilog.error(DOMAIN, TAG, 'remote manifest parse failed: %{public}s', er.message);
       return;
     }
-    let queued: number = 0;
+    let total: number = 0;
+    let done: number = 0;
+    const expected: Set<string> = new Set();
     for (let i = 0; i < arr.length; i++) {
       const e: RawEntry = arr[i];
       if (!e || !e.url || !e.file) {
         continue;
       }
-      // 来源 = 后台文件,缓存 key = 原站 URL(拦截器按原站 URL 命中)
-      this.fetchAndStore(e.url, base + '/' + e.file, e.mime, false);
-      queued++;
+      total++;
+      if (this.diskIndex.has(e.url) || this.rawIndex.has(e.url)) {
+        done++; // 已在缓存里,算已完成
+      } else {
+        expected.add(e.url);
+        // 来源 = 后台文件,缓存 key = 原站 URL(拦截器按原站 URL 命中)
+        this.fetchAndStore(e.url, base + '/' + e.file, e.mime, false);
+      }
     }
-    hilog.info(DOMAIN, TAG, 'remote bundle queued %{public}d from %{public}s', queued, manifestUrl);
-    // 下载是异步的;稍后通知对已建节点补注入字节码(此时多数资源已落盘)
-    if (this.bundleReadyHandler) {
-      const handler = this.bundleReadyHandler;
-      setTimeout(() => {
-        handler(origin);
-      }, 5000);
-    }
+    const prog: BundleProgressEntry = { total: total, done: done, expected: expected };
+    this.bundleProgress.set(origin, prog);
+    hilog.info(DOMAIN, TAG, 'remote bundle: total %{public}d, to download %{public}d, from %{public}s',
+      total, total - done, manifestUrl);
   }
 
   private httpGetText(url: string): Promise<string> {

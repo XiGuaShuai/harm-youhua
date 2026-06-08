@@ -2,9 +2,9 @@ import { BuilderNode, FrameNode, NodeController, UIContext, RenderOptions, Size,
 import { webview } from '@kit.ArkWeb';
 import { BusinessError } from '@kit.BasicServicesKit';
 import { hilog } from '@kit.PerformanceAnalysisKit';
-import { WebViewModel, buildWeb, injectOffline } from './WebShared';
-import { webCache } from '../cache/WebCacheManager';
-import { remoteConfig, CONFIG_SERVER, RemoteApp } from '../config/RemoteConfig';
+import { WebViewModel, buildWeb } from './WebShared';
+import { webCache } from './WebCacheManager';
+import { remoteConfig, RemoteApp } from './RemoteConfig';
 
 const TAG: string = 'WebPreRender';
 const DOMAIN: number = 0x0001;
@@ -70,26 +70,8 @@ export class WebPool {
       webCache.setDocUpdateHandler((url: string) => {
         this.onDocUpdated(url);
       });
-      // 远程离线包下载完 → 对该站已建节点补注入字节码(下次加载/二级导航即用上)
-      webCache.setBundleReadyHandler((origin: string) => {
-        this.reinjectOrigin(origin);
-      });
       this.handlerSet = true;
     }
-  }
-
-  /** 远程离线包就绪后,对该 origin 的已建节点补注入字节码资源 */
-  private reinjectOrigin(origin: string): void {
-    this.nodes.forEach((node: WebNode, url: string) => {
-      if (url.indexOf(origin) === 0) {
-        try {
-          injectOffline(node.model.controller, url);
-          hilog.info(DOMAIN, TAG, 'reinjected offline JS for %{public}s', url);
-        } catch (e) {
-          // controller 尚未 attach,忽略
-        }
-      }
-    });
   }
 
   /** 主文档版本变化时刷新对应节点。只在"刚加载完不久"才刷,避免打断用户操作(填表) */
@@ -141,19 +123,47 @@ export class WebPool {
     return node;
   }
 
-  /** 在远程配置里找到该 url 对应的 app,若启用离线包则从后台下载(manifestUrl 没下发就按 id 兜底拼) */
+  /**
+   * 在远程配置里找到该 url 对应的 app,若启用离线包则从后台下载(manifestUrl 没下发就按 id 兜底拼)。
+   * 未配置后台地址(纯本地/直连模式)时跳过——元服务保持包体精简、缓存全走运行时沙箱。
+   */
   private loadBundleFor(url: string): void {
+    const server: string = remoteConfig.getServer();
+    if (server.length === 0) {
+      return; // 没有后台:不下离线包,靠运行时拦截缓存自愈
+    }
     const apps: RemoteApp[] = remoteConfig.getApps();
     for (let i = 0; i < apps.length; i++) {
       const a: RemoteApp = apps[i];
       if (a.url === url && a.bundle === true) {
-        const path: string = (a.manifestUrl !== undefined && a.manifestUrl.length > 0)
+        // manifestUrl 可能是后台下发的全地址,也可能是相对路径;为空则按 id 兜底拼
+        let murl: string = (a.manifestUrl !== undefined && a.manifestUrl.length > 0)
           ? a.manifestUrl
           : ('/bundles/' + a.id + '/manifest.json');
-        webCache.loadRemoteBundle(a.url, CONFIG_SERVER + path);
+        if (murl.indexOf('http://') !== 0 && murl.indexOf('https://') !== 0) {
+          murl = server + (murl.charAt(0) === '/' ? murl : ('/' + murl));
+        }
+        webCache.loadRemoteBundle(a.url, murl);
         break;
       }
     }
+  }
+
+  /** 网页能后退则后退,返回是否消费了返回事件(供宿主页 onBackPress 转调) */
+  goBack(url: string): boolean {
+    const node: WebNode | undefined = this.nodes.get(url);
+    if (node) {
+      try {
+        const c = node.model.controller;
+        if (c.accessBackward()) {
+          c.backward();
+          return true;
+        }
+      } catch (e) {
+        // controller 尚未 attach
+      }
+    }
+    return false;
   }
 
   release(url: string): void {

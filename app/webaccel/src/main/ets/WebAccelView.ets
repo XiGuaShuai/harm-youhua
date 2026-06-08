@@ -1,0 +1,123 @@
+import { webPool, WebNode } from './core/WebPreRender';
+import { webCache, BundleProgress } from './core/WebCacheManager';
+
+/**
+ * 开箱即用的加速网页展示组件。内部:取离屏预渲染好的节点 → NodeContainer 挂载;
+ * 首屏前显示白屏占位,离线包下载时显示底部进度条(下完自动消失)。
+ *
+ * 用法(宿主页只需一行):
+ *   WebAccelView({ url: this.url })
+ *
+ * 后退处理放在宿主页(NodeController 节点在本组件内):
+ *   onBackPress(): boolean { return WebAccel.goBack(this.url); }
+ */
+@Component
+export struct WebAccelView {
+  /** 要展示的网页 URL(应已在 launcher 阶段 WebAccel.prewarm 过,未预热则即时创建退化为普通加载) */
+  url: string = '';
+  /** 是否显示底部「离线加速准备中 x/y」进度条 */
+  @Prop showBundleProgress: boolean = true;
+  /** 是否在首屏绘制前显示白屏占位(预渲染已完成时不会出现) */
+  @Prop showPlaceholder: boolean = true;
+  /** 占位背景色 */
+  @Prop placeholderColor: string = '#F0F2F5';
+
+  private node: WebNode | null = null;
+  private timerId: number = -1;
+  private origin: string = '';
+  @State firstPaint: boolean = false;
+  @State bundleTotal: number = 0;
+  @State bundleDone: number = 0;
+
+  aboutToAppear(): void {
+    const om = this.url.match(/^https?:\/\/[^\/]+/);
+    this.origin = om ? om[0] : '';
+    this.node = webPool.obtain(this.url);
+    // 同步初始状态:若预渲染已完成,这里直接就是已绘制,占位立刻消失
+    this.firstPaint = this.node.model.firstPaint;
+    this.node.model.notify = () => {
+      if (this.node) {
+        this.firstPaint = this.node.model.firstPaint;
+      }
+    };
+    if (this.showBundleProgress) {
+      this.timerId = setInterval(() => {
+        const bp: BundleProgress | null = webCache.getBundleProgress(this.origin);
+        if (bp) {
+          this.bundleTotal = bp.total;
+          this.bundleDone = bp.done;
+        }
+      }, 1000);
+    }
+  }
+
+  aboutToDisappear(): void {
+    if (this.node) {
+      this.node.model.notify = null;
+    }
+    if (this.timerId >= 0) {
+      clearInterval(this.timerId);
+      this.timerId = -1;
+    }
+  }
+
+  // 离线加速进度条:底部居中,下完自动消失;不拦截网页交互
+  @Builder
+  BundleBadge() {
+    Column() {
+      Row() {
+        LoadingProgress()
+          .width(14)
+          .height(14)
+          .color(Color.White)
+        Text(`离线加速准备中 ${this.bundleDone}/${this.bundleTotal}`)
+          .fontSize(11)
+          .fontColor(Color.White)
+          .margin({ left: 6 })
+      }
+      .padding({ left: 14, right: 14, top: 7, bottom: 7 })
+      .backgroundColor('rgba(10,89,247,0.88)')
+      .borderRadius(16)
+    }
+    .width('100%')
+    .height('100%')
+    .justifyContent(FlexAlign.End)
+    .alignItems(HorizontalAlign.Center)
+    .padding({ bottom: 40 })
+    .hitTestBehavior(HitTestMode.None)
+  }
+
+  build() {
+    Stack({ alignContent: Alignment.TopEnd }) {
+      if (this.node) {
+        NodeContainer(this.node)
+          .width('100%')
+          .height('100%')
+      }
+
+      // 白屏期原生占位:预渲染已完成时不会出现
+      if (this.showPlaceholder && !this.firstPaint) {
+        Column({ space: 14 }) {
+          LoadingProgress()
+            .width(44)
+            .height(44)
+            .color('#0A59F7')
+          Text('正在加载…')
+            .fontSize(13)
+            .fontColor('#888888')
+        }
+        .width('100%')
+        .height('100%')
+        .justifyContent(FlexAlign.Center)
+        .backgroundColor(this.placeholderColor)
+      }
+
+      // 离线包正在下载时显示进度,下完(done===total)自动消失
+      if (this.showBundleProgress && this.bundleTotal > 0 && this.bundleDone < this.bundleTotal) {
+        this.BundleBadge()
+      }
+    }
+    .width('100%')
+    .height('100%')
+  }
+}

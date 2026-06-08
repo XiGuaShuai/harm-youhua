@@ -1,11 +1,11 @@
 import { webview } from '@kit.ArkWeb';
 import { hilog } from '@kit.PerformanceAnalysisKit';
-import { BusinessError } from '@kit.BasicServicesKit';
-import { webCache } from '../cache/WebCacheManager';
+import { webCache } from './WebCacheManager';
 
 const TAG: string = 'WebPerf';
 const DOMAIN: number = 0x0001;
-const ENABLE_CODE_CACHE: boolean = true; // 字节码注入(实测能把二级页面渲染提前数秒)
+// 注:字节码注入(injectOfflineResources)在元服务中被平台禁用,已移除;
+// 其余加速层(离线缓存拦截 / 主文档 SWR / 离屏预渲染 / chunk 预取 / 黑名单短路)照常工作。
 
 /**
  * 一个网页实例的状态 + 配置。在离屏预渲染和页面展示之间共享同一个对象,
@@ -64,33 +64,6 @@ export class WebViewModel {
 }
 
 /**
- * 注入某站离线 JS 并生成字节码缓存。
- * 数据源:沙箱里(从服务器下载的)JS,兜底打进 HAP 的内置包。
- * 首次 onControllerAttached 调用;远程离线包下载完后由 WebPool 补调用一次。
- */
-export function injectOffline(controller: webview.WebviewController, url: string): void {
-  if (!ENABLE_CODE_CACHE || !webCache.isCodeCacheEnabled()) {
-    return;
-  }
-  try {
-    const maps = webCache.buildOfflineResources(url);
-    const BATCH: number = 30; // injectOfflineResources 单次上限 30 个
-    let injected: number = 0;
-    for (let i = 0; i < maps.length; i += BATCH) {
-      const batch: Array<webview.OfflineResourceMap> = maps.slice(i, i + BATCH);
-      controller.injectOfflineResources(batch);
-      injected += batch.length;
-    }
-    if (injected > 0) {
-      hilog.info(DOMAIN, TAG, 'injected %{public}d offline JS (code cache)', injected);
-    }
-  } catch (e) {
-    const er = e as BusinessError;
-    hilog.error(DOMAIN, TAG, 'injectOfflineResources failed: %{public}d %{public}s', er.code, er.message);
-  }
-}
-
-/**
  * 全局 @Builder:所有网页统一的 Web 配置。
  * 离线缓存拦截、Google 短路、加载回调都集中在这里 —— 加新网页无需重复配置。
  */
@@ -109,10 +82,6 @@ export function buildWeb(model: WebViewModel) {
     .geolocationAccess(true)
     .width('100%')
     .height('100%')
-    .onControllerAttached(() => {
-      // 把 JS chunk 注入 WebView 并生成字节码缓存 → 跳过 JS 解析+编译,二级页面渲染更快
-      injectOffline(model.controller, model.url);
-    })
     .onInterceptRequest((event) => {
       try {
         const req = event.request;

@@ -20,7 +20,8 @@
       }
     ],
     "deliveryWithInstall": true,
-    "installationFree": false,
+    // ★ 元服务关键:本模块支持免安装。会计入元服务 10MB 免安装上限,单包需 ≤ 2MB。
+    "installationFree": true,
     "pages": "$profile:main_pages",
     "abilities": [
       {
@@ -42,20 +43,6 @@
             ]
           }
         ]
-      }
-    ],
-    "extensionAbilities": [
-      {
-        "name": "EntryBackupAbility",
-        "srcEntry": "./ets/entrybackupability/EntryBackupAbility.ets",
-        "type": "backup",
-        "exported": false,
-        "metadata": [
-          {
-            "name": "ohos.extension.backup",
-            "resource": "$profile:backup_config"
-          }
-        ],
       }
     ]
   }

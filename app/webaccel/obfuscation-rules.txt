@@ -1,0 +1,2 @@
+# webaccel 自身混淆规则(release 默认未开启,见 build-profile.json5)。
+-keep-property-name

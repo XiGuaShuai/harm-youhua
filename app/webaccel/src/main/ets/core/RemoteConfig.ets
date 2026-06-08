@@ -8,13 +8,6 @@ import { BusinessError } from '@kit.BasicServicesKit';
 const TAG: string = 'RemoteConfig';
 const DOMAIN: number = 0x0001;
 
-/**
- * ★★★ 改成你的后台服务器地址 ★★★
- *  - 真机/模拟器调试:填运行 server 的电脑局域网 IP(如 http://192.168.1.100:8787),不能用 localhost;
- *  - 生产:填你的域名(如 https://admin.example.com)。
- */
-export const CONFIG_SERVER: string = 'http://192.168.20.133:8787';
-
 /** 一个网页应用(对应后台「应用管理」一条) */
 export interface RemoteApp {
   id: string;
@@ -41,11 +34,19 @@ export interface RemoteConfigData {
   settings: RemoteSettings;
 }
 
-/** App 内置兜底:服务器首次不可达时也能跑(开机拉到后即覆盖) */
+/** configure() 入参:由 WebAccel.init 传入,把后台地址 / 直供列表 / 黑名单 / 设置注入 SDK */
+export interface ConfigureOptions {
+  configServer?: string;     // admin 后台地址(如 https://admin.example.com);不填 = 不联网
+  apps?: RemoteApp[];        // 直供应用列表(不依赖后台时用)
+  blockHosts?: string[];     // 过滤黑名单(覆盖默认内置;不填用 SDK 内置)
+  settings?: RemoteSettings; // 缓存上限 / 主文档校验节流 / 字节码开关
+}
+
+/** SDK 内置兜底:无后台、无缓存、未直供时也能跑(空列表;拉到/直供后即覆盖) */
 function fallbackConfig(): RemoteConfigData {
   return {
     version: '',
-    apps: [{ id: 'beacukai', name: '印尼海关 e-CD', url: 'https://ecd.beacukai.go.id/', bundle: true }],
+    apps: [],
     blockHosts: [],
     settings: { diskCapMB: 64, docCheckSec: 60, bytecodeCache: true }
   };
@@ -53,14 +54,46 @@ function fallbackConfig(): RemoteConfigData {
 
 /**
  * 远程配置管理器(单例)。
+ *  configure():由 WebAccel.init 注入后台地址 / 直供列表 / 黑名单 / 设置(在 load 之前调用);
  *  load():开机同步读沙箱里的上次配置(秒返回,不阻塞首屏);
- *  refresh():异步拉服务器最新配置,成功后写沙箱 + 更新内存 + 回调通知。
+ *  refresh():异步拉服务器最新配置,成功后写沙箱 + 更新内存 + 回调通知(未配置 server 则直接跳过)。
  * apps 同步写入 AppStorage('apps'),launcher 用 @StorageLink 自动响应更新。
  */
 class RemoteConfigManager {
   private data: RemoteConfigData = fallbackConfig();
   private cachePath: string = '';
+  private server: string = '';   // 后台地址(运行时由 configure 注入;为空 = 不联网,纯直供/缓存/兜底)
   private onApps: ((apps: RemoteApp[]) => void) | null = null;
+
+  /** 注入配置(在 load 之前调用)。configServer 为空时 SDK 走纯直供/本地模式,不联网 */
+  configure(opt?: ConfigureOptions): void {
+    if (!opt) {
+      return;
+    }
+    if (typeof opt.configServer === 'string') {
+      this.server = opt.configServer.replace(/\/+$/, ''); // 去尾部斜杠,避免拼出 //api/config
+    }
+    if (opt.apps && opt.apps.length > 0) {
+      this.data.apps = opt.apps; // 直供列表(作为默认;后续缓存/服务器配置会覆盖)
+    }
+    if (opt.blockHosts && opt.blockHosts.length > 0) {
+      this.data.blockHosts = opt.blockHosts;
+    }
+    if (opt.settings) {
+      this.data.settings = opt.settings;
+    }
+  }
+
+  /** 后台地址(供 WebPreRender 拼离线包 manifest 用;为空表示未配置后台) */
+  getServer(): string {
+    return this.server;
+  }
+
+  /** 运行时直接喂应用列表(不依赖后台;会写入 AppStorage 并触发回调) */
+  setApps(apps: RemoteApp[]): void {
+    this.data.apps = apps || [];
+    this.publishApps();
+  }
 
   /** 开机同步初始化:读沙箱缓存(没有就用兜底),并写入 AppStorage */
   load(context: common.UIAbilityContext): void {
@@ -88,9 +121,13 @@ class RemoteConfigManager {
     hilog.info(DOMAIN, TAG, 'loaded (cached) apps=%{public}d', this.data.apps.length);
   }
 
-  /** 异步拉服务器最新配置;成功返回 true */
+  /** 异步拉服务器最新配置;成功返回 true。未配置 server 时直接返回 false(纯直供/本地模式) */
   async refresh(): Promise<boolean> {
-    const txt: string = await this.httpGetText(CONFIG_SERVER + '/api/config');
+    if (this.server.length === 0) {
+      hilog.info(DOMAIN, TAG, 'refresh: no configServer, skip (direct/local mode)');
+      return false;
+    }
+    const txt: string = await this.httpGetText(this.server + '/api/config');
     if (txt.length === 0) {
       hilog.warn(DOMAIN, TAG, 'refresh: server unreachable, keep cached');
       return false;
