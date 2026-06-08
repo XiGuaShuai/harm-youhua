@@ -61,6 +61,7 @@ export class WebPool {
   private nodes: Map<string, WebNode> = new Map();
   private uiContext: UIContext | null = null;
   private handlerSet: boolean = false;
+  private appsHandlerSet: boolean = false;
 
   /** 提供一个 UIContext(任意页面/窗口的都行,同窗口共享) */
   setUIContext(ctx: UIContext): void {
@@ -71,6 +72,52 @@ export class WebPool {
         this.onDocUpdated(url);
       });
       this.handlerSet = true;
+    }
+    const registered: boolean = this.ensureAppsHandler();
+    if (!registered) {
+      this.prewarmConfiguredApps(remoteConfig.getApps());
+    }
+  }
+
+  /** 配置异步刷新后,自动对新下发的应用补预热;launcher 无需自己感知配置时序 */
+  bindRemoteConfig(): void {
+    this.ensureAppsHandler();
+  }
+
+  private ensureAppsHandler(): boolean {
+    if (this.appsHandlerSet) {
+      return false;
+    }
+    remoteConfig.setAppsHandler((apps: RemoteApp[]) => {
+      this.prewarmConfiguredApps(apps);
+    });
+    this.appsHandlerSet = true;
+    return true;
+  }
+
+  private prewarmConfiguredApps(apps: RemoteApp[]): void {
+    if (!apps || apps.length === 0) {
+      return;
+    }
+    for (let i = 0; i < apps.length; i++) {
+      const app: RemoteApp = apps[i];
+      if (!app || !app.url || app.url.length === 0) {
+        continue;
+      }
+      const swr: boolean = app.swrDoc !== false;
+      if (app.prerender !== false && this.uiContext) {
+        this.prewarm(app.url, swr);
+        continue;
+      }
+      try {
+        webview.WebviewController.prepareForPageLoad(app.url, true, 4);
+      } catch (e) {
+        const er = e as BusinessError;
+        hilog.error(DOMAIN, TAG, 'preconnect failed: %{public}s', er.message);
+      }
+      if (swr) {
+        webCache.enableDocCache([app.url]);
+      }
     }
   }
 

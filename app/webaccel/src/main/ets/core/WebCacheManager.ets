@@ -13,6 +13,7 @@ const DOMAIN: number = 0x0001;
 const RAW_DIR: string = 'webcache';                 // rawfile 下的目录
 const DISK_CAP_BYTES: number = 64 * 1024 * 1024;    // 沙箱运行时缓存总量上限 64MB
 const DOC_CHECK_MS: number = 60 * 1000;             // 主文档版本校验节流:60 秒内不重复校验
+const BUNDLE_CONCURRENCY: number = 3;               // 远程离线包后台下载并发上限
 
 /**
  * 通用过滤黑名单:命中即立刻返回空响应,不走网络。
@@ -118,11 +119,15 @@ class WebCacheManager {
   private blockHosts: string[] = BLOCK_HOSTS;       // 过滤黑名单(可远程下发)
   private diskCapBytes: number = DISK_CAP_BYTES;    // 沙箱缓存上限(可远程下发)
   private docCheckMs: number = DOC_CHECK_MS;        // 主文档校验节流(可远程下发)
+  private bundleConcurrency: number = BUNDLE_CONCURRENCY; // 远程离线包下载并发(可远程下发)
 
   private rawIndex: Map<string, RawEntry> = new Map();
   private diskIndex: Map<string, DiskEntry> = new Map();
   private inflight: Set<string> = new Set();
   private pending: Set<string> = new Set();
+  private bundleQueue: RawEntry[] = [];
+  private bundleQueueSources: Map<string, string> = new Map();
+  private activeBundleDownloads: number = 0;
   private totalBytes: number = 0;
   private ready: boolean = false;
 
@@ -187,8 +192,11 @@ class WebCacheManager {
     if (typeof s.docCheckSec === 'number' && s.docCheckSec >= 0) {
       this.docCheckMs = s.docCheckSec * 1000;
     }
-    hilog.info(DOMAIN, TAG, 'settings applied cap=%{public}dB docCheck=%{public}dms',
-      this.diskCapBytes, this.docCheckMs);
+    if (typeof s.bundleConcurrency === 'number' && s.bundleConcurrency > 0) {
+      this.bundleConcurrency = Math.max(1, Math.min(8, Math.floor(s.bundleConcurrency)));
+    }
+    hilog.info(DOMAIN, TAG, 'settings applied cap=%{public}dB docCheck=%{public}dms bundleConcurrency=%{public}d',
+      this.diskCapBytes, this.docCheckMs, this.bundleConcurrency);
   }
 
   /** 查询某站离线包下载进度(无则返回 null) */
@@ -520,12 +528,19 @@ class WebCacheManager {
    * @param forceMime 非空则强制用该 mime(主文档用 text/html;离线包用 manifest 里的 mime)
    * @param overwrite 为 true 时即使已缓存也重新抓(SWR revalidate);否则已缓存则跳过
    */
-  private fetchAndStore(cacheKey: string, sourceUrl: string, forceMime: string, overwrite: boolean): void {
+  private fetchAndStore(cacheKey: string, sourceUrl: string, forceMime: string, overwrite: boolean,
+    onDone?: (ok: boolean) => void): void {
     const src: string = sourceUrl && sourceUrl.length > 0 ? sourceUrl : cacheKey;
     if (this.inflight.has(cacheKey)) {
+      if (onDone) {
+        onDone(false);
+      }
       return;
     }
     if (!overwrite && (this.diskIndex.has(cacheKey) || this.rawIndex.has(cacheKey))) {
+      if (onDone) {
+        onDone(true);
+      }
       return; // 已在沙箱或内置包里,不重复下(预取全量 chunk 时靠这个跳过已有的)
     }
     this.inflight.add(cacheKey);
@@ -543,6 +558,7 @@ class WebCacheManager {
     };
     client.request(src, options, (err: BusinessError, data: http.HttpResponse) => {
       this.inflight.delete(cacheKey);
+      let ok: boolean = false;
       try {
         if (!err && data && data.responseCode === 200 && data.result instanceof ArrayBuffer) {
           const body: ArrayBuffer = data.result as ArrayBuffer;
@@ -566,6 +582,7 @@ class WebCacheManager {
           this.evictIfNeeded();
           this.saveDiskIndex();
           this.markBundleResource(cacheKey); // 若属于某站离线包,推进其下载进度
+          ok = true;
           hilog.info(DOMAIN, TAG, 'cached %{public}s %{public}d B', mime, body.byteLength);
 
           // 主文档版本变了 = 站点更新 → 通知(池)刷新对应节点,立即用上新版
@@ -581,7 +598,44 @@ class WebCacheManager {
         hilog.error(DOMAIN, TAG, 'store failed: %{public}s', er.message);
       }
       client.destroy();
+      if (onDone) {
+        onDone(ok);
+      }
     });
+  }
+
+  /** 远程离线包下载任务入队,用有限并发避免抢占首屏主链路 */
+  private enqueueBundleDownload(entry: RawEntry, sourceUrl: string): void {
+    if (this.diskIndex.has(entry.url) || this.rawIndex.has(entry.url) || this.inflight.has(entry.url) ||
+      this.bundleQueueSources.has(entry.url)) {
+      return;
+    }
+    this.bundleQueue.push(entry);
+    this.bundleQueueSources.set(entry.url, sourceUrl);
+    this.pumpBundleQueue();
+  }
+
+  private pumpBundleQueue(): void {
+    while (this.activeBundleDownloads < this.bundleConcurrency && this.bundleQueue.length > 0) {
+      const entry: RawEntry | undefined = this.bundleQueue.shift();
+      if (!entry) {
+        return;
+      }
+      const src: string | undefined = this.bundleQueueSources.get(entry.url);
+      this.bundleQueueSources.delete(entry.url);
+      if (!src || src.length === 0) {
+        continue;
+      }
+      if (this.diskIndex.has(entry.url) || this.rawIndex.has(entry.url)) {
+        this.markBundleResource(entry.url);
+        continue;
+      }
+      this.activeBundleDownloads++;
+      this.fetchAndStore(entry.url, src, entry.mime, false, (_ok: boolean) => {
+        this.activeBundleDownloads--;
+        this.pumpBundleQueue();
+      });
+    }
   }
 
   /**
@@ -604,6 +658,7 @@ class WebCacheManager {
     const txt: string = await this.httpGetText(manifestUrl);
     if (txt.length === 0) {
       hilog.warn(DOMAIN, TAG, 'remote bundle manifest unreachable: %{public}s', manifestUrl);
+      this.loadedBundles.delete(origin);
       return;
     }
     let arr: RawEntry[] = [];
@@ -612,6 +667,7 @@ class WebCacheManager {
     } catch (e) {
       const er = e as BusinessError;
       hilog.error(DOMAIN, TAG, 'remote manifest parse failed: %{public}s', er.message);
+      this.loadedBundles.delete(origin);
       return;
     }
     let total: number = 0;
@@ -628,7 +684,7 @@ class WebCacheManager {
       } else {
         expected.add(e.url);
         // 来源 = 后台文件,缓存 key = 原站 URL(拦截器按原站 URL 命中)
-        this.fetchAndStore(e.url, base + '/' + e.file, e.mime, false);
+        this.enqueueBundleDownload(e, base + '/' + e.file);
       }
     }
     const prog: BundleProgressEntry = { total: total, done: done, expected: expected };

@@ -54,6 +54,7 @@ export class WebAccel {
     remoteConfig.load(context);
     webCache.setBlockHosts(remoteConfig.getBlockHosts());
     webCache.applySettings(remoteConfig.getSettings());
+    webPool.bindRemoteConfig();
 
     // ⑤ 异步:有后台且允许时拉服务器最新配置,成功后再注入一次
     const autoRefresh: boolean = !(options && options.autoRefresh === false);

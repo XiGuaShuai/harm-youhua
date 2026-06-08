@@ -24,6 +24,7 @@ export interface RemoteApp {
 export interface RemoteSettings {
   diskCapMB?: number;
   docCheckSec?: number;
+  bundleConcurrency?: number;
   bytecodeCache?: boolean;
 }
 
@@ -42,13 +43,15 @@ export interface ConfigureOptions {
   settings?: RemoteSettings; // 缓存上限 / 主文档校验节流 / 字节码开关
 }
 
+type AppsHandler = (apps: RemoteApp[]) => void;
+
 /** SDK 内置兜底:无后台、无缓存、未直供时也能跑(空列表;拉到/直供后即覆盖) */
 function fallbackConfig(): RemoteConfigData {
   return {
     version: '',
     apps: [],
     blockHosts: [],
-    settings: { diskCapMB: 64, docCheckSec: 60, bytecodeCache: true }
+    settings: { diskCapMB: 64, docCheckSec: 60, bundleConcurrency: 3, bytecodeCache: true }
   };
 }
 
@@ -63,7 +66,7 @@ class RemoteConfigManager {
   private data: RemoteConfigData = fallbackConfig();
   private cachePath: string = '';
   private server: string = '';   // 后台地址(运行时由 configure 注入;为空 = 不联网,纯直供/缓存/兜底)
-  private onApps: ((apps: RemoteApp[]) => void) | null = null;
+  private appHandlers: AppsHandler[] = [];
 
   /** 注入配置(在 load 之前调用)。configServer 为空时 SDK 走纯直供/本地模式,不联网 */
   configure(opt?: ConfigureOptions): void {
@@ -156,15 +159,16 @@ class RemoteConfigManager {
 
   /** 注册 apps 更新回调(launcher 之外的消费者用) */
   setAppsHandler(cb: (apps: RemoteApp[]) => void): void {
-    this.onApps = cb;
-    this.onApps(this.getApps());
+    this.appHandlers.push(cb);
+    cb(this.getApps());
   }
 
   private publishApps(): void {
     // 全局状态,launcher 用 @StorageLink('apps') 自动响应
     AppStorage.setOrCreate<RemoteApp[]>('apps', this.getApps());
-    if (this.onApps) {
-      this.onApps(this.getApps());
+    const apps: RemoteApp[] = this.getApps();
+    for (let i = 0; i < this.appHandlers.length; i++) {
+      this.appHandlers[i](apps);
     }
   }
 

@@ -46,16 +46,62 @@ async function remove(row) {
   ElMessage.success('已删除');
 }
 
+const checking = ref('');
+const updating = ref('');
 const building = ref('');
-async function build(row) {
+const generating = ref('');
+
+async function checkUpdate(row) {
+  checking.value = row.id;
+  try {
+    const { data } = await api.post(`/api/admin/bundles/${row.id}/check`);
+    if (data.changed) {
+      const home = data.homeChanged ? '首页已变化' : '首页未变化';
+      ElMessage.warning(`${home}; 新增 ${data.addedCount}, 移除 ${data.removedCount}, 缺失 ${data.missingFileCount}`);
+    } else {
+      ElMessage.success('未发现更新');
+    }
+  } catch (e) {
+    ElMessage.error('检查失败:' + (e.response?.data?.error || e.message));
+  } finally {
+    checking.value = '';
+  }
+}
+
+async function updateCache(row) {
+  updating.value = row.id;
+  try {
+    const { data } = await api.post(`/api/admin/bundles/${row.id}/update`);
+    ElMessage.success(`已增量更新: 下载 ${data.downloaded}, 跳过 ${data.skipped}, 共 ${data.count}`);
+  } catch (e) {
+    ElMessage.error('增量更新失败:' + (e.response?.data?.error || e.message));
+  } finally {
+    updating.value = '';
+  }
+}
+
+async function buildCache(row) {
+  await ElMessageBox.confirm('强制重建会访问目标站并清空旧缓存目录,确认继续?', '确认强制重建', { type: 'warning' });
   building.value = row.id;
   try {
     const { data } = await api.post(`/api/admin/bundles/${row.id}/build`);
-    ElMessage.success(`已打包 ${data.count} 个资源`);
+    ElMessage.success(`已构建 ${data.count} 个缓存资源`);
   } catch (e) {
-    ElMessage.error('打包失败:' + (e.response?.data?.error || e.message));
+    ElMessage.error('构建失败:' + (e.response?.data?.error || e.message));
   } finally {
     building.value = '';
+  }
+}
+
+async function generateManifest(row) {
+  generating.value = row.id;
+  try {
+    const { data } = await api.post(`/api/admin/bundles/${row.id}/manifest`);
+    ElMessage.success(`已生成 ${data.count} 个缓存资源`);
+  } catch (e) {
+    ElMessage.error('生成失败:' + (e.response?.data?.error || e.message));
+  } finally {
+    generating.value = '';
   }
 }
 </script>
@@ -72,15 +118,18 @@ async function build(row) {
       <el-table-column prop="url" label="URL" show-overflow-tooltip />
       <el-table-column label="加速项" width="220">
         <template #default="{ row }">
-          <el-tag v-if="row.bundle" size="small" type="success">内置包</el-tag>
+          <el-tag v-if="row.bundle" size="small" type="success">离线包</el-tag>
           <el-tag v-if="row.prerender" size="small">预渲染</el-tag>
           <el-tag v-if="row.swrDoc" size="small">SWR</el-tag>
           <el-tag v-if="row.codeCache" size="small">字节码</el-tag>
         </template>
       </el-table-column>
-      <el-table-column label="操作" width="240">
+      <el-table-column label="操作" width="500">
         <template #default="{ row }">
-          <el-button size="small" :loading="building === row.id" @click="build(row)">服务端打包</el-button>
+          <el-button size="small" :loading="checking === row.id" @click="checkUpdate(row)">检查更新</el-button>
+          <el-button size="small" :loading="updating === row.id" @click="updateCache(row)">增量更新</el-button>
+          <el-button size="small" :loading="building === row.id" @click="buildCache(row)">强制重建</el-button>
+          <el-button size="small" :loading="generating === row.id" @click="generateManifest(row)">生成清单</el-button>
           <el-button size="small" @click="openEdit(row)">编辑</el-button>
           <el-button size="small" type="danger" @click="remove(row)">删除</el-button>
         </template>
@@ -96,10 +145,10 @@ async function build(row) {
         <el-form-item label="URL"><el-input v-model="form.url" placeholder="https://..." /></el-form-item>
         <el-form-item label="路由">
           <el-input v-model="form.routesText" type="textarea" :rows="4"
-            placeholder="每行一个,用于离线打包(/ 为首页)" />
+            placeholder="每行一个,用于构建缓存与端侧预热" />
         </el-form-item>
         <el-form-item label="加速项">
-          <el-checkbox v-model="form.bundle">内置离线包</el-checkbox>
+          <el-checkbox v-model="form.bundle">离线包</el-checkbox>
           <el-checkbox v-model="form.prerender">离屏预渲染</el-checkbox>
           <el-checkbox v-model="form.swrDoc">主文档 SWR</el-checkbox>
           <el-checkbox v-model="form.codeCache">字节码缓存</el-checkbox>

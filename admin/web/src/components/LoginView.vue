@@ -41,7 +41,7 @@ async function submit() {
         <p>鸿蒙网页应用的远程配置与离线包分发中心</p>
         <ul class="features">
           <li>应用、黑名单、全局设置一处下发</li>
-          <li>服务端一键打包离线资源</li>
+          <li>服务端缓存清单一键生成</li>
           <li>改配置即生效,App 无需重新发版</li>
         </ul>
       </div>

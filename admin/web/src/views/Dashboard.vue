@@ -60,7 +60,7 @@ onMounted(() => { if (!apps.value.length) store.load(); loadBundles(); });
             <el-table-column prop="url" label="URL" show-overflow-tooltip min-width="160" />
             <el-table-column label="加速项" width="200">
               <template #default="{ row }">
-                <el-tag v-if="row.bundle" size="small" type="success" effect="light">内置包</el-tag>
+                <el-tag v-if="row.bundle" size="small" type="success" effect="light">离线包</el-tag>
                 <el-tag v-if="row.prerender" size="small" effect="light">预渲染</el-tag>
                 <el-tag v-if="row.swrDoc" size="small" effect="light">SWR</el-tag>
                 <el-tag v-if="row.codeCache" size="small" effect="light">字节码</el-tag>
@@ -92,6 +92,10 @@ onMounted(() => { if (!apps.value.length) store.load(); loadBundles(); });
             <div class="info-row">
               <span class="k">文档校验节流</span>
               <span class="v">{{ settings.docCheckSec ?? '-' }} 秒</span>
+            </div>
+            <div class="info-row">
+              <span class="k">离线包下载并发</span>
+              <span class="v">{{ settings.bundleConcurrency ?? '-' }}</span>
             </div>
             <div class="info-row">
               <span class="k">字节码缓存</span>

@@ -3,7 +3,7 @@
 // 提供:
 //  1) GET /api/config        —— 鸿蒙 App 开机拉取(应用列表 + 黑名单 + 全局设置 + 离线包地址)
 //  2) /bundles/*             —— 托管离线包(manifest.json + 资源文件),App 从这里快速拉取
-//  3) /api/admin/*           —— 后台管理(增删改应用、黑名单、设置;一键服务端打包)
+//  3) /api/admin/*           —— 后台管理(增删改应用、黑名单、设置;构建服务器缓存/生成缓存清单)
 //
 // 配置持久化:data/config.json(纯文件,无需数据库)
 
@@ -12,6 +12,7 @@ import cors from 'cors';
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
+import { execFile } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -19,13 +20,13 @@ const DATA_FILE = path.join(__dirname, 'data', 'config.json');
 const USERS_FILE = path.join(__dirname, 'data', 'users.json');
 const SESSIONS_FILE = path.join(__dirname, 'data', 'sessions.json');
 const BUNDLES_DIR = path.join(__dirname, 'bundles');
+const CACHE_BUILDER = path.join(__dirname, 'cache-builder.js');
 const PORT = process.env.PORT || 8787;
 // 可选「主令牌」:仅当显式设置 ADMIN_TOKEN 时生效(给脚本/CI 用),默认不开,走账号密码登录
 const MASTER_TOKEN = process.env.ADMIN_TOKEN || '';
 const DEFAULT_USER = process.env.ADMIN_USER || 'admin';
 const DEFAULT_PASS = process.env.ADMIN_PASS || 'admin123';
 const SESSION_TTL_MS = 7 * 24 * 3600 * 1000; // 登录态有效期 7 天
-const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36';
 
 fs.mkdirSync(path.dirname(DATA_FILE), { recursive: true });
 fs.mkdirSync(BUNDLES_DIR, { recursive: true });
@@ -106,6 +107,7 @@ function defaultConfig() {
     settings: {
       diskCapMB: 64,        // 运行时缓存上限
       docCheckSec: 60,      // 主文档版本校验节流(秒)
+      bundleConcurrency: 3, // 远程离线包后台下载并发
       bytecodeCache: true
     }
   };
@@ -121,71 +123,28 @@ function saveConfig(c) {
 }
 if (!fs.existsSync(DATA_FILE)) saveConfig(defaultConfig());
 
-// ——————————————— 离线包打包(服务端拉取目标站资源)———————————————
-function mimeOf(u) {
-  if (u.endsWith('.js')) return 'application/javascript';
-  if (u.endsWith('.css')) return 'text/css';
-  if (u.endsWith('.ttf')) return 'font/ttf';
-  if (u.endsWith('.woff2')) return 'font/woff2';
-  if (u.endsWith('.woff')) return 'font/woff';
-  if (u.endsWith('.otf')) return 'font/otf';
-  return 'application/octet-stream';
-}
-async function fetchText(url, headers = {}) {
-  const r = await fetch(url, { headers: { 'User-Agent': UA, ...headers } });
-  return r.ok ? await r.text() : '';
-}
-function matchAll(text, re) { return Array.from(text.matchAll(re)).map((m) => m[0]); }
-
-// 为某个 app 构建离线包:抓首页 + webpack 运行时 + 各路由 RSC,汇总全部 chunk/css/font,下载并生成 manifest
-async function buildBundle(appCfg) {
-  const base = appCfg.url.replace(/\/+$/, '');
-  const origin = new URL(appCfg.url).origin;
-  const routes = (appCfg.routes && appCfg.routes.length) ? appCfg.routes : ['/'];
-  const jsSet = new Set(), cssSet = new Set(), fontSet = new Set();
-
-  const html = await fetchText(base + '/');
-  if (!html) throw new Error('抓取首页失败');
-  matchAll(html, /\/_next\/static\/chunks\/[A-Za-z0-9/._-]+\.js/g).forEach((x) => jsSet.add(x));
-  matchAll(html, /\/_next\/static\/css\/[A-Za-z0-9._-]+\.css/g).forEach((x) => cssSet.add(x));
-
-  const wp = matchAll(html, /\/_next\/static\/chunks\/webpack-[a-f0-9]+\.js/g)[0];
-  if (wp) {
-    const wpText = await fetchText(base + wp);
-    matchAll(wpText, /static\/chunks\/[A-Za-z0-9/._-]+\.js/g).forEach((x) => jsSet.add('/_next/' + x));
-  }
-  for (const r of routes) {
-    const rsc = await fetchText(base + r + '?_rsc=warm', { RSC: '1' });
-    matchAll(rsc, /static\/chunks\/[A-Za-z0-9/._-]+\.js/g).forEach((x) => jsSet.add('/_next/' + x));
-  }
-  for (const c of cssSet) {
-    const css = await fetchText(base + c);
-    matchAll(css, /\/_next\/static\/media\/[A-Za-z0-9/._-]+\.(?:ttf|woff2|woff|otf)/g).forEach((x) => fontSet.add(x));
-  }
-
-  const outDir = path.join(BUNDLES_DIR, appCfg.id);
-  fs.rmSync(outDir, { recursive: true, force: true });
-  fs.mkdirSync(outDir, { recursive: true });
-
-  const manifest = [];
-  // 首页 HTML 也打进包
-  fs.writeFileSync(path.join(outDir, 'home.html'), html, 'utf8');
-  manifest.push({ url: origin + '/', file: 'home.html', mime: 'text/html' });
-
-  const all = [...jsSet, ...cssSet, ...fontSet];
-  for (const u of all) {
-    try {
-      const res = await fetch(base + u, { headers: { 'User-Agent': UA } });
-      if (!res.ok) continue;
-      const buf = Buffer.from(await res.arrayBuffer());
-      if (!buf.length) continue;
-      const file = u.replace(/^\/_next\/static\//, '').replace(/\//g, '_');
-      fs.writeFileSync(path.join(outDir, file), buf);
-      manifest.push({ url: origin + u, file, mime: mimeOf(u) });
-    } catch { /* 跳过坏 URL */ }
-  }
-  fs.writeFileSync(path.join(outDir, 'manifest.json'), JSON.stringify(manifest, null, 2), 'utf8');
-  return { id: appCfg.id, count: manifest.length, builtAt: new Date().toISOString() };
+// ——————————————— 缓存构建程序触发 ———————————————
+function runCacheBuilder(mode, appId) {
+  return new Promise((resolve, reject) => {
+    execFile(process.execPath, [CACHE_BUILDER, mode, appId], {
+      cwd: __dirname,
+      windowsHide: true,
+      timeout: 10 * 60 * 1000,
+      maxBuffer: 10 * 1024 * 1024
+    }, (err, stdout, stderr) => {
+      let parsed = null;
+      const lines = String(stdout || '').trim().split(/\r?\n/).filter(Boolean);
+      if (lines.length) {
+        try { parsed = JSON.parse(lines[lines.length - 1]); } catch {}
+      }
+      if (err || !parsed || parsed.ok !== true) {
+        const msg = parsed && parsed.error ? parsed.error : (stderr || err && err.message || 'cache builder failed');
+        reject(new Error(String(msg).trim()));
+        return;
+      }
+      resolve(parsed.result);
+    });
+  });
 }
 
 // ——————————————— Express ———————————————
@@ -194,7 +153,7 @@ app.use(cors());
 app.use(express.json({ limit: '4mb' }));
 
 // 鸿蒙 App 开机拉取(公开)
-// 对启用离线包且服务端已打包的 app,附上 manifestUrl —— App 据此去服务器下载离线资源(替代打进 HAP 的内置包)
+// 对启用离线包且服务端已有缓存清单的 app,附上 manifestUrl —— App 据此去服务器下载缓存资源
 app.get('/api/config', (req, res) => {
   const c = loadConfig();
   const apps = (c.apps || []).map((a) => {
@@ -271,7 +230,7 @@ app.put('/api/admin/settings', (req, res) => {
   const c = loadConfig(); c.settings = req.body.settings || {}; res.json(saveConfig(c));
 });
 
-// 已构建的离线包列表
+// 已生成缓存清单的离线资源列表
 app.get('/api/admin/bundles', (req, res) => {
   const out = [];
   for (const id of fs.readdirSync(BUNDLES_DIR)) {
@@ -288,13 +247,52 @@ app.get('/api/admin/bundles', (req, res) => {
   res.json(out);
 });
 
-// 一键服务端打包某个 app
+// 检查源站是否有新资源:访问目标站并对比当前 manifest,不写缓存文件。
+app.post('/api/admin/bundles/:id/check', async (req, res) => {
+  const c = loadConfig();
+  const appCfg = c.apps.find((a) => a.id === req.params.id);
+  if (!appCfg) return res.status(404).json({ error: 'app not found' });
+  try {
+    const r = await runCacheBuilder('check', appCfg.id);
+    res.json(r);
+  } catch (e) {
+    res.status(500).json({ error: String(e && e.message || e) });
+  }
+});
+
+// 增量更新服务器缓存:只下载新增/缺失资源,成功后原子替换 manifest。
+app.post('/api/admin/bundles/:id/update', async (req, res) => {
+  const c = loadConfig();
+  const appCfg = c.apps.find((a) => a.id === req.params.id);
+  if (!appCfg) return res.status(404).json({ error: 'app not found' });
+  try {
+    const r = await runCacheBuilder('update', appCfg.id);
+    res.json(r);
+  } catch (e) {
+    res.status(500).json({ error: String(e && e.message || e) });
+  }
+});
+
+// 为某个 app 构建服务器缓存文件:访问目标站、下载资源、清空旧缓存目录、生成 manifest。
 app.post('/api/admin/bundles/:id/build', async (req, res) => {
   const c = loadConfig();
   const appCfg = c.apps.find((a) => a.id === req.params.id);
   if (!appCfg) return res.status(404).json({ error: 'app not found' });
   try {
-    const r = await buildBundle(appCfg);
+    const r = await runCacheBuilder('build', appCfg.id);
+    res.json(r);
+  } catch (e) {
+    res.status(500).json({ error: String(e && e.message || e) });
+  }
+});
+
+// 仅生成缓存清单:扫描服务器已有缓存文件,不访问目标站,不清空目录。
+app.post('/api/admin/bundles/:id/manifest', async (req, res) => {
+  const c = loadConfig();
+  const appCfg = c.apps.find((a) => a.id === req.params.id);
+  if (!appCfg) return res.status(404).json({ error: 'app not found' });
+  try {
+    const r = await runCacheBuilder('manifest', appCfg.id);
     res.json(r);
   } catch (e) {
     res.status(500).json({ error: String(e && e.message || e) });

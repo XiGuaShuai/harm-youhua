@@ -29,15 +29,15 @@ function copy(row) {
 <template>
   <div class="page-card">
     <el-alert type="info" :closable="false" show-icon style="margin-bottom:12px">
-      在「应用管理」里点 <b>服务端打包</b> 后,离线包出现在这里,托管于 <code>/bundles/&lt;id&gt;/</code>。
-      鸿蒙 App 用这个 manifest 地址从你的服务器拉取离线包(国内快),替代/补充打进 HAP 的内置包。
+      「构建缓存」会访问目标站并刷新服务器缓存文件;「生成清单」只扫描已有缓存文件生成 manifest。
+      鸿蒙 App 用 manifest 从你的服务器拉取缓存文件,再注入到端侧沙箱缓存。
     </el-alert>
     <el-button :loading="loading" @click="load">刷新</el-button>
     <el-table :data="bundles" border style="margin-top:12px">
       <el-table-column prop="id" label="应用 ID" width="140" />
       <el-table-column prop="count" label="资源数" width="100" />
       <el-table-column prop="sizeKB" label="大小 (KB)" width="120" />
-      <el-table-column label="打包时间" width="200">
+      <el-table-column label="清单时间" width="200">
         <template #default="{ row }">{{ new Date(row.builtAt).toLocaleString() }}</template>
       </el-table-column>
       <el-table-column label="manifest 地址">

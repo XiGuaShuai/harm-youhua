@@ -23,9 +23,13 @@ async function save() {
         <el-input-number v-model="settings.docCheckSec" :min="0" :max="3600" :step="10" />
         <div class="hint">多久才重拉一次首页 HTML 比对版本(对应 DOC_CHECK_MS)。</div>
       </el-form-item>
+      <el-form-item label="离线包下载并发">
+        <el-input-number v-model="settings.bundleConcurrency" :min="1" :max="8" :step="1" />
+        <div class="hint">App 从后台拉取离线包时的后台下载并发;过高会抢占首屏网络。</div>
+      </el-form-item>
       <el-form-item label="JS 字节码缓存">
         <el-switch v-model="settings.bytecodeCache" />
-        <div class="hint">注入内置 JS 并预生成字节码,二级页面渲染更快。</div>
+        <div class="hint">元服务环境已禁用字节码注入,该字段仅保留兼容。</div>
       </el-form-item>
       <el-form-item>
         <el-button type="primary" @click="save">保存设置</el-button>

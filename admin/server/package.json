@@ -6,7 +6,11 @@
   "description": "鸿蒙网页加速方案的远程配置 + 离线包服务端",
   "scripts": {
     "start": "node index.js",
-    "dev": "node --watch index.js"
+    "dev": "node --watch index.js",
+    "cache:check": "node cache-builder.js check",
+    "cache:update": "node cache-builder.js update",
+    "cache:build": "node cache-builder.js build",
+    "cache:manifest": "node cache-builder.js manifest"
   },
   "dependencies": {
     "cors": "^2.8.5",
