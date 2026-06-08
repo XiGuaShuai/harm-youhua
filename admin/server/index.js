@@ -99,7 +99,7 @@ function defaultConfig() {
         name: '圣淘沙名胜世界 RWS',
         url: 'https://www.rwsentosa.com/',
         swrDoc: true,        // 首页陈旧即用缓存
-        prerender: true,     // 离屏预渲染
+        prerender: false,    // 不离屏预渲染:避免和 beacukai 抢预热带宽(它仍有运行时缓存+SWR+黑名单加速)
         codeCache: false,    // 元服务不支持字节码注入
         bundle: false        // 非 Next.js(Adobe AEM+React),靠运行时通用层缓存,不做 Next 打包
       }
