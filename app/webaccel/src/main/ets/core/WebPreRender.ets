@@ -109,6 +109,8 @@ export class WebPool {
         this.prewarm(app.url, swr);
         continue;
       }
+      // 不离屏预渲染的应用:也提前预连接 +(可选)SWR + 预下离线包(bundle:true 才会真下)
+      this.loadBundleFor(app.url);
       try {
         webview.WebviewController.prepareForPageLoad(app.url, true, 4);
       } catch (e) {
@@ -145,6 +147,9 @@ export class WebPool {
       node = new WebNode(new WebViewModel(url));
       this.nodes.set(url, node);
     }
+    // 预热即开始下离线包:让 chunk 尽早进沙箱,等用户点进去时已在本地,不和慢源站抢首屏。
+    // (WebCache 内部按 origin 去重,所以这里和 obtain 重复调用都安全)
+    this.loadBundleFor(url);
     try {
       webview.WebviewController.prepareForPageLoad(url, true, 4); // 预连接
     } catch (e) {
