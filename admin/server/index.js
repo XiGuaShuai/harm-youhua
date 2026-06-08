@@ -93,6 +93,15 @@ function defaultConfig() {
         prerender: true,     // 离屏预渲染
         codeCache: true,     // JS 字节码缓存
         bundle: true         // 是否启用离线包(从本服务器拉)
+      },
+      {
+        id: 'rwsentosa',
+        name: '圣淘沙名胜世界 RWS',
+        url: 'https://www.rwsentosa.com/',
+        swrDoc: true,        // 首页陈旧即用缓存
+        prerender: true,     // 离屏预渲染
+        codeCache: false,    // 元服务不支持字节码注入
+        bundle: false        // 非 Next.js(Adobe AEM+React),靠运行时通用层缓存,不做 Next 打包
       }
     ],
     // 通用过滤黑名单:被墙/纯追踪的第三方,App 端命中即秒拒(屏蔽后不影响功能)
@@ -102,7 +111,13 @@ function defaultConfig() {
       'doubleclick.net', 'googlesyndication.com', 'adservice.google',
       'connect.facebook.net', 'facebook.com/tr', 'platform.twitter.com',
       'fonts.googleapis.com', 'fonts.gstatic.com',
-      'hotjar.com', 'mixpanel.com', 'fullstory.com', 'clarity.ms'
+      'hotjar.com', 'mixpanel.com', 'fullstory.com', 'clarity.ms',
+      // —— rwsentosa(USS 购票流程)实测追加的广告/数据/追踪域(屏蔽后购票功能不受影响)——
+      'adform.net', 'adsrvr.org', 'pubmatic.com', 'openx.net', 'adnxs.com',
+      'dotomi.com', 'crwdcntrl.net', 'eyeota.net', 'stackadapt.com', 'sojern.com',
+      'analytics.tiktok.com', 'bat.bing.com', 'px.ads.linkedin.com', 'snap.licdn.com',
+      'conviva.com', 's4mdsp.com', 'ad.daum.net', 's.yimg.com',
+      'aem-kakao-collector.onkakao.net', 'aichat.com'
     ],
     settings: {
       diskCapMB: 64,        // 运行时缓存上限
