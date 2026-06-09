@@ -11,7 +11,7 @@ const DOMAIN = 0x0000;
  */
 const FALLBACK_APPS: RemoteApp[] = [
   { id: 'beacukai', name: '印尼海关 e-CD', url: 'https://ecd.beacukai.go.id/', swrDoc: true, prerender: true, bundle: true },
-  { id: 'rwsentosa', name: '圣淘沙名胜世界 RWS', url: 'https://www.rwsentosa.com/', swrDoc: true, prerender: false }
+  { id: 'rwsentosa', name: '圣淘沙名胜世界 RWS', url: 'https://www.rwsentosa.com/', swrDoc: true, prerender: true, bundle: true }
 ];
 
 export default class EntryAbility extends UIAbility {
