@@ -27,6 +27,10 @@ async function save() {
         <el-input-number v-model="settings.bundleConcurrency" :min="1" :max="8" :step="1" />
         <div class="hint">App 从后台拉取离线包时的后台下载并发;过高会抢占首屏网络。</div>
       </el-form-item>
+      <el-form-item label="全站 chunk 预取">
+        <el-switch v-model="settings.prefetchChunks" />
+        <div class="hint">页面加载完后台预取该站全部按需 chunk(Next.js 系站点有效;非 Next 站自动无操作)。</div>
+      </el-form-item>
       <el-form-item label="JS 字节码缓存">
         <el-switch v-model="settings.bytecodeCache" />
         <div class="hint">元服务环境已禁用字节码注入,该字段仅保留兼容。</div>

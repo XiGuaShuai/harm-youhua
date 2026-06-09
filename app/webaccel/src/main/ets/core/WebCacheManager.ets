@@ -16,40 +16,18 @@ const DOC_CHECK_MS: number = 60 * 1000;             // 主文档版本校验节�
 const BUNDLE_CONCURRENCY: number = 3;               // 远程离线包后台下载并发上限
 
 /**
- * 通用过滤黑名单:命中即立刻返回空响应,不走网络。
- * 国内不可达/会挂起到超时的第三方,会卡住 window.load 导致"首页转圈 / 点击卡顿"。
- * 这里只放"屏蔽后不影响站点功能"的:统计、广告、社交追踪、Google 字体(降级系统字体)、翻译。
- * 对所有 web app 自动生效、零配置。需要时直接在这里加(也可改成从服务器远程下发更新)。
- * 注意:不要屏蔽 recaptcha / maps / 支付等"功能性"第三方(屏蔽会破坏功能)。
+ * SDK 内置的极小「首启安全网」黑名单 —— **不是站点优化**。
+ * 只放会**阻塞渲染 / 挂死 window.load** 且跨境普遍不可达的通用域,保证「后台配置还没拉到 /
+ * 后台不可达」的窗口里首启也不卡。完整、可调的黑名单由 **admin 后台下发**:
+ * `setBlockHosts(非空)` 会整体覆盖本列表(见 intercept 用的 this.blockHosts)。
+ * 给某个站加屏蔽域 → 改 admin 配置,不要往这里加。
+ * 注意:不要放 recaptcha / maps / 支付等功能性第三方(屏蔽会破坏功能)。
  */
 const BLOCK_HOSTS: string[] = [
-  // —— Google 翻译(阻塞 + 国内不可达)——
-  'translate.google',          // 覆盖 translate.google.com 与 translate.googleapis.com
-  'translate.googleapis',
-  'gstatic.com/_/translate',
-  'gstatic.com/translate',
-  // —— 统计 / 分析(纯开销)——
-  'google-analytics.com',
-  'googletagmanager.com',
-  'googletagservices.com',
-  'analytics.google.com',
-  'googleadservices.com',
-  // —— 广告 ——
-  'doubleclick.net',
-  'googlesyndication.com',
-  'adservice.google',
-  // —— 社交追踪像素 ——
-  'connect.facebook.net',
-  'facebook.com/tr',
-  'platform.twitter.com',
-  // —— Google 字体(阻塞渲染;屏蔽后降级系统字体,页面照常)——
-  'fonts.googleapis.com',
-  'fonts.gstatic.com',
-  // —— 其它常见第三方追踪 ——
-  'hotjar.com',
-  'mixpanel.com',
-  'fullstory.com',
-  'clarity.ms'
+  'translate.google', 'translate.googleapis',     // 谷歌翻译挂件:阻塞渲染 + 国内不可达
+  'fonts.googleapis.com', 'fonts.gstatic.com',    // 谷歌字体:阻塞渲染(降级系统字体)
+  'google-analytics.com', 'googletagmanager.com', // GA/GTM:会挂起到超时
+  'doubleclick.net'                               // 广告:常挂起
 ];
 
 /** 通用静态资源扩展名(用于识别可缓存的不可变资源) */
@@ -120,6 +98,7 @@ class WebCacheManager {
   private diskCapBytes: number = DISK_CAP_BYTES;    // 沙箱缓存上限(可远程下发)
   private docCheckMs: number = DOC_CHECK_MS;        // 主文档校验节流(可远程下发)
   private bundleConcurrency: number = BUNDLE_CONCURRENCY; // 远程离线包下载并发(可远程下发)
+  private prefetchEnabled: boolean = true;          // 是否预取全站 chunk(可远程下发)
 
   private rawIndex: Map<string, RawEntry> = new Map();
   private diskIndex: Map<string, DiskEntry> = new Map();
@@ -195,8 +174,11 @@ class WebCacheManager {
     if (typeof s.bundleConcurrency === 'number' && s.bundleConcurrency > 0) {
       this.bundleConcurrency = Math.max(1, Math.min(8, Math.floor(s.bundleConcurrency)));
     }
-    hilog.info(DOMAIN, TAG, 'settings applied cap=%{public}dB docCheck=%{public}dms bundleConcurrency=%{public}d',
-      this.diskCapBytes, this.docCheckMs, this.bundleConcurrency);
+    if (typeof s.prefetchChunks === 'boolean') {
+      this.prefetchEnabled = s.prefetchChunks;
+    }
+    hilog.info(DOMAIN, TAG, 'settings applied cap=%{public}dB docCheck=%{public}dms bundleConcurrency=%{public}d prefetch=%{public}s',
+      this.diskCapBytes, this.docCheckMs, this.bundleConcurrency, this.prefetchEnabled ? 'on' : 'off');
   }
 
   /** 查询某站离线包下载进度(无则返回 null) */
@@ -221,9 +203,13 @@ class WebCacheManager {
   /**
    * 二级页面加速:解析 webpack 运行时,把站点**全部按需 chunk** 后台预缓存。
    * 点进任何子路由时其 JS 都已在本地。每个站点只跑一次。
+   * 框架级能力(Next.js 系有效),由后台 settings.prefetchChunks 控制;非 Next 站本就自动无操作。
    * @param originUrl 该站任意同源 URL(用于取 origin)
    */
   prefetchSiteChunks(originUrl: string): void {
+    if (!this.prefetchEnabled) {
+      return; // 后台关闭了全站 chunk 预取
+    }
     const om = originUrl.match(/^https?:\/\/[^\/]+/);
     const origin: string = om ? om[0] : '';
     if (origin.length === 0 || this.prefetchedOrigins.has(origin)) {

@@ -25,6 +25,7 @@ export interface RemoteSettings {
   diskCapMB?: number;
   docCheckSec?: number;
   bundleConcurrency?: number;
+  prefetchChunks?: boolean;  // 是否预取全站 chunk(Next.js 系站点有效;非 Next 站自动无操作)。默认 true
   bytecodeCache?: boolean;
 }
 

@@ -120,9 +120,10 @@ function defaultConfig() {
       'aem-kakao-collector.onkakao.net', 'aichat.com'
     ],
     settings: {
-      diskCapMB: 64,        // 运行时缓存上限
-      docCheckSec: 60,      // 主文档版本校验节流(秒)
-      bundleConcurrency: 3, // 远程离线包后台下载并发
+      diskCapMB: 64,         // 运行时缓存上限
+      docCheckSec: 60,       // 主文档版本校验节流(秒)
+      bundleConcurrency: 3,  // 远程离线包后台下载并发
+      prefetchChunks: true,  // 是否预取全站 chunk(Next.js 系有效)
       bytecodeCache: true
     }
   };
