@@ -69,6 +69,7 @@ export interface CacheStats {
   bundleActive: number; // 离线包正在下载的资源数
   bundleQueued: number; // 离线包排队待下的资源数
   lastUrl: string;      // 最近被后台缓存的资源 URL(看"在缓存哪个站的什么资源")
+  recent: string[];     // 最近若干条后台缓存的 URL(新→旧),用于浮窗列出多个
 }
 
 /** 某站离线包下载进度(对外只读) */
@@ -126,6 +127,7 @@ class WebCacheManager {
   private loadedBundles: Set<string> = new Set();                 // 本次会话已拉过远程离线包的站点(按 origin)
   private bundleProgress: Map<string, BundleProgressEntry> = new Map(); // 各站离线包下载进度(按 origin)
   private lastCachedUrl: string = '';                             // 最近被后台缓存的资源 URL(调试浮窗用)
+  private recentCached: string[] = [];                            // 最近若干条后台缓存(新→旧,调试浮窗列表用)
 
   /** 启动时调用一次(EntryAbility.onCreate) */
   init(context: common.UIAbilityContext): void {
@@ -446,7 +448,8 @@ class WebCacheManager {
       pending: this.pending.size,
       bundleActive: this.activeBundleDownloads,
       bundleQueued: this.bundleQueue.length,
-      lastUrl: this.lastCachedUrl
+      lastUrl: this.lastCachedUrl,
+      recent: this.recentCached.slice(0)
     };
   }
 
@@ -542,7 +545,14 @@ class WebCacheManager {
       return; // 已在沙箱或内置包里,不重复下(预取全量 chunk 时靠这个跳过已有的)
     }
     this.inflight.add(cacheKey);
-    this.lastCachedUrl = cacheKey; // 调试浮窗:一发起下载就记录"正在缓存的资源"(不等下完)
+    // 调试浮窗:一发起下载就记录"正在缓存的资源"(不等下完),并入最近列表(新→旧,留 12 条)
+    this.lastCachedUrl = cacheKey;
+    if (this.recentCached.length === 0 || this.recentCached[0] !== cacheKey) {
+      this.recentCached.unshift(cacheKey);
+      if (this.recentCached.length > 12) {
+        this.recentCached.pop();
+      }
+    }
     const client = http.createHttp();
     const reqHeader: Record<string, string> = {
       'Accept': 'text/html,image/avif,image/webp,application/javascript,text/css,*/*',

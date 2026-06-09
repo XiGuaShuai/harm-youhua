@@ -11,8 +11,9 @@ import { remoteConfig, RemoteApp } from './core/RemoteConfig';
 export struct WebAccelDebugBadge {
   @State stats: CacheStats = {
     raw: 0, disk: 0, hitRaw: 0, hitDisk: 0, miss: 0, blocked: 0, bytes: 0,
-    inflight: 0, pending: 0, bundleActive: 0, bundleQueued: 0, lastUrl: ''
+    inflight: 0, pending: 0, bundleActive: 0, bundleQueued: 0, lastUrl: '', recent: []
   };
+  @State cacheIdx: number = 0; // "正在缓存"那行在最近列表里的滚动下标(快速切换效果)
   @State expanded: boolean = true;
   @State posX: number = 12;   // 默认左上角
   @State posY: number = 60;
@@ -21,9 +22,12 @@ export struct WebAccelDebugBadge {
   private timerId: number = -1;
 
   aboutToAppear(): void {
+    // 350ms 一跳:刷新统计 + 让"正在缓存"那行在最近缓存的资源间快速滚动切换(下载切换效果)
     this.timerId = setInterval(() => {
       this.stats = webCache.stats();
-    }, 1000);
+      const n: number = this.stats.recent.length;
+      this.cacheIdx = n > 0 ? (this.cacheIdx + 1) % n : 0;
+    }, 350);
   }
 
   aboutToDisappear(): void {
@@ -38,9 +42,8 @@ export struct WebAccelDebugBadge {
     return (this.stats.inflight + this.stats.pending + this.stats.bundleActive + this.stats.bundleQueued) > 0;
   }
 
-  /** 最近缓存的资源属于哪个应用/站点 + 文件名(看"在缓存哪个应用的资源") */
-  private cachingLabel(): string {
-    const u: string = this.stats.lastUrl;
+  /** 某条资源属于哪个应用/站点 + 文件名(看"在缓存哪个应用的资源") */
+  private labelFor(u: string): string {
     if (u.length === 0) {
       return '';
     }
@@ -74,8 +77,9 @@ export struct WebAccelDebugBadge {
           .fontSize(10)
           .fontColor(this.bgCaching() ? '#22DD88' : '#AAAAAA')
           .margin({ top: 2 })
-        if (this.stats.lastUrl.length > 0) {
-          Text(this.cachingLabel())
+        if (this.stats.recent.length > 0) {
+          // 单行,在最近缓存的资源间快速切换 → "下载切换"效果
+          Text(this.labelFor(this.stats.recent[this.cacheIdx % this.stats.recent.length]))
             .fontSize(9)
             .fontColor('#88CCFF')
             .margin({ top: 1 })
