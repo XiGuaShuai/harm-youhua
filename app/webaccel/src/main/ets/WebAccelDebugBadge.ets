@@ -63,14 +63,18 @@ export struct WebAccelDebugBadge {
     return remoteConfig.getSource() === 'server';
   }
 
-  /** 某应用的「已缓存/总缓存」:启用了离线包 → done/total;否则 → 沙箱已缓存条数 */
+  /**
+   * 某应用的缓存进度。两种模式标清楚:
+   *  - 启用离线包(bundle:true) → 「包 已下/总数」,有明确总数;
+   *  - 未启用(bundle:false)  → 「缓 已缓存条数」,运行时边用边缓存,无固定总数。
+   */
   private progressText(app: RemoteApp): string {
     const origin: string = this.originOf(app.url);
     const bp: BundleProgress | null = webCache.getBundleProgress(origin);
     if (bp && bp.total > 0) {
-      return `${bp.done}/${bp.total}`;
+      return `包 ${bp.done}/${bp.total}`;
     }
-    return `${webCache.cachedCountForOrigin(origin)} 条`;
+    return `缓 ${webCache.cachedCountForOrigin(origin)} 条`;
   }
 
   build() {
