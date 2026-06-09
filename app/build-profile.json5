@@ -5,13 +5,13 @@
         "name": "default",
         "type": "HarmonyOS",
         "material": {
-          "certpath": "C:\\Users\\pzx\\.ohos\\config\\default_youhua_WTeL4rGExq5FLb673ohkSmAv4MHawvI872bmPX7TZOc=.cer",
+          "certpath": "C:\\Users\\xskj-xnhz\\.ohos\\config\\default_app_ix4ZtcY5O04rVBYdIOyTmQtSZcX_j9ZXQGZm5_s-TFU=.cer",
           "keyAlias": "debugKey",
-          "keyPassword": "0000001B17B373D12E834A5549C1766D49C4D99C640F924B95C1711398AC03B1BFEDA9A3163BD8220527C6",
-          "profile": "C:\\Users\\pzx\\.ohos\\config\\default_youhua_WTeL4rGExq5FLb673ohkSmAv4MHawvI872bmPX7TZOc=.p7b",
+          "keyPassword": "0000001BE03C7DD9A852C116E7C1B38A29878C1A65161EAAF139A830A281A9CD4BF53B7EF3811A4483E73D",
+          "profile": "C:\\Users\\xskj-xnhz\\.ohos\\config\\default_app_ix4ZtcY5O04rVBYdIOyTmQtSZcX_j9ZXQGZm5_s-TFU=.p7b",
           "signAlg": "SHA256withECDSA",
-          "storeFile": "C:\\Users\\pzx\\.ohos\\config\\default_youhua_WTeL4rGExq5FLb673ohkSmAv4MHawvI872bmPX7TZOc=.p12",
-          "storePassword": "0000001BBD701EBFC2A325DD22AF906B3A35A83E49AF896C9E0452331FC5A1A8D8A042B3F829B02B6832CF"
+          "storeFile": "C:\\Users\\xskj-xnhz\\.ohos\\config\\default_app_ix4ZtcY5O04rVBYdIOyTmQtSZcX_j9ZXQGZm5_s-TFU=.p12",
+          "storePassword": "0000001B10768A88FF0005E6B5D9A54BCBE40E32F7D4C370839C1ECC9AC3102F0161686E5CAA5B88278E25"
         }
       }
     ],
@@ -19,8 +19,8 @@
       {
         "name": "default",
         "signingConfig": "default",
-        "targetSdkVersion": "6.0.1(21)",
-        "compatibleSdkVersion": "6.0.1(21)",
+        "targetSdkVersion": "5.0.1(13)",
+        "compatibleSdkVersion": "5.0.1(13)",
         "runtimeOS": "HarmonyOS",
         "buildOption": {
           "strictMode": {
