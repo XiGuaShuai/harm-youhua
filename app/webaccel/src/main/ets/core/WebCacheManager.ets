@@ -453,6 +453,20 @@ class WebCacheManager {
     };
   }
 
+  /** 某站(按 origin)已在沙箱缓存的资源条数(给无离线包的应用看"已缓存多少") */
+  cachedCountForOrigin(origin: string): number {
+    if (origin.length === 0) {
+      return 0;
+    }
+    let n: number = 0;
+    this.diskIndex.forEach((e: DiskEntry) => {
+      if (e.url.indexOf(origin) === 0) {
+        n++;
+      }
+    });
+    return n;
+  }
+
   /** 是否命中黑名单(会挂死的外部请求) */
   private isBlocked(url: string): boolean {
     for (let i = 0; i < this.blockHosts.length; i++) {

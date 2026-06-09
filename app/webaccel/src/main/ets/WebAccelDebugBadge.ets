@@ -1,11 +1,11 @@
-import { webCache, CacheStats } from './core/WebCacheManager';
-import { remoteConfig, RemoteApp } from './core/RemoteConfig';
+import { webCache, CacheStats, BundleProgress } from './core/WebCacheManager';
+import { RemoteApp } from './core/RemoteConfig';
 
 /**
- * 可拖动的调试浮窗:实时显示「缓存命中」+「后台是否在偷偷缓存」。
+ * 可拖动的调试浮窗:显示「缓存命中」+「各应用已缓存/总缓存」。
  * 默认左上角,可拖到任意位置,点击展开/收起。
- * 由 WebAccelLauncher 挂在最顶层(覆盖首页列表 + 网页,全程可见);
- * 自定义壳也可自行 WebAccelDebugBadge() 挂到页面根。显隐由 WebAccel.setDebug() 控制(父层渲染门控)。
+ * 由 WebAccelLauncher 挂在最顶层(覆盖首页列表 + 网页,全程可见);也可自行挂到页面根。
+ * 显隐由 WebAccel.setDebug() 控制(父层渲染门控)。
  */
 @Component
 export struct WebAccelDebugBadge {
@@ -13,7 +13,8 @@ export struct WebAccelDebugBadge {
     raw: 0, disk: 0, hitRaw: 0, hitDisk: 0, miss: 0, blocked: 0, bytes: 0,
     inflight: 0, pending: 0, bundleActive: 0, bundleQueued: 0, lastUrl: '', recent: []
   };
-  @State cacheIdx: number = 0; // "正在缓存"那行在最近列表里的滚动下标(快速切换效果)
+  // 应用列表(WebAccel 写入 AppStorage('apps'))
+  @StorageLink('apps') apps: RemoteApp[] = [];
   @State expanded: boolean = true;
   @State posX: number = 12;   // 默认左上角
   @State posY: number = 60;
@@ -22,12 +23,10 @@ export struct WebAccelDebugBadge {
   private timerId: number = -1;
 
   aboutToAppear(): void {
-    // 350ms 一跳:刷新统计 + 让"正在缓存"那行在最近缓存的资源间快速滚动切换(下载切换效果)
+    // 1s 刷新:统计 + 各应用缓存进度(build 重跑时 progressText 读最新值)
     this.timerId = setInterval(() => {
       this.stats = webCache.stats();
-      const n: number = this.stats.recent.length;
-      this.cacheIdx = n > 0 ? (this.cacheIdx + 1) % n : 0;
-    }, 350);
+    }, 1000);
   }
 
   aboutToDisappear(): void {
@@ -42,27 +41,19 @@ export struct WebAccelDebugBadge {
     return (this.stats.inflight + this.stats.pending + this.stats.bundleActive + this.stats.bundleQueued) > 0;
   }
 
-  /** 某条资源属于哪个应用/站点 + 文件名(看"在缓存哪个应用的资源") */
-  private labelFor(u: string): string {
-    if (u.length === 0) {
-      return '';
+  private originOf(url: string): string {
+    const om = url.match(/^https?:\/\/[^\/]+/);
+    return om ? om[0] : '';
+  }
+
+  /** 某应用的「已缓存/总缓存」:启用了离线包 → done/total;否则 → 沙箱已缓存条数 */
+  private progressText(app: RemoteApp): string {
+    const origin: string = this.originOf(app.url);
+    const bp: BundleProgress | null = webCache.getBundleProgress(origin);
+    if (bp && bp.total > 0) {
+      return `${bp.done}/${bp.total}`;
     }
-    const om = u.match(/^https?:\/\/[^\/]+/);
-    const origin: string = om ? om[0] : '';
-    const host: string = origin.replace(/^https?:\/\//, '');
-    const path: string = u.split('?')[0];
-    const slash: number = path.lastIndexOf('/');
-    const file: string = slash >= 0 ? path.substring(slash + 1) : path;
-    // 能匹配到应用就显示应用名,否则显示域名
-    let name: string = host;
-    const apps: RemoteApp[] = remoteConfig.getApps();
-    for (let i = 0; i < apps.length; i++) {
-      if (apps[i].url && origin.length > 0 && apps[i].url.indexOf(origin) === 0) {
-        name = apps[i].name;
-        break;
-      }
-    }
-    return file.length > 0 ? `${name} · ${file}` : name;
+    return `${webCache.cachedCountForOrigin(origin)} 条`;
   }
 
   build() {
@@ -71,22 +62,26 @@ export struct WebAccelDebugBadge {
         Text(`命中 R:${this.stats.hitRaw} D:${this.stats.hitDisk}　透传:${this.stats.miss}　拦:${this.stats.blocked}`)
           .fontSize(10)
           .fontColor(Color.White)
-        Text(this.bgCaching()
-          ? `↓ 后台缓存中  下载:${this.stats.inflight} 待:${this.stats.pending} 包:${this.stats.bundleActive}+${this.stats.bundleQueued}`
-          : '后台空闲')
-          .fontSize(10)
+        Text(this.bgCaching() ? '↓ 后台缓存中  应用(已缓存/总缓存)' : '后台空闲  应用(已缓存/总缓存)')
+          .fontSize(9)
           .fontColor(this.bgCaching() ? '#22DD88' : '#AAAAAA')
           .margin({ top: 2 })
-        if (this.stats.recent.length > 0) {
-          // 单行,在最近缓存的资源间快速切换 → "下载切换"效果
-          Text(this.labelFor(this.stats.recent[this.cacheIdx % this.stats.recent.length]))
-            .fontSize(9)
-            .fontColor('#88CCFF')
-            .margin({ top: 1 })
-            .maxLines(1)
-            .textOverflow({ overflow: TextOverflow.Ellipsis })
-            .constraintSize({ maxWidth: 240 })
-        }
+        ForEach(this.apps, (app: RemoteApp) => {
+          Row() {
+            Text(app.name)
+              .fontSize(10)
+              .fontColor(Color.White)
+              .maxLines(1)
+              .textOverflow({ overflow: TextOverflow.Ellipsis })
+              .layoutWeight(1)
+            Text(this.progressText(app))
+              .fontSize(10)
+              .fontColor('#88CCFF')
+              .margin({ left: 8 })
+          }
+          .width(196)
+          .margin({ top: 1 })
+        }, (app: RemoteApp) => app.url)
         Text(`沙箱 ${this.stats.disk} 条　${Math.round(this.stats.bytes / 1024)} KB`)
           .fontSize(10)
           .fontColor(Color.White)
