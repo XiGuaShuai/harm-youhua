@@ -107,24 +107,26 @@ function sameOriginPath(ref, origin, baseForResolve) {
 }
 
 async function discoverResources(appCfg) {
-  const base = appCfg.url.replace(/\/+$/, '');
   const origin = new URL(appCfg.url).origin;
+  const entryUrl = appCfg.url;                                  // 入口页(可为深层子页,如 .../tickets):要缓存的主文档
+  const entryU = new URL(entryUrl);
+  const entryKey = origin + entryU.pathname + entryU.search;    // 主文档缓存键 = 入口页真实路径(设备端按此 URL 命中)
   const routes = (appCfg.routes && appCfg.routes.length) ? appCfg.routes : ['/'];
   const jsSet = new Set(), cssSet = new Set(), fontSet = new Set();
 
-  const html = await fetchText(base + '/');
-  if (!html) throw new Error('抓取首页失败');
+  const html = await fetchText(entryUrl);
+  if (!html) throw new Error('抓取入口页失败');
 
   // ① Next.js 专用:/_next/static + webpack runtime + 各路由 RSC(对 Next 站抓得最全)
   matchAll(html, /\/_next\/static\/chunks\/[A-Za-z0-9/._-]+\.js/g).forEach((x) => jsSet.add(x));
   matchAll(html, /\/_next\/static\/css\/[A-Za-z0-9._-]+\.css/g).forEach((x) => cssSet.add(x));
   const wp = matchAll(html, /\/_next\/static\/chunks\/webpack-[a-f0-9]+\.js/g)[0];
   if (wp) {
-    const wpText = await fetchText(base + wp);
+    const wpText = await fetchText(origin + wp);
     matchAll(wpText, /static\/chunks\/[A-Za-z0-9/._-]+\.js/g).forEach((x) => jsSet.add('/_next/' + x));
   }
   for (const r of routes) {
-    const rsc = await fetchText(base + r + '?_rsc=warm', { RSC: '1' });
+    const rsc = await fetchText(origin + r + '?_rsc=warm', { RSC: '1' });
     matchAll(rsc, /static\/chunks\/[A-Za-z0-9/._-]+\.js/g).forEach((x) => jsSet.add('/_next/' + x));
   }
 
@@ -134,7 +136,7 @@ async function discoverResources(appCfg) {
     ...matchGroup(html, /<link[^>]+href=["']([^"']+\.css(?:\?[^"']*)?)["']/gi)
   ];
   for (const ref of refs) {
-    const p = sameOriginPath(ref, origin, base + '/');
+    const p = sameOriginPath(ref, origin, entryUrl);
     if (!p || !isHashedAsset(p)) continue;
     if (p.endsWith('.js')) jsSet.add(p);
     else if (p.endsWith('.css')) cssSet.add(p);
@@ -142,7 +144,7 @@ async function discoverResources(appCfg) {
 
   // ③ 从每个 CSS 里抓字体/媒体(Next 的 /_next/static/media + 通用 url() 同源 hash 资源)
   for (const c of cssSet) {
-    const css = await fetchText(base + c);
+    const css = await fetchText(origin + c);
     matchAll(css, /\/_next\/static\/media\/[A-Za-z0-9/._-]+\.(?:ttf|woff2|woff|otf)/g).forEach((x) => fontSet.add(x));
     for (const m of css.matchAll(/url\(\s*['"]?([^'")?#]+\.(?:woff2|woff|ttf|otf|eot))/gi)) {
       const p = sameOriginPath(m[1], origin, origin + c);
@@ -151,11 +153,11 @@ async function discoverResources(appCfg) {
   }
 
   const resources = [
-    { url: origin + '/', sourceUrl: base + '/', file: 'home.html', mime: 'text/html' }
+    { url: entryKey, sourceUrl: entryUrl, file: 'home.html', mime: 'text/html' }
   ];
   const all = [...jsSet, ...cssSet, ...fontSet];
   for (const u of all) {
-    resources.push({ url: origin + u, sourceUrl: base + u, file: fileNameForPath(u), mime: mimeOf(u) });
+    resources.push({ url: origin + u, sourceUrl: origin + u, file: fileNameForPath(u), mime: mimeOf(u) });
   }
 
   const seen = new Set();
@@ -285,8 +287,9 @@ async function buildServerCache(appCfg) {
   fs.mkdirSync(outDir, { recursive: true });
 
   const manifest = [];
+  const homeEntry = discovered.resources.find((e) => e.file === 'home.html');
   fs.writeFileSync(path.join(outDir, 'home.html'), discovered.html, 'utf8');
-  manifest.push({ url: origin + '/', file: 'home.html', mime: 'text/html' });
+  manifest.push({ url: homeEntry ? homeEntry.url : origin + '/', file: 'home.html', mime: 'text/html' });
 
   // 体积上限:资源已按 rank 排序(css/js 在前、字体在后),超预算就跳过 → 砍掉的主要是靠后的字体
   // (字体非首屏关键,文字先用系统字体显示,真正用到时再走运行时缓存)
