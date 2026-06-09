@@ -13,7 +13,7 @@ const DOMAIN: number = 0x0001;
 const RAW_DIR: string = 'webcache';                 // rawfile 下的目录
 const DISK_CAP_BYTES: number = 64 * 1024 * 1024;    // 沙箱运行时缓存总量上限 64MB
 const DOC_CHECK_MS: number = 60 * 1000;             // 主文档版本校验节流:60 秒内不重复校验
-const BUNDLE_CONCURRENCY: number = 3;               // 远程离线包后台下载并发上限
+const BUNDLE_CONCURRENCY: number = 8;               // 远程离线包后台下载并发上限(可远程下发覆盖,上限 8)
 
 /**
  * SDK 内置的极小「首启安全网」黑名单 —— **不是站点优化**。
