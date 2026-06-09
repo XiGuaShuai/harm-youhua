@@ -2,9 +2,9 @@
   "apiType": "stageMode",
   "buildOption": {
     "arkOptions": {
-      // 后台地址默认值(debug/开发):跑 admin 的电脑局域网 IP。代码读 BuildProfile.CONFIG_SERVER。
+      // 后台地址默认值(debug/开发):已部署的云端后台 maidun(HTTPS)。代码读 BuildProfile.CONFIG_SERVER。
       "buildProfileFields": {
-        "CONFIG_SERVER": "http://192.168.20.133:8787"
+        "CONFIG_SERVER": "https://maidun.chujingservice.com"
       }
     }
   },
@@ -14,7 +14,7 @@
       "arkOptions": {
         // 后台地址(release/上线):改成你的生产域名,只改这一处、且只在 release 生效。
         "buildProfileFields": {
-          "CONFIG_SERVER": "https://admin.example.com"
+          "CONFIG_SERVER": "https://maidun.chujingservice.com"
         },
         "obfuscation": {
           "ruleOptions": {
