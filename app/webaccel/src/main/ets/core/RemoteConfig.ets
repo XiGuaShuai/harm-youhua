@@ -175,6 +175,9 @@ class RemoteConfigManager {
   private publishApps(): void {
     // 全局状态,launcher 用 @StorageLink('apps') 自动响应
     AppStorage.setOrCreate<RemoteApp[]>('apps', this.getApps());
+    // 配置来源 / 版本也发布到 AppStorage,调试浮窗用 @StorageLink 订阅 → 拉到配置即自动刷新(不用点)
+    AppStorage.setOrCreate<string>('configSource', this.source);
+    AppStorage.setOrCreate<string>('configVersion', this.getVersion());
     const apps: RemoteApp[] = this.getApps();
     for (let i = 0; i < this.appHandlers.length; i++) {
       this.appHandlers[i](apps);

@@ -1,5 +1,5 @@
 import { webCache, CacheStats, BundleProgress } from './core/WebCacheManager';
-import { remoteConfig, RemoteApp } from './core/RemoteConfig';
+import { RemoteApp } from './core/RemoteConfig';
 
 /**
  * 可拖动的调试浮窗:显示「缓存命中」+「各应用已缓存/总缓存」。
@@ -15,6 +15,9 @@ export struct WebAccelDebugBadge {
   };
   // 应用列表(WebAccel 写入 AppStorage('apps'))
   @StorageLink('apps') apps: RemoteApp[] = [];
+  // 配置来源 / 版本(RemoteConfig 写入 AppStorage):订阅后拉到配置即自动重绘,无需点击浮窗
+  @StorageLink('configSource') cfgSource: string = 'fallback';
+  @StorageLink('configVersion') cfgVersion: string = '';
   @State expanded: boolean = true;
   @State posX: number = 12;   // 默认左上角
   @State posY: number = 60;
@@ -48,9 +51,9 @@ export struct WebAccelDebugBadge {
 
   /** 配置(含应用名)来自哪:服务器 / 缓存 / 兜底 —— 看应用名是不是后台下发的 */
   private configLine(): string {
-    const s: string = remoteConfig.getSource();
+    const s: string = this.cfgSource; // 读 @StorageLink → 该文本节点随配置来源变化自动重绘
     if (s === 'server') {
-      const v: string = remoteConfig.getVersion();
+      const v: string = this.cfgVersion;
       return '配置: 服务器 ✓ ' + (v.length >= 16 ? v.substring(5, 16) : v);
     }
     if (s === 'cache') {
@@ -60,7 +63,7 @@ export struct WebAccelDebugBadge {
   }
 
   private configFromServer(): boolean {
-    return remoteConfig.getSource() === 'server';
+    return this.cfgSource === 'server';
   }
 
   /**
