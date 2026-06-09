@@ -1,5 +1,6 @@
 import { WebAccel } from './WebAccel';
 import { WebAccelView } from './WebAccelView';
+import { WebAccelDebugBadge } from './WebAccelDebugBadge';
 import { RemoteApp } from './core/RemoteConfig';
 
 /**
@@ -23,6 +24,8 @@ export struct WebAccelLauncher {
 
   // 应用列表来自远程配置(WebAccel.init 后写入 AppStorage('apps'));拉到新配置自动刷新
   @StorageLink('apps') apps: RemoteApp[] = [];
+  // 调试浮窗开关(WebAccel.setDebug 驱动):开后浮窗挂在最顶层,首页列表 + 网页全程可见、可拖动
+  @StorageLink('webaccel_debug') debugOn: boolean = false;
   private stack: NavPathStack = new NavPathStack();
 
   aboutToAppear(): void {
@@ -45,29 +48,39 @@ export struct WebAccelLauncher {
   }
 
   build() {
-    Navigation(this.stack) {
-      Column({ space: 14 }) {
-        Text(this.title)
-          .fontSize(22)
-          .fontWeight(FontWeight.Bold)
-          .margin({ top: 48, bottom: 16 })
-        ForEach(this.apps, (a: RemoteApp) => {
-          Button(a.name)
-            .width('80%')
-            .height(50)
-            .fontSize(16)
-            .backgroundColor(this.accentColor)
-            .onClick(() => {
-              this.stack.pushPath({ name: a.url });
-            })
-        }, (a: RemoteApp) => a.url)
+    // 根 Stack:Navigation 在下,调试浮窗在最上层(故首页列表 + 网页页全程可见、可拖动)
+    Stack() {
+      Navigation(this.stack) {
+        Column({ space: 14 }) {
+          Text(this.title)
+            .fontSize(22)
+            .fontWeight(FontWeight.Bold)
+            .margin({ top: 48, bottom: 16 })
+          ForEach(this.apps, (a: RemoteApp) => {
+            Button(a.name)
+              .width('80%')
+              .height(50)
+              .fontSize(16)
+              .backgroundColor(this.accentColor)
+              .onClick(() => {
+                this.stack.pushPath({ name: a.url });
+              })
+          }, (a: RemoteApp) => a.url)
+        }
+        .width('100%')
+        .height('100%')
+        .backgroundColor(this.backgroundColor2)
       }
-      .width('100%')
-      .height('100%')
-      .backgroundColor(this.backgroundColor2)
+      .navDestination(this.webDestination)
+      .mode(NavigationMode.Stack)
+      .hideTitleBar(true)
+
+      // 调试浮窗:挂在最顶层,首页 + 网页全程可见、可拖动(WebAccel.setDebug(true) 开启)
+      if (this.debugOn) {
+        WebAccelDebugBadge()
+      }
     }
-    .navDestination(this.webDestination)
-    .mode(NavigationMode.Stack)
-    .hideTitleBar(true)
+    .width('100%')
+    .height('100%')
   }
 }

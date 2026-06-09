@@ -56,13 +56,18 @@ interface DiskEntry {
 
 /** 调试用统计 */
 export interface CacheStats {
-  raw: number;     // 内置包条数
-  disk: number;    // 沙箱缓存条数
-  hitRaw: number;  // 命中内置包次数
-  hitDisk: number; // 命中沙箱次数
-  miss: number;    // 透传次数
-  blocked: number; // 短路掉的外部挂起请求次数
-  bytes: number;   // 沙箱已用字节
+  raw: number;          // 内置包条数
+  disk: number;         // 沙箱缓存条数
+  hitRaw: number;       // 命中内置包次数
+  hitDisk: number;      // 命中沙箱次数
+  miss: number;         // 透传次数
+  blocked: number;      // 短路掉的外部挂起请求次数
+  bytes: number;        // 沙箱已用字节
+  // —— 后台缓存活动(用于"是否在背后偷偷再缓存")——
+  inflight: number;     // 正在下载回填的资源数
+  pending: number;      // 页面加载完待回填的资源数
+  bundleActive: number; // 离线包正在下载的资源数
+  bundleQueued: number; // 离线包排队待下的资源数
 }
 
 /** 某站离线包下载进度(对外只读) */
@@ -434,7 +439,11 @@ class WebCacheManager {
       hitDisk: this.hitDisk,
       miss: this.miss,
       blocked: this.blocked,
-      bytes: this.totalBytes
+      bytes: this.totalBytes,
+      inflight: this.inflight.size,
+      pending: this.pending.size,
+      bundleActive: this.activeBundleDownloads,
+      bundleQueued: this.bundleQueue.length
     };
   }
 

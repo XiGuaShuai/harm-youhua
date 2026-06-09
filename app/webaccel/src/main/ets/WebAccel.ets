@@ -118,6 +118,20 @@ export class WebAccel {
     return webCache.stats();
   }
 
+  /**
+   * 调试浮窗开关。开启后,WebAccelView(及 WebAccelLauncher 内的网页)右上角叠加一个浮窗,
+   * 实时显示「缓存命中(命中/透传)」与「后台是否在偷偷缓存(下载中/待回填/离线包队列)」。默认关。
+   * 用全局 AppStorage('webaccel_debug') 驱动,可在任意处调用、随时开关。
+   */
+  static setDebug(on: boolean): void {
+    AppStorage.setOrCreate<boolean>('webaccel_debug', on);
+  }
+
+  /** 调试浮窗是否开启 */
+  static isDebug(): boolean {
+    return AppStorage.get<boolean>('webaccel_debug') === true;
+  }
+
   /** 某站离线包下载进度(无则 null) */
   static bundleProgress(origin: string): BundleProgress | null {
     return webCache.getBundleProgress(origin);

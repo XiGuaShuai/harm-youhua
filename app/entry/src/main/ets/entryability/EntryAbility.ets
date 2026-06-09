@@ -27,6 +27,9 @@ export default class EntryAbility extends UIAbility {
     // apps 为兜底:后台可达时以 /api/config 覆盖;不可达时也有列表可显示。
     WebAccel.init(this.context, { apps: FALLBACK_APPS });
 
+    // 调试浮窗:打开后网页右上角显示「缓存命中 + 后台是否在偷偷缓存」。上线时关掉(或不调)。
+    WebAccel.setDebug(true);
+
     hilog.info(DOMAIN, 'testTag', '%{public}s', 'Ability onCreate');
   }
 

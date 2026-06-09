@@ -21,6 +21,7 @@ import { WebAccel, WebAccelLauncher, WebAccelView, WebAccelOptions, RemoteApp } 
 | `WebAccel.getApps()` / `setApps(apps)` | 读 / 运行时直接喂应用列表 |
 | `WebAccel.refreshConfig()` | 手动拉一次后台最新配置 |
 | `WebAccel.stats()` / `bundleProgress(origin)` | 缓存统计 / 某站离线包进度(调试) |
+| **`WebAccel.setDebug(on)`** | **调试浮窗开关**:开后挂在**最顶层**的可拖动浮窗(默认左上角),**首页列表 + 网页全程可见**,实时显示「缓存命中(命中/透传/拦截)」+「后台是否在偷偷缓存(下载中/待回填/离线包队列)」。点击展开收起、拖动移动。默认关,上线别开 |
 | `WebAccel.attach(uiContext)` / `prewarm(url, swrDoc?)` / `obtain(url)` | 可选/底层:UIContext 与预热现已自动,通常无需手动调 |
 
 ### `WebAccelOptions`
