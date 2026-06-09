@@ -542,6 +542,7 @@ class WebCacheManager {
       return; // 已在沙箱或内置包里,不重复下(预取全量 chunk 时靠这个跳过已有的)
     }
     this.inflight.add(cacheKey);
+    this.lastCachedUrl = cacheKey; // 调试浮窗:一发起下载就记录"正在缓存的资源"(不等下完)
     const client = http.createHttp();
     const reqHeader: Record<string, string> = {
       'Accept': 'text/html,image/avif,image/webp,application/javascript,text/css,*/*',
@@ -581,7 +582,6 @@ class WebCacheManager {
           this.saveDiskIndex();
           this.markBundleResource(cacheKey); // 若属于某站离线包,推进其下载进度
           ok = true;
-          this.lastCachedUrl = cacheKey;     // 调试浮窗:最近被后台缓存的资源(用于显示"正在缓存哪个站")
           hilog.info(DOMAIN, TAG, 'cached %{public}s %{public}d B', mime, body.byteLength);
 
           // 主文档版本变了 = 站点更新 → 通知(池)刷新对应节点,立即用上新版
