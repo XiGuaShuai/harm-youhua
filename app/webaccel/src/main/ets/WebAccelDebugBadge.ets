@@ -81,7 +81,8 @@ export struct WebAccelDebugBadge {
           }
           .width(196)
           .margin({ top: 1 })
-        }, (app: RemoteApp) => app.url)
+          // key 带上进度:进度一变 key 就变 → ForEach 重渲染该行,数字才会动
+        }, (app: RemoteApp) => app.url + '|' + this.progressText(app))
         Text(`沙箱 ${this.stats.disk} 条　${Math.round(this.stats.bytes / 1024)} KB`)
           .fontSize(10)
           .fontColor(Color.White)
