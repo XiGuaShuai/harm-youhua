@@ -11,7 +11,7 @@ import { remoteConfig, RemoteApp } from './core/RemoteConfig';
 export struct WebAccelDebugBadge {
   @State stats: CacheStats = {
     raw: 0, disk: 0, hitRaw: 0, hitDisk: 0, miss: 0, blocked: 0, bytes: 0,
-    inflight: 0, pending: 0, bundleActive: 0, bundleQueued: 0, lastUrl: '', recent: []
+    inflight: 0, pending: 0, bundleActive: 0, bundleQueued: 0, lastUrl: '', recent: [], caching: false
   };
   // 应用列表(WebAccel 写入 AppStorage('apps'))
   @StorageLink('apps') apps: RemoteApp[] = [];
@@ -36,9 +36,9 @@ export struct WebAccelDebugBadge {
     }
   }
 
-  /** 后台是否正在偷偷缓存(下载回填 / 待回填 / 离线包下载) */
+  /** 后台是否"真的还在缓存"(最近 3 秒内有缓存成功;挂死/卡住的请求不算,避免一直显示"缓存中") */
   private bgCaching(): boolean {
-    return (this.stats.inflight + this.stats.pending + this.stats.bundleActive + this.stats.bundleQueued) > 0;
+    return this.stats.caching;
   }
 
   private originOf(url: string): string {

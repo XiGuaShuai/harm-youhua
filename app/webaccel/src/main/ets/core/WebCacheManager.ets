@@ -70,6 +70,7 @@ export interface CacheStats {
   bundleQueued: number; // 离线包排队待下的资源数
   lastUrl: string;      // 最近被后台缓存的资源 URL(看"在缓存哪个站的什么资源")
   recent: string[];     // 最近若干条后台缓存的 URL(新→旧),用于浮窗列出多个
+  caching: boolean;     // 是否"真的还在缓存"(最近 3 秒内有缓存成功;挂死的请求不算)
 }
 
 /** 某站离线包下载进度(对外只读) */
@@ -128,6 +129,7 @@ class WebCacheManager {
   private bundleProgress: Map<string, BundleProgressEntry> = new Map(); // 各站离线包下载进度(按 origin)
   private lastCachedUrl: string = '';                             // 最近被后台缓存的资源 URL(调试浮窗用)
   private recentCached: string[] = [];                            // 最近若干条后台缓存(新→旧,调试浮窗列表用)
+  private lastCacheAt: number = 0;                                // 最近一次"缓存成功"的时刻(判断是否真的还在缓存)
 
   /** 启动时调用一次(EntryAbility.onCreate) */
   init(context: common.UIAbilityContext): void {
@@ -449,7 +451,8 @@ class WebCacheManager {
       bundleActive: this.activeBundleDownloads,
       bundleQueued: this.bundleQueue.length,
       lastUrl: this.lastCachedUrl,
-      recent: this.recentCached.slice(0)
+      recent: this.recentCached.slice(0),
+      caching: this.lastCacheAt > 0 && (Date.now() - this.lastCacheAt) < 3000
     };
   }
 
@@ -606,6 +609,7 @@ class WebCacheManager {
           this.saveDiskIndex();
           this.markBundleResource(cacheKey); // 若属于某站离线包,推进其下载进度
           ok = true;
+          this.lastCacheAt = Date.now();     // 记"真的缓存成功"的时刻
           hilog.info(DOMAIN, TAG, 'cached %{public}s %{public}d B', mime, body.byteLength);
 
           // 主文档版本变了 = 站点更新 → 通知(池)刷新对应节点,立即用上新版
