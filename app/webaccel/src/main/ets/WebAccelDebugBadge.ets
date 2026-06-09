@@ -21,6 +21,8 @@ export struct WebAccelDebugBadge {
   @State expanded: boolean = true;
   @State posX: number = 12;   // 默认左上角
   @State posY: number = 60;
+  // 各应用缓存进度文本快照:定时器每秒重算并赋新数组 → 行内 Text 实时重绘
+  @State progress: string[] = [];
   private startX: number = 0;
   private startY: number = 0;
   private timerId: number = -1;
@@ -29,6 +31,8 @@ export struct WebAccelDebugBadge {
     // 1s 刷新:统计 + 各应用缓存进度(build 重跑时 progressText 读最新值)
     this.timerId = setInterval(() => {
       this.stats = webCache.stats();
+      // 每秒重算各应用进度并赋新数组,触发行内 Text 重绘(progressText 读外部 webCache,不被 @State 跟踪)
+      this.progress = this.apps.map((a: RemoteApp): string => this.progressText(a));
     }, 1000);
   }
 
@@ -94,7 +98,7 @@ export struct WebAccelDebugBadge {
           .fontSize(9)
           .fontColor(this.bgCaching() ? '#22DD88' : '#AAAAAA')
           .margin({ top: 2 })
-        ForEach(this.apps, (app: RemoteApp) => {
+        ForEach(this.apps, (app: RemoteApp, idx: number) => {
           Row() {
             Text(app.name)
               .fontSize(10)
@@ -102,15 +106,15 @@ export struct WebAccelDebugBadge {
               .maxLines(1)
               .textOverflow({ overflow: TextOverflow.Ellipsis })
               .layoutWeight(1)
-            Text(this.progressText(app))
+            Text(idx < this.progress.length ? this.progress[idx] : this.progressText(app))
               .fontSize(10)
               .fontColor('#88CCFF')
               .margin({ left: 8 })
           }
           .width(196)
           .margin({ top: 1 })
-          // key 带上进度:进度一变 key 就变 → ForEach 重渲染该行,数字才会动
-        }, (app: RemoteApp) => app.url + '|' + this.progressText(app))
+          // 进度文本取自 @State progress(定时器每秒刷新);key 用稳定的 url,内容随 @State 实时重绘
+        }, (app: RemoteApp) => app.url)
         Text(`沙箱 ${this.stats.disk} 条　${Math.round(this.stats.bytes / 1024)} KB`)
           .fontSize(10)
           .fontColor(Color.White)
