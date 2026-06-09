@@ -9,20 +9,19 @@
 ## 对外 API
 
 ```ts
-import { WebAccel, WebAccelView, WebAccelOptions, RemoteApp } from 'webaccel';
+import { WebAccel, WebAccelLauncher, WebAccelView, WebAccelOptions, RemoteApp } from 'webaccel';
 ```
 
 | API | 说明 |
 |---|---|
+| **`WebAccelLauncher({ title?, accentColor? })`** | **开箱即用整页组件**:配置驱动的应用列表 + 内置导航 + 网页展示 + 返回 + 自动预热。配 `init` 即成完整 App |
 | `WebAccel.init(context, options?)` | 开机初始化(UIAbility.onCreate 调一次):内核 + 离线缓存 + 配置一把梭 |
-| `WebAccel.attach(uiContext)` | 提供 UIContext(离屏预渲染需要),首个页面 aboutToAppear 调一次 |
-| `WebAccel.prewarm(url, swrDoc?)` | 预热某网页(预连接 + 主文档 SWR + 离屏预渲染) |
-| `WebAccel.obtain(url)` | 取已渲染节点(`WebAccelView` 内部用;也可自行 `NodeContainer` 挂载) |
+| `WebAccelView({ url })` | 加速网页展示组件:节点挂载 + 白屏占位 + 离线进度条(自定义壳时用) |
 | `WebAccel.goBack(url)` | 网页能后退则后退,宿主页 `onBackPress` 转调 |
 | `WebAccel.getApps()` / `setApps(apps)` | 读 / 运行时直接喂应用列表 |
 | `WebAccel.refreshConfig()` | 手动拉一次后台最新配置 |
 | `WebAccel.stats()` / `bundleProgress(origin)` | 缓存统计 / 某站离线包进度(调试) |
-| `WebAccelView({ url })` | 开箱即用展示组件:节点挂载 + 白屏占位 + 离线进度条 |
+| `WebAccel.attach(uiContext)` / `prewarm(url, swrDoc?)` / `obtain(url)` | 可选/底层:UIContext 与预热现已自动,通常无需手动调 |
 
 ### `WebAccelOptions`
 
@@ -36,36 +35,37 @@ interface WebAccelOptions {
 }
 ```
 
-## 三步接入
+## 开箱即用(推荐):两步,几乎不写代码
 
-**1) 依赖**(接入方 `oh-package.json5`):
+**1) 依赖**(接入方 `oh-package.json5`):`{ "dependencies": { "webaccel": "file:../webaccel" } }`
 
-```json5
-{ "dependencies": { "webaccel": "file:../webaccel" } }
-```
-
-**2) 初始化**(`EntryAbility.ets` / `onCreate`):
+**2) 一行 init + 一个组件**:
 
 ```ts
-import { WebAccel } from 'webaccel';
-
+// EntryAbility.ets / onCreate —— 唯一的初始化
 WebAccel.init(this.context, { configServer: 'https://admin.example.com' });
-// 或不依赖后台,直接喂列表:
-// WebAccel.init(this.context, { apps: [{ id: 'a', name: '应用A', url: 'https://a.example.com/' }] });
+// 或不依赖后台直供:WebAccel.init(this.context, { apps: [{ id:'a', name:'应用A', url:'https://a.example.com/' }] });
+
+// 入口页 Index.ets —— 整个 App 就这一个组件(@Entry 的 build 根需是容器,故包一层 Stack)
+@Entry @Component struct Index {
+  build() { Stack() { WebAccelLauncher() }.width('100%').height('100%') }
+}
 ```
 
-**3) 预热 + 展示**:
+列表(来自远程配置)、点开秒显、内置导航、离线进度、返回键、全站预热——**全在 `WebAccelLauncher` 内部**,无需 `attach` / `prewarm` 循环 / 自己写网页页 / 注册第二个路由。
+可选定制:`WebAccelLauncher({ title: '...', accentColor: '#...' })`。
+
+## 自定义壳(可选):想用自己的列表/页面
+
+不想用内置 launcher,就用低层 API 自己拼:
 
 ```ts
-// 列表页 aboutToAppear
-WebAccel.attach(this.getUIContext());
-for (const a of WebAccel.getApps()) { WebAccel.prewarm(a.url, true); }
-
-// 展示页 build()
-WebAccelView({ url: this.url })
-// 展示页 onBackPress
-onBackPress(): boolean { return WebAccel.goBack(this.url); }
+WebAccel.init(this.context, { configServer })              // onCreate,同上
+const apps = WebAccel.getApps()                            // 取列表自己渲染
+WebAccelView({ url })                                      // 展示页:加速网页组件
+onBackPress(): boolean { return WebAccel.goBack(url) }     // 返回键
 ```
+低层用法下 `WebAccelView` 会自动注入 UIContext,配置就绪即自动预热,通常也无需手动 `attach`/`prewarm`(它们仍作为可选 API 保留)。
 
 应用列表也可用 `@StorageLink('apps') apps: RemoteApp[]` 自动响应——SDK 拉到/直供配置时会写入 `AppStorage('apps')`。
 

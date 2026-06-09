@@ -30,6 +30,8 @@ export struct WebAccelView {
   @State bundleDone: number = 0;
 
   aboutToAppear(): void {
+    // 组件自带 UIContext:自动注入,低层(不经 WebAccelLauncher)用法也无需接入方手动 attach
+    webPool.setUIContext(this.getUIContext());
     const om = this.url.match(/^https?:\/\/[^\/]+/);
     this.origin = om ? om[0] : '';
     this.node = webPool.obtain(this.url);
