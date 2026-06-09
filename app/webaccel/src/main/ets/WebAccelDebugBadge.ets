@@ -1,5 +1,5 @@
 import { webCache, CacheStats, BundleProgress } from './core/WebCacheManager';
-import { RemoteApp } from './core/RemoteConfig';
+import { remoteConfig, RemoteApp } from './core/RemoteConfig';
 
 /**
  * 可拖动的调试浮窗:显示「缓存命中」+「各应用已缓存/总缓存」。
@@ -46,6 +46,23 @@ export struct WebAccelDebugBadge {
     return om ? om[0] : '';
   }
 
+  /** 配置(含应用名)来自哪:服务器 / 缓存 / 兜底 —— 看应用名是不是后台下发的 */
+  private configLine(): string {
+    const s: string = remoteConfig.getSource();
+    if (s === 'server') {
+      const v: string = remoteConfig.getVersion();
+      return '配置: 服务器 ✓ ' + (v.length >= 16 ? v.substring(5, 16) : v);
+    }
+    if (s === 'cache') {
+      return '配置: 缓存(上次后台)';
+    }
+    return '配置: 兜底(未连后台)';
+  }
+
+  private configFromServer(): boolean {
+    return remoteConfig.getSource() === 'server';
+  }
+
   /** 某应用的「已缓存/总缓存」:启用了离线包 → done/total;否则 → 沙箱已缓存条数 */
   private progressText(app: RemoteApp): string {
     const origin: string = this.originOf(app.url);
@@ -59,9 +76,13 @@ export struct WebAccelDebugBadge {
   build() {
     Column() {
       if (this.expanded) {
+        Text(this.configLine())
+          .fontSize(9)
+          .fontColor(this.configFromServer() ? '#22DD88' : '#FFAA55')
         Text(`命中 R:${this.stats.hitRaw} D:${this.stats.hitDisk}　透传:${this.stats.miss}　拦:${this.stats.blocked}`)
           .fontSize(10)
           .fontColor(Color.White)
+          .margin({ top: 2 })
         Text(this.bgCaching() ? '↓ 后台缓存中  应用(已缓存/总缓存)' : '后台空闲  应用(已缓存/总缓存)')
           .fontSize(9)
           .fontColor(this.bgCaching() ? '#22DD88' : '#AAAAAA')

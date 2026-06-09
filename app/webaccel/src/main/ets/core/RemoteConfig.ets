@@ -70,6 +70,7 @@ class RemoteConfigManager {
   // 后台地址默认值 = SDK 自带(build-profile 按 debug/release 注入的 BuildProfile.CONFIG_SERVER);
   // 接入方通常无需再传,init({ configServer }) 可覆盖。为空字符串 = 不联网(纯直供/缓存/兜底)。
   private server: string = (BuildProfile.CONFIG_SERVER || '').replace(/\/+$/, '');
+  private source: string = 'fallback'; // 当前配置来源:server / cache / fallback(调试用)
   private appHandlers: AppsHandler[] = [];
 
   /** 注入配置(在 load 之前调用)。默认用 SDK 自带后台地址;传 configServer 可覆盖 */
@@ -117,6 +118,7 @@ class RemoteConfigManager {
           const parsed = JSON.parse(txt) as RemoteConfigData;
           if (parsed && Array.isArray(parsed.apps)) {
             this.data = parsed;
+            this.source = 'cache'; // 来自上次服务器写入的沙箱缓存
           }
         }
       }
@@ -145,6 +147,7 @@ class RemoteConfigManager {
         return false;
       }
       this.data = next;
+      this.source = 'server'; // 本次成功从后台拉到
       this.saveCache(txt);
       this.publishApps();
       hilog.info(DOMAIN, TAG, 'refreshed apps=%{public}d block=%{public}d',
@@ -160,6 +163,8 @@ class RemoteConfigManager {
   getApps(): RemoteApp[] { return this.data.apps || []; }
   getBlockHosts(): string[] { return this.data.blockHosts || []; }
   getSettings(): RemoteSettings { return this.data.settings || {}; }
+  getSource(): string { return this.source; }        // server / cache / fallback
+  getVersion(): string { return this.data.version || ''; }
 
   /** 注册 apps 更新回调(launcher 之外的消费者用) */
   setAppsHandler(cb: (apps: RemoteApp[]) => void): void {
