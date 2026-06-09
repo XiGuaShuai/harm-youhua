@@ -1,0 +1,30 @@
+# 后台部署编排:单服务(Node 同时跑 API + 托管管理界面)
+# 数据用「命名卷」持久化 —— 换镜像(更新代码)时绝不丢账号配置与离线包。
+#
+#   启动 / 更新:  docker compose up -d --build
+#   看日志:       docker compose logs -f
+#   停止:         docker compose down            (卷不会被删,数据还在)
+#
+# 后台密码等敏感项放同目录的 .env(不进 git),见 .env.example。
+
+services:
+  admin:
+    build:
+      context: ./admin          # 构建上下文 = admin/,内含 web/ 与 server/
+      dockerfile: Dockerfile
+    image: youhua-admin:latest
+    container_name: youhua-admin
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8787:8787"   # 只绑本地:由宿主机 nginx 反代 maidun.chujingservice.com → 此端口,不暴露公网
+    environment:
+      - PORT=8787
+      - ADMIN_USER=${ADMIN_USER:-admin}
+      - ADMIN_PASS=${ADMIN_PASS:?请在 .env 里设置 ADMIN_PASS(后台登录密码)}
+    volumes:
+      - admin-data:/app/server/data        # 账号 / 会话 / config.json
+      - admin-bundles:/app/server/bundles  # 离线包(cache-builder 产出)
+
+volumes:
+  admin-data:
+  admin-bundles:

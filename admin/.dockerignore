@@ -1,0 +1,7 @@
+# 别把这些塞进镜像构建上下文(加快构建、避免覆盖容器内依赖/数据)
+**/node_modules
+server/data
+server/bundles
+web/dist
+**/*.log
+.git

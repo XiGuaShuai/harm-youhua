@@ -21,6 +21,8 @@ const USERS_FILE = path.join(__dirname, 'data', 'users.json');
 const SESSIONS_FILE = path.join(__dirname, 'data', 'sessions.json');
 const BUNDLES_DIR = path.join(__dirname, 'bundles');
 const CACHE_BUILDER = path.join(__dirname, 'cache-builder.js');
+// 管理界面构建产物(admin/web/dist);容器内由 Dockerfile 置于 /app/web/dist 并用 WEB_DIST 指定
+const WEB_DIST = process.env.WEB_DIST || path.join(__dirname, '..', 'web', 'dist');
 const PORT = process.env.PORT || 8787;
 // 可选「主令牌」:仅当显式设置 ADMIN_TOKEN 时生效(给脚本/CI 用),默认不开,走账号密码登录
 const MASTER_TOKEN = process.env.ADMIN_TOKEN || '';
@@ -168,6 +170,10 @@ const app = express();
 app.use(cors());
 app.use(express.json({ limit: '4mb' }));
 
+// 同源托管管理界面(admin/web 构建产物):静态资源命中即返回,未命中则交给后续路由。
+// 本地用 vite(5174)代理调试时 WEB_DIST 不存在,此块自动跳过,不影响开发流程。
+if (fs.existsSync(WEB_DIST)) app.use(express.static(WEB_DIST));
+
 // 鸿蒙 App 开机拉取(公开)
 // 对启用离线包且服务端已有缓存清单的 app,附上 manifestUrl —— App 据此去服务器下载缓存资源
 app.get('/api/config', (req, res) => {
@@ -314,6 +320,14 @@ app.post('/api/admin/bundles/:id/manifest', async (req, res) => {
     res.status(500).json({ error: String(e && e.message || e) });
   }
 });
+
+// SPA 兜底:非 /api、非 /bundles 的 GET 一律回 index.html,交给前端路由(刷新子页面不 404)
+if (fs.existsSync(WEB_DIST)) {
+  app.get('*', (req, res, next) => {
+    if (req.path.startsWith('/api') || req.path.startsWith('/bundles')) return next();
+    res.sendFile(path.join(WEB_DIST, 'index.html'));
+  });
+}
 
 app.listen(PORT, () => {
   console.log(`[youhua-admin] server on http://localhost:${PORT}`);

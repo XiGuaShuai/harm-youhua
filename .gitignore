@@ -21,6 +21,9 @@ local.properties
 admin/server/data/
 admin/server/bundles/
 
+# 部署环境变量(含后台密码,勿上传)
+.env
+
 # 日志 / 系统文件
 *.log
 .DS_Store
