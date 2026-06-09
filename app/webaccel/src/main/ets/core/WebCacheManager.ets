@@ -68,6 +68,7 @@ export interface CacheStats {
   pending: number;      // 页面加载完待回填的资源数
   bundleActive: number; // 离线包正在下载的资源数
   bundleQueued: number; // 离线包排队待下的资源数
+  lastUrl: string;      // 最近被后台缓存的资源 URL(看"在缓存哪个站的什么资源")
 }
 
 /** 某站离线包下载进度(对外只读) */
@@ -124,6 +125,7 @@ class WebCacheManager {
   private prefetchedOrigins: Set<string> = new Set();             // 已预取过全部 chunk 的站点
   private loadedBundles: Set<string> = new Set();                 // 本次会话已拉过远程离线包的站点(按 origin)
   private bundleProgress: Map<string, BundleProgressEntry> = new Map(); // 各站离线包下载进度(按 origin)
+  private lastCachedUrl: string = '';                             // 最近被后台缓存的资源 URL(调试浮窗用)
 
   /** 启动时调用一次(EntryAbility.onCreate) */
   init(context: common.UIAbilityContext): void {
@@ -443,7 +445,8 @@ class WebCacheManager {
       inflight: this.inflight.size,
       pending: this.pending.size,
       bundleActive: this.activeBundleDownloads,
-      bundleQueued: this.bundleQueue.length
+      bundleQueued: this.bundleQueue.length,
+      lastUrl: this.lastCachedUrl
     };
   }
 
@@ -578,6 +581,7 @@ class WebCacheManager {
           this.saveDiskIndex();
           this.markBundleResource(cacheKey); // 若属于某站离线包,推进其下载进度
           ok = true;
+          this.lastCachedUrl = cacheKey;     // 调试浮窗:最近被后台缓存的资源(用于显示"正在缓存哪个站")
           hilog.info(DOMAIN, TAG, 'cached %{public}s %{public}d B', mime, body.byteLength);
 
           // 主文档版本变了 = 站点更新 → 通知(池)刷新对应节点,立即用上新版

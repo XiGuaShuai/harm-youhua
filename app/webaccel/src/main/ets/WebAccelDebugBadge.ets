@@ -1,4 +1,5 @@
 import { webCache, CacheStats } from './core/WebCacheManager';
+import { remoteConfig, RemoteApp } from './core/RemoteConfig';
 
 /**
  * 可拖动的调试浮窗:实时显示「缓存命中」+「后台是否在偷偷缓存」。
@@ -10,7 +11,7 @@ import { webCache, CacheStats } from './core/WebCacheManager';
 export struct WebAccelDebugBadge {
   @State stats: CacheStats = {
     raw: 0, disk: 0, hitRaw: 0, hitDisk: 0, miss: 0, blocked: 0, bytes: 0,
-    inflight: 0, pending: 0, bundleActive: 0, bundleQueued: 0
+    inflight: 0, pending: 0, bundleActive: 0, bundleQueued: 0, lastUrl: ''
   };
   @State expanded: boolean = true;
   @State posX: number = 12;   // 默认左上角
@@ -37,6 +38,30 @@ export struct WebAccelDebugBadge {
     return (this.stats.inflight + this.stats.pending + this.stats.bundleActive + this.stats.bundleQueued) > 0;
   }
 
+  /** 最近缓存的资源属于哪个应用/站点 + 文件名(看"在缓存哪个应用的资源") */
+  private cachingLabel(): string {
+    const u: string = this.stats.lastUrl;
+    if (u.length === 0) {
+      return '';
+    }
+    const om = u.match(/^https?:\/\/[^\/]+/);
+    const origin: string = om ? om[0] : '';
+    const host: string = origin.replace(/^https?:\/\//, '');
+    const path: string = u.split('?')[0];
+    const slash: number = path.lastIndexOf('/');
+    const file: string = slash >= 0 ? path.substring(slash + 1) : path;
+    // 能匹配到应用就显示应用名,否则显示域名
+    let name: string = host;
+    const apps: RemoteApp[] = remoteConfig.getApps();
+    for (let i = 0; i < apps.length; i++) {
+      if (apps[i].url && origin.length > 0 && apps[i].url.indexOf(origin) === 0) {
+        name = apps[i].name;
+        break;
+      }
+    }
+    return file.length > 0 ? `${name} · ${file}` : name;
+  }
+
   build() {
     Column() {
       if (this.expanded) {
@@ -49,6 +74,15 @@ export struct WebAccelDebugBadge {
           .fontSize(10)
           .fontColor(this.bgCaching() ? '#22DD88' : '#AAAAAA')
           .margin({ top: 2 })
+        if (this.stats.lastUrl.length > 0) {
+          Text(this.cachingLabel())
+            .fontSize(9)
+            .fontColor('#88CCFF')
+            .margin({ top: 1 })
+            .maxLines(1)
+            .textOverflow({ overflow: TextOverflow.Ellipsis })
+            .constraintSize({ maxWidth: 240 })
+        }
         Text(`沙箱 ${this.stats.disk} 条　${Math.round(this.stats.bytes / 1024)} KB`)
           .fontSize(10)
           .fontColor(Color.White)
