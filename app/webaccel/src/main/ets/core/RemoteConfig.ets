@@ -4,6 +4,7 @@ import { common } from '@kit.AbilityKit';
 import { util } from '@kit.ArkTS';
 import { hilog } from '@kit.PerformanceAnalysisKit';
 import { BusinessError } from '@kit.BasicServicesKit';
+import BuildProfile from '../../../../BuildProfile'; // SDK 自己的生成文件(build-profile 按 debug/release 注入 CONFIG_SERVER)
 
 const TAG: string = 'RemoteConfig';
 const DOMAIN: number = 0x0001;
@@ -66,15 +67,17 @@ function fallbackConfig(): RemoteConfigData {
 class RemoteConfigManager {
   private data: RemoteConfigData = fallbackConfig();
   private cachePath: string = '';
-  private server: string = '';   // 后台地址(运行时由 configure 注入;为空 = 不联网,纯直供/缓存/兜底)
+  // 后台地址默认值 = SDK 自带(build-profile 按 debug/release 注入的 BuildProfile.CONFIG_SERVER);
+  // 接入方通常无需再传,init({ configServer }) 可覆盖。为空字符串 = 不联网(纯直供/缓存/兜底)。
+  private server: string = (BuildProfile.CONFIG_SERVER || '').replace(/\/+$/, '');
   private appHandlers: AppsHandler[] = [];
 
-  /** 注入配置(在 load 之前调用)。configServer 为空时 SDK 走纯直供/本地模式,不联网 */
+  /** 注入配置(在 load 之前调用)。默认用 SDK 自带后台地址;传 configServer 可覆盖 */
   configure(opt?: ConfigureOptions): void {
     if (!opt) {
       return;
     }
-    if (typeof opt.configServer === 'string') {
+    if (typeof opt.configServer === 'string' && opt.configServer.length > 0) {
       this.server = opt.configServer.replace(/\/+$/, ''); // 去尾部斜杠,避免拼出 //api/config
     }
     if (opt.apps && opt.apps.length > 0) {

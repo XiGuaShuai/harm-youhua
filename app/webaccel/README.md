@@ -27,24 +27,38 @@ import { WebAccel, WebAccelLauncher, WebAccelView, WebAccelOptions, RemoteApp } 
 
 ```ts
 interface WebAccelOptions {
-  configServer?: string;     // admin 后台地址;不填 = 不联网,用 apps 直供
-  apps?: RemoteApp[];        // 直供应用列表(不依赖后台时用)
+  configServer?: string;     // admin 后台地址。不填 = 用 SDK 自带默认(见下「后台地址」);传了则覆盖
+  apps?: RemoteApp[];        // 兜底/直供应用列表(后台拉到后覆盖;后台不可达时用它)
   blockHosts?: string[];     // 过滤黑名单(覆盖默认内置)
-  settings?: RemoteSettings; // 缓存上限 / 校验节流(bytecodeCache 字段在元服务被忽略)
-  autoRefresh?: boolean;     // 有 configServer 时是否开机异步拉最新(默认 true)
+  settings?: RemoteSettings; // 缓存上限 / 校验节流 / 全站预取(bytecodeCache 字段在元服务被忽略)
+  autoRefresh?: boolean;     // 是否开机异步拉最新(默认 true)
 }
 ```
+
+## 后台地址(SDK 自带,按 debug/release 自动切换)
+
+后台地址**内置在 SDK** 里、不用接入方写:`webaccel/build-profile.json5` 的 `buildProfileFields.CONFIG_SERVER`,
+debug/release 各一个值,`RemoteConfig` 读 `BuildProfile.CONFIG_SERVER` 作默认。
+
+```json5
+// webaccel/build-profile.json5
+"buildOption":    { "arkOptions": { "buildProfileFields": { "CONFIG_SERVER": "http://192.168.x.x:8787" } } }, // debug:局域网
+"buildOptionSet": [{ "name": "release", "arkOptions": { "buildProfileFields": { "CONFIG_SERVER": "https://admin.你的域名.com" } } }] // release:生产
+```
+
+> **上线唯一要做的一次性配置**:把 release 那行换成你的真实生产域名(改配置、非代码)。之后切 release 构建,地址自动是生产。
+> 想运行时覆盖(多后台)仍可:`WebAccel.init(ctx, { configServer })`。
 
 ## 开箱即用(推荐):两步,几乎不写代码
 
 **1) 依赖**(接入方 `oh-package.json5`):`{ "dependencies": { "webaccel": "file:../webaccel" } }`
 
-**2) 一行 init + 一个组件**:
+**2) 一行 init + 一个组件**(连后台地址都不用写):
 
 ```ts
-// EntryAbility.ets / onCreate —— 唯一的初始化
-WebAccel.init(this.context, { configServer: 'https://admin.example.com' });
-// 或不依赖后台直供:WebAccel.init(this.context, { apps: [{ id:'a', name:'应用A', url:'https://a.example.com/' }] });
+// EntryAbility.ets / onCreate —— 唯一的初始化(地址由 SDK 自带)
+WebAccel.init(this.context);
+// 可选传兜底列表(后台拉不到时也有得显示):WebAccel.init(this.context, { apps: [...] });
 
 // 入口页 Index.ets —— 整个 App 就这一个组件(@Entry 的 build 根需是容器,故包一层 Stack)
 @Entry @Component struct Index {
@@ -60,7 +74,7 @@ WebAccel.init(this.context, { configServer: 'https://admin.example.com' });
 不想用内置 launcher,就用低层 API 自己拼:
 
 ```ts
-WebAccel.init(this.context, { configServer })              // onCreate,同上
+WebAccel.init(this.context)                                // onCreate,后台地址 SDK 自带
 const apps = WebAccel.getApps()                            // 取列表自己渲染
 WebAccelView({ url })                                      // 展示页:加速网页组件
 onBackPress(): boolean { return WebAccel.goBack(url) }     // 返回键

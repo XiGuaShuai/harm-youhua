@@ -1,12 +1,18 @@
 import { AbilityConstant, ConfigurationConstant, UIAbility, Want } from '@kit.AbilityKit';
 import { hilog } from '@kit.PerformanceAnalysisKit';
 import { window } from '@kit.ArkUI';
-import { WebAccel } from 'webaccel';
+import { WebAccel, RemoteApp } from 'webaccel';
 
 const DOMAIN = 0x0000;
 
-/** 后台地址:真机/模拟器调试填运行 server 的电脑局域网 IP(不能用 localhost);生产填域名 */
-const CONFIG_SERVER: string = 'http://192.168.20.133:8787';
+/**
+ * 兜底应用列表:后台拉不到/不可达(或首装沙箱无缓存)时先用它,列表不至于空白。
+ * 后台可达时以 /api/config 为准覆盖。这是「接入方/demo 自己的数据」,不进 SDK。
+ */
+const FALLBACK_APPS: RemoteApp[] = [
+  { id: 'beacukai', name: '印尼海关 e-CD', url: 'https://ecd.beacukai.go.id/', swrDoc: true, prerender: true, bundle: true },
+  { id: 'rwsentosa', name: '圣淘沙名胜世界 RWS', url: 'https://www.rwsentosa.com/', swrDoc: true, prerender: false }
+];
 
 export default class EntryAbility extends UIAbility {
   onCreate(want: Want, launchParam: AbilityConstant.LaunchParam): void {
@@ -17,9 +23,9 @@ export default class EntryAbility extends UIAbility {
     }
 
     // —— 一行接入网页加速 SDK ——
-    // 内部:提前初始化 Web 内核 + 初始化离线缓存 + 拉后台配置(应用列表/黑名单/设置)。
-    // 离线包不在这里下,改为打开某网页应用时(WebAccelView/obtain)按需下载。
-    WebAccel.init(this.context, { configServer: CONFIG_SERVER });
+    // 后台地址由 SDK 自带(webaccel/build-profile.json5 按 debug/release 注入),接入方无需再写。
+    // apps 为兜底:后台可达时以 /api/config 覆盖;不可达时也有列表可显示。
+    WebAccel.init(this.context, { apps: FALLBACK_APPS });
 
     hilog.info(DOMAIN, 'testTag', '%{public}s', 'Ability onCreate');
   }
