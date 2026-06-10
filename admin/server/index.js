@@ -196,6 +196,44 @@ app.get('/api/config', (req, res) => {
 // 离线包静态托管:App 从 /bundles/<id>/manifest.json 拉取
 app.use('/bundles', express.static(BUNDLES_DIR));
 
+// ——————————————— 众包上报(设备探索结果)———————————————
+// 设备打开某 app 时,把加载到的静态资源 {url, hash, mime, size} 报上来(公开接口,带限频/校验)。
+// 一人一票存 votes;多用户对同一 URL 的 hash 一致 = 稳定可缓存(共识)。只收配置内 app,不收 PII。
+const reportLimit = new Map(); // key=appId|anonId -> 上次上报时刻(同一设备同一 app 60s 限一次)
+app.post('/api/report', async (req, res) => {
+  if (!dbReady() || !getPool()) return res.status(503).json({ ok: false, error: 'db not ready' });
+  const body = req.body || {};
+  const appId = String(body.appId || '');
+  const anonId = String(body.anonId || '').slice(0, 64);
+  const resources = Array.isArray(body.resources) ? body.resources : [];
+  if (!appId || !anonId || resources.length === 0) return res.status(400).json({ ok: false, error: 'bad request' });
+  if (!(loadConfig().apps || []).some((a) => a.id === appId)) return res.status(404).json({ ok: false, error: 'unknown app' });
+  const key = `${appId}|${anonId}`;
+  const now = Date.now();
+  if (now - (reportLimit.get(key) || 0) < 60 * 1000) return res.status(429).json({ ok: false, error: 'too frequent' });
+  reportLimit.set(key, now);
+  const pool = getPool();
+  let accepted = 0;
+  for (const r of resources.slice(0, 200)) { // 单次最多 200 条
+    const url = String(r && r.url || '');
+    const hash = String(r && r.hash || '').toLowerCase();
+    if (!/^https?:\/\//.test(url) || !/^[a-f0-9]{16,128}$/.test(hash)) continue; // 只收 http(s) + 合法 hash
+    const urlHash = crypto.createHash('sha256').update(url).digest('hex');
+    const mime = r && r.mime ? String(r.mime).slice(0, 128) : null;
+    const size = r && Number.isFinite(r.size) ? Math.floor(r.size) : null;
+    try {
+      await pool.query(
+        `INSERT INTO votes (app_id, url_hash, anon_id, content_hash, url, mime, size, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+         ON DUPLICATE KEY UPDATE content_hash=VALUES(content_hash), url=VALUES(url), mime=VALUES(mime), size=VALUES(size), updated_at=VALUES(updated_at)`,
+        [appId, urlHash, anonId, hash, url, mime, size, now]
+      );
+      accepted++;
+    } catch (e) { /* 跳过坏行 */ }
+  }
+  res.json({ ok: true, accepted });
+});
+
 // 登录:账号 + 密码 → 颁发会话 token
 app.post('/api/login', (req, res) => {
   const { username, password } = req.body || {};
@@ -240,6 +278,36 @@ app.get('/api/admin/db', async (req, res) => {
     res.json({ ready: true, votes: rows[0].n });
   } catch (e) {
     res.json({ ready: false, error: String(e && e.message || e) });
+  }
+});
+
+// 共识:某 app 下,哪些 URL 被多用户报成同一 hash(≥K)= 稳定可缓存;
+// 同一 URL 出现多个 hash = 用户间不一致 = 动态,不缓存。?k=2 设阈值。
+app.get('/api/admin/report/:id', async (req, res) => {
+  if (!dbReady() || !getPool()) return res.status(503).json({ error: 'db not ready' });
+  const appId = req.params.id;
+  const K = Math.max(1, parseInt(req.query.k || '2', 10));
+  try {
+    const [rows] = await getPool().query(
+      `SELECT url_hash, content_hash, COUNT(*) AS votes, MIN(url) AS url, MIN(mime) AS mime, MAX(size) AS size
+       FROM votes WHERE app_id=? GROUP BY url_hash, content_hash`, [appId]
+    );
+    const byUrl = new Map();
+    for (const r of rows) {
+      let u = byUrl.get(r.url_hash);
+      if (!u) { u = { url: r.url, mime: r.mime, size: r.size, variants: 0, topHash: null, topVotes: 0 }; byUrl.set(r.url_hash, u); }
+      u.variants += 1;
+      if (r.votes > u.topVotes) { u.topVotes = r.votes; u.topHash = r.content_hash; u.size = r.size; }
+    }
+    const stable = [], unstable = [];
+    for (const u of byUrl.values()) {
+      // 稳定 = 只有一个 hash 且票数 ≥ K(多 hash 说明各人内容不同 → 动态)
+      if (u.variants === 1 && u.topVotes >= K) stable.push({ url: u.url, mime: u.mime, size: u.size, hash: u.topHash, votes: u.topVotes });
+      else unstable.push({ url: u.url, variants: u.variants, votes: u.topVotes });
+    }
+    res.json({ appId, K, totalUrls: byUrl.size, stableCount: stable.length, unstableCount: unstable.length, stable: stable.slice(0, 100), unstable: unstable.slice(0, 50) });
+  } catch (e) {
+    res.status(500).json({ error: String(e && e.message || e) });
   }
 });
 
