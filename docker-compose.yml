@@ -21,10 +21,39 @@ services:
       - PORT=8787
       - ADMIN_USER=${ADMIN_USER:-admin}
       - ADMIN_PASS=${ADMIN_PASS:?请在 .env 里设置 ADMIN_PASS(后台登录密码)}
+      - DB_HOST=mysql
+      - DB_PORT=3306
+      - DB_NAME=${DB_NAME:-webaccel}
+      - DB_USER=${DB_USER:-webaccel}
+      - DB_PASS=${DB_PASS:?请在 .env 里设置 DB_PASS(MySQL 业务库密码)}
     volumes:
       - admin-data:/app/server/data        # 账号 / 会话 / config.json
       - admin-bundles:/app/server/bundles  # 离线包(cache-builder 产出)
+    depends_on:
+      mysql:
+        condition: service_healthy
+
+  # MySQL:众包上报 / 共识数据(配置仍走文件)。只内网,不暴露公网。
+  mysql:
+    image: mysql:8.0
+    container_name: youhua-mysql
+    restart: unless-stopped
+    command: --default-authentication-plugin=mysql_native_password --skip-mysqlx --innodb-buffer-pool-size=128M
+    environment:
+      - MYSQL_ROOT_PASSWORD=${MYSQL_ROOT_PASSWORD:?请在 .env 里设置 MYSQL_ROOT_PASSWORD}
+      - MYSQL_DATABASE=${DB_NAME:-webaccel}
+      - MYSQL_USER=${DB_USER:-webaccel}
+      - MYSQL_PASSWORD=${DB_PASS:?请在 .env 里设置 DB_PASS}
+    volumes:
+      - admin-mysql:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uroot", "-p${MYSQL_ROOT_PASSWORD}"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
 
 volumes:
   admin-data:
   admin-bundles:
+  admin-mysql:

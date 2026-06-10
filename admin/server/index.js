@@ -14,6 +14,7 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { execFile } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
+import { initDb, dbReady, getPool } from './db.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const DATA_FILE = path.join(__dirname, 'data', 'config.json');
@@ -231,6 +232,17 @@ app.use('/api/admin', auth);
 // 当前登录用户
 app.get('/api/admin/me', (req, res) => res.json({ username: req.user }));
 
+// DB(MySQL)状态:联调验证用 —— 连上没、votes 表多少行
+app.get('/api/admin/db', async (req, res) => {
+  if (!dbReady() || !getPool()) return res.json({ ready: false });
+  try {
+    const [rows] = await getPool().query('SELECT COUNT(*) AS n FROM votes');
+    res.json({ ready: true, votes: rows[0].n });
+  } catch (e) {
+    res.json({ ready: false, error: String(e && e.message || e) });
+  }
+});
+
 // 修改密码
 app.post('/api/admin/password', (req, res) => {
   const { oldPassword, newPassword } = req.body || {};
@@ -333,6 +345,7 @@ if (fs.existsSync(WEB_DIST)) {
   });
 }
 
+initDb(); // 后台连 MySQL 并建表(不阻塞;配置/离线包接口走文件,不依赖 DB)
 app.listen(PORT, () => {
   console.log(`[youhua-admin] server on http://localhost:${PORT}`);
   console.log(`  鸿蒙 App 配置:  GET http://localhost:${PORT}/api/config`);
