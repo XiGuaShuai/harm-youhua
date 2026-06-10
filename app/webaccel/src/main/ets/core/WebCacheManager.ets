@@ -294,6 +294,7 @@ class WebCacheManager {
     const tokens: string[] = seg.substring(0, dot).split(/[.\-_]/);
     for (let i = 0; i < tokens.length; i++) {
       const t: string = tokens[i];
+      if (/^[0-9]+x[0-9]+$/.test(t)) { continue; } // "2160x1140" 等尺寸串不是内容 hash,别误当不可变缓存(否则坏副本永不回源)
       if (t.length >= 8) {
         const isHex: boolean = /^[a-f0-9]+$/.test(t);
         const hasDigit: boolean = /[0-9]/.test(t);

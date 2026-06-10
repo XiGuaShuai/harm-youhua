@@ -40,7 +40,7 @@ function isHashedAsset(p) {
   const dot = seg.lastIndexOf('.');
   if (dot <= 0) return false;
   if (!/^(js|mjs|css|woff2?|ttf|otf|eot|png|jpe?g|gif|svg|webp|avif|ico)$/.test(seg.slice(dot + 1))) return false;
-  return seg.slice(0, dot).split(/[.\-_]/).some((t) => t.length >= 8 && (/^[a-f0-9]+$/.test(t) || (/[0-9]/.test(t) && /[a-z]/.test(t))));
+  return seg.slice(0, dot).split(/[.\-_]/).some((t) => t.length >= 8 && !/^[0-9]+x[0-9]+$/.test(t) && (/^[a-f0-9]+$/.test(t) || (/[0-9]/.test(t) && /[a-z]/.test(t))));
 }
 
 function sha256(data) {
