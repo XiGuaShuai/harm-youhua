@@ -30,7 +30,27 @@ export default class EntryAbility extends UIAbility {
     // 调试浮窗:打开后网页右上角显示「缓存命中 + 后台是否在偷偷缓存」。上线时关掉(或不调)。
     WebAccel.setDebug(true);
 
+    // 服务卡片点击带来的 targetUrl:存全局,WebAccelLauncher 据此直达对应网页
+    this.applyLaunchTarget(want);
+
     hilog.info(DOMAIN, 'testTag', '%{public}s', 'Ability onCreate');
+  }
+
+  // 元服务已在运行时,卡片再次拉起走这里
+  onNewWant(want: Want, launchParam: AbilityConstant.LaunchParam): void {
+    this.applyLaunchTarget(want);
+  }
+
+  // 从 want 取卡片传来的 targetUrl,写入 AppStorage('launchTarget'),供 launcher 直达
+  private applyLaunchTarget(want: Want): void {
+    const params = want.parameters as Record<string, Object>;
+    if (!params) {
+      return;
+    }
+    const url = params.targetUrl as string;
+    if (typeof url === 'string' && url.length > 0) {
+      AppStorage.setOrCreate<string>('launchTarget', url);
+    }
   }
 
   onDestroy(): void {

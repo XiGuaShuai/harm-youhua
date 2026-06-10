@@ -26,12 +26,31 @@ export struct WebAccelLauncher {
   @StorageLink('apps') apps: RemoteApp[] = [];
   // 调试浮窗开关(WebAccel.setDebug 驱动):开后浮窗挂在最顶层,首页列表 + 网页全程可见、可拖动
   @StorageLink('webaccel_debug') debugOn: boolean = false;
+  // 外部直达(服务卡片/快捷方式):EntryAbility 把目标网页 URL 写入 launchTarget,这里订阅后自动打开
+  @StorageLink('launchTarget') @Watch('onLaunchTarget') launchTarget: string = '';
   private stack: NavPathStack = new NavPathStack();
 
   aboutToAppear(): void {
     // 组件天生有 UIContext:挂载即注入 → 自动对配置里所有应用预热(预连接+预下离线包+离屏预渲染)
     // 接入方无需手动 attach / prewarm。
     WebAccel.attach(this.getUIContext());
+    if (this.launchTarget.length > 0) {
+      this.openTarget(); // 冷启动:卡片带来的目标,挂载即直达
+    }
+  }
+
+  // launchTarget 变化(元服务已运行时被卡片再次拉起)→ 直达对应网页
+  onLaunchTarget(): void {
+    if (this.launchTarget.length > 0) {
+      this.openTarget();
+    }
+  }
+
+  // 消费 launchTarget:压栈到对应网页(先清空,避免重复跳 / 返回又跳)
+  private openTarget(): void {
+    const url: string = this.launchTarget;
+    AppStorage.setOrCreate<string>('launchTarget', '');
+    this.stack.pushPath({ name: url });
   }
 
   // 网页展示目的页:点列表项后由 Navigation 压栈进入,name = 网页 URL

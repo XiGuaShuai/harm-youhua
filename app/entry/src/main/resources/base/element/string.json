@@ -15,6 +15,22 @@
     {
       "name": "internet_permission_reason",
       "value": "用于加载网页内容"
+    },
+    {
+      "name": "form_FormAbility_label",
+      "value": "网页加速"
+    },
+    {
+      "name": "form_FormAbility_desc",
+      "value": "网页应用快捷卡片"
+    },
+    {
+      "name": "card_display_name",
+      "value": "网页应用"
+    },
+    {
+      "name": "card_desc",
+      "value": "一键直达常用网页应用"
     }
   ]
 }
