@@ -289,7 +289,8 @@ async function buildServerCache(appCfg) {
   const manifest = [];
   const homeEntry = discovered.resources.find((e) => e.file === 'home.html');
   fs.writeFileSync(path.join(outDir, 'home.html'), discovered.html, 'utf8');
-  manifest.push({ url: homeEntry ? homeEntry.url : origin + '/', file: 'home.html', mime: 'text/html' });
+  // hash:内容指纹,设备据此判断该文件是否需要更新(同 URL 内容变了 → hash 变)
+  manifest.push({ url: homeEntry ? homeEntry.url : origin + '/', file: 'home.html', mime: 'text/html', hash: sha256(discovered.html) });
 
   // 体积上限:资源已按 rank 排序(css/js 在前、字体在后),超预算就跳过 → 砍掉的主要是靠后的字体
   // (字体非首屏关键,文字先用系统字体显示,真正用到时再走运行时缓存)
@@ -307,7 +308,7 @@ async function buildServerCache(appCfg) {
       if (total + buf.length > BUDGET) { skipped++; continue; }
       total += buf.length;
       fs.writeFileSync(path.join(outDir, e.file), buf);
-      manifest.push({ url: e.url, file: e.file, mime: e.mime });
+      manifest.push({ url: e.url, file: e.file, mime: e.mime, hash: sha256(buf) });
     } catch { failed++; }
   }
   fs.writeFileSync(path.join(outDir, 'manifest.json'), JSON.stringify(manifest, null, 2), 'utf8');

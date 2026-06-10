@@ -179,9 +179,13 @@ if (fs.existsSync(WEB_DIST)) app.use(express.static(WEB_DIST));
 app.get('/api/config', (req, res) => {
   const c = loadConfig();
   const apps = (c.apps || []).map((a) => {
-    const hasBundle = fs.existsSync(path.join(BUNDLES_DIR, a.id, 'manifest.json'));
+    const mfPath = path.join(BUNDLES_DIR, a.id, 'manifest.json');
+    const hasBundle = fs.existsSync(mfPath);
     if (a.bundle && hasBundle) {
-      return Object.assign({}, a, { manifestUrl: `/bundles/${a.id}/manifest.json` });
+      // bundleVersion = 清单内容指纹:清单一变(资源增删改)它就变,设备据此判断"要不要更新离线包"
+      let bundleVersion = '';
+      try { bundleVersion = crypto.createHash('sha256').update(fs.readFileSync(mfPath)).digest('hex').slice(0, 16); } catch {}
+      return Object.assign({}, a, { manifestUrl: `/bundles/${a.id}/manifest.json`, bundleVersion });
     }
     return a;
   });
