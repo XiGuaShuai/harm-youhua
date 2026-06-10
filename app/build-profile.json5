@@ -5,13 +5,13 @@
         "name": "default",
         "type": "HarmonyOS",
         "material": {
-          "certpath": "C:\\Users\\xskj-xnhz\\.ohos\\config\\default_app_ix4ZtcY5O04rVBYdIOyTmQtSZcX_j9ZXQGZm5_s-TFU=.cer",
+          "certpath": "C:\\Users\\pzx\\.ohos\\config\\default_app_oS2iV_eFMcf8exyjFlIthIJ23O9gz-sveJtzy1yKSjk=.cer",
           "keyAlias": "debugKey",
-          "keyPassword": "0000001BE03C7DD9A852C116E7C1B38A29878C1A65161EAAF139A830A281A9CD4BF53B7EF3811A4483E73D",
-          "profile": "C:\\Users\\xskj-xnhz\\.ohos\\config\\default_app_ix4ZtcY5O04rVBYdIOyTmQtSZcX_j9ZXQGZm5_s-TFU=.p7b",
+          "keyPassword": "0000001BF53AE35072317EE19F2E2A5CFBA957F9AA3C250CF0871B9C07AE489560C3BDAF0CD8FC99D42B64",
+          "profile": "C:\\Users\\pzx\\.ohos\\config\\default_app_oS2iV_eFMcf8exyjFlIthIJ23O9gz-sveJtzy1yKSjk=.p7b",
           "signAlg": "SHA256withECDSA",
-          "storeFile": "C:\\Users\\xskj-xnhz\\.ohos\\config\\default_app_ix4ZtcY5O04rVBYdIOyTmQtSZcX_j9ZXQGZm5_s-TFU=.p12",
-          "storePassword": "0000001B10768A88FF0005E6B5D9A54BCBE40E32F7D4C370839C1ECC9AC3102F0161686E5CAA5B88278E25"
+          "storeFile": "C:\\Users\\pzx\\.ohos\\config\\default_app_oS2iV_eFMcf8exyjFlIthIJ23O9gz-sveJtzy1yKSjk=.p12",
+          "storePassword": "0000001BDE59822F6F6359342DDA61B176FC0059B298E4832E4AA4FDC0487E2C49A9E2158CB4599EB28CAF"
         }
       }
     ],
