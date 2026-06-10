@@ -128,7 +128,9 @@ function defaultConfig() {
       docCheckSec: 60,       // 主文档版本校验节流(秒)
       bundleConcurrency: 8,  // 远程离线包后台下载并发(上限 8)
       prefetchChunks: true,  // 是否预取全站 chunk(Next.js 系有效)
-      bytecodeCache: true
+      bytecodeCache: true,
+      exploreK: 3,           // 众包共识阈值:≥K 个用户 hash 一致才采纳为可缓存
+      exploreSample: 0.1     // 探索采样率:命中待探索名单的 app,每次打开按此概率上报(0.1=10%,减负)
     }
   };
 }
@@ -191,7 +193,14 @@ app.get('/api/config', (req, res) => {
     }
     return a;
   });
-  res.json(Object.assign({}, c, { apps }));
+  // 任务派发:把"待探索清单 + 共识阈值 K + 采样率"下发给设备(设备只对名单内 app 按采样率上报)
+  const s = c.settings || {};
+  const explore = {
+    apps: (c.apps || []).filter((a) => a.explore).map((a) => a.id), // 后台给某 app 设 explore:true 即入列
+    k: s.exploreK || 3,
+    sample: typeof s.exploreSample === 'number' ? s.exploreSample : 0.1
+  };
+  res.json(Object.assign({}, c, { apps, explore }));
 });
 
 // 离线包静态托管:App 从 /bundles/<id>/manifest.json 拉取
