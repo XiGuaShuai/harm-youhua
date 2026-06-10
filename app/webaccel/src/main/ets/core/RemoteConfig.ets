@@ -31,11 +31,19 @@ export interface RemoteSettings {
   bytecodeCache?: boolean;
 }
 
+/** 任务派发:后台下发的待探索清单 + 共识阈值 K + 采样率 */
+export interface ExploreDispatch {
+  apps: string[];
+  k: number;
+  sample: number;
+}
+
 export interface RemoteConfigData {
   version: string;
   apps: RemoteApp[];
   blockHosts: string[];
   settings: RemoteSettings;
+  explore?: ExploreDispatch; // 众包探索任务派发(后台 /api/config 下发)
 }
 
 /** configure() 入参:由 WebAccel.init 传入,把后台地址 / 直供列表 / 黑名单 / 设置注入 SDK */
@@ -164,6 +172,7 @@ class RemoteConfigManager {
   getApps(): RemoteApp[] { return this.data.apps || []; }
   getBlockHosts(): string[] { return this.data.blockHosts || []; }
   getSettings(): RemoteSettings { return this.data.settings || {}; }
+  getExplore(): ExploreDispatch { const e = this.data.explore; return e ? e : { apps: new Array<string>(), k: 3, sample: 0 }; }
   getSource(): string { return this.source; }        // server / cache / fallback
   getVersion(): string { return this.data.version || ''; }
 

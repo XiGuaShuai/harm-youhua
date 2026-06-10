@@ -227,7 +227,7 @@ app.post('/api/report', async (req, res) => {
   for (const r of resources.slice(0, 200)) { // 单次最多 200 条
     const url = String(r && r.url || '');
     const hash = String(r && r.hash || '').toLowerCase();
-    if (!/^https?:\/\//.test(url) || !/^[a-f0-9]{16,128}$/.test(hash)) continue; // 只收 http(s) + 合法 hash
+    if (!/^https?:\/\//.test(url) || !/^[a-f0-9-]{8,160}$/.test(hash)) continue; // 只收 http(s) + 合法指纹(sha256 或设备 djb2)
     const urlHash = crypto.createHash('sha256').update(url).digest('hex');
     const mime = r && r.mime ? String(r.mime).slice(0, 128) : null;
     const size = r && Number.isFinite(r.size) ? Math.floor(r.size) : null;

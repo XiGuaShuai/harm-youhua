@@ -93,6 +93,19 @@ interface BundleState {
   urls: string[];  // 已应用清单里的资源 URL(用于清理被服务端移除的旧资源)
 }
 
+/** 众包探索上报:一条资源 + 报文体 */
+interface ReportItem {
+  url: string;
+  hash: string;   // = DiskEntry.version(djb2 指纹),服务端按它做跨用户共识
+  mime: string;
+  size: number;
+}
+interface ReportBody {
+  appId: string;
+  anonId: string;
+  resources: ReportItem[];
+}
+
 /**
  * Web 离线缓存管理器(单例)。两层只读/可写缓存:
  *
@@ -136,6 +149,7 @@ class WebCacheManager {
   private bundleProgress: Map<string, BundleProgressEntry> = new Map(); // 各站离线包下载进度(按 origin)
   private bundleState: Map<string, BundleState> = new Map();      // 各站离线包已应用状态(版本+URL清单,持久化,用于更新检查)
   private bundleStatePath: string = '';                           // bundle-state.json 路径
+  private anonId: string = '';                                    // 匿名上报 id(持久化,无个人信息)
   private lastCachedUrl: string = '';                             // 最近被后台缓存的资源 URL(调试浮窗用)
   private recentCached: string[] = [];                            // 最近若干条后台缓存(新→旧,调试浮窗列表用)
   private lastCacheAt: number = 0;                                // 最近一次"缓存成功"的时刻(判断是否真的还在缓存)
@@ -1035,6 +1049,73 @@ class WebCacheManager {
       const er = e as BusinessError;
       hilog.error(DOMAIN, TAG, 'saveBundleState failed: %{public}s', er.message);
     }
+  }
+
+  /** 取/建匿名上报 id(持久化在沙箱,不含任何个人信息) */
+  private ensureAnonId(): string {
+    if (this.anonId.length > 0) {
+      return this.anonId;
+    }
+    const p: string = this.cacheDir + '/anon-id.txt';
+    try {
+      const buf: ArrayBuffer | null = this.readFile(p);
+      if (buf) {
+        const t: string = util.TextDecoder.create('utf-8').decodeToString(new Uint8Array(buf)).trim();
+        if (t.length > 0) {
+          this.anonId = t;
+          return t;
+        }
+      }
+    } catch (e) { /* 首次无文件 */ }
+    const id: string = Date.now().toString(36) + Math.floor(Math.random() * 1e9).toString(36);
+    try {
+      const f = fs.openSync(p, fs.OpenMode.READ_WRITE | fs.OpenMode.CREATE | fs.OpenMode.TRUNC);
+      fs.writeSync(f.fd, id);
+      fs.closeSync(f);
+    } catch (e) { /* 写失败也不影响本次内存值 */ }
+    this.anonId = id;
+    return id;
+  }
+
+  /** 采集某站本地已缓存的静态资源(url + 指纹 + mime + 体积),供探索上报 */
+  private collectForReport(origin: string, max: number): ReportItem[] {
+    const out: ReportItem[] = [];
+    this.diskIndex.forEach((e: DiskEntry, url: string) => {
+      if (out.length < max && url.indexOf(origin) === 0 && e.version.length > 0) {
+        out.push({ url: url, hash: e.version, mime: e.mime, size: e.size });
+      }
+    });
+    return out;
+  }
+
+  /** 众包探索上报:按采样率把某站本地已缓存的静态资源匿名报给后台,供共识判定可缓存性 */
+  reportExploration(appId: string, origin: string, server: string, sample: number): void {
+    if (server.length === 0 || sample <= 0) {
+      return;
+    }
+    if (Math.random() > sample) {
+      return; // 采样:只一部分用户上报,整体减负
+    }
+    const resources: ReportItem[] = this.collectForReport(origin, 200);
+    if (resources.length === 0) {
+      return;
+    }
+    const body: ReportBody = { appId: appId, anonId: this.ensureAnonId(), resources: resources };
+    const client = http.createHttp();
+    const header: Record<string, string> = { 'Content-Type': 'application/json' };
+    const options: http.HttpRequestOptions = {
+      method: http.RequestMethod.POST,
+      header: header,
+      extraData: JSON.stringify(body),
+      connectTimeout: 15000,
+      readTimeout: 30000
+    };
+    client.request(server + '/api/report', options, (err: BusinessError, data: http.HttpResponse) => {
+      client.destroy();
+      if (!err && data) {
+        hilog.info(DOMAIN, TAG, 'explore report %{public}s code=%{public}d n=%{public}d', appId, data.responseCode, resources.length);
+      }
+    });
   }
 
   /** 由完整 URL 生成文件系统安全的文件名(双 DJB2,够防碰撞) */

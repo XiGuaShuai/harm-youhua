@@ -63,11 +63,33 @@ export class WebAccel {
         if (ok) {
           webCache.setBlockHosts(remoteConfig.getBlockHosts());
           webCache.applySettings(remoteConfig.getSettings());
+          WebAccel.runExploreReports(); // 众包探索:对后台标记的待探索 app 匿名上报本地已缓存资源
         }
       });
     }
     hilog.info(DOMAIN, TAG, 'initialized (server=%{public}s)',
       remoteConfig.getServer().length > 0 ? remoteConfig.getServer() : '(none)');
+  }
+
+  // 众包探索上报:对后台标记为待探索(explore)的 app,按采样率上报本地已缓存的静态资源(匿名)
+  private static runExploreReports(): void {
+    const ex = remoteConfig.getExplore();
+    if (ex.apps.length === 0 || ex.sample <= 0) {
+      return;
+    }
+    const server: string = remoteConfig.getServer();
+    const apps: RemoteApp[] = remoteConfig.getApps();
+    for (let i = 0; i < ex.apps.length; i++) {
+      const id: string = ex.apps[i];
+      const a: RemoteApp | undefined = apps.find((x: RemoteApp) => x.id === id);
+      if (a) {
+        const om = a.url.match(/^https?:\/\/[^\/]+/);
+        const origin: string = om ? om[0] : '';
+        if (origin.length > 0) {
+          webCache.reportExploration(a.id, origin, server, ex.sample);
+        }
+      }
+    }
   }
 
   /** 提供 UIContext(离屏预渲染需要)。在首个页面/组件 aboutToAppear 调用一次 */

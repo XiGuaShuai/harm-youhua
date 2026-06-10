@@ -8,6 +8,19 @@ import crypto from 'node:crypto';
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36';
 const sha256 = (d) => crypto.createHash('sha256').update(d).digest('hex');
 
+// 与设备端 WebCacheManager.fingerprint 完全同算法(DJB2 双哈希 + 长度),用于跨用户共识比对。
+// 设备上报的是这个指纹(免在端上算 sha256);服务端抓字节后用同款复算校验。
+function fingerprint(buf) {
+  let h1 = 5381, h2 = 52711;
+  const step = buf.length > 65536 ? 7 : 1; // 与端侧一致:大文件抽样
+  for (let i = 0; i < buf.length; i += step) {
+    const c = buf[i];
+    h1 = ((h1 * 33) ^ c) >>> 0;
+    h2 = ((h2 * 33) ^ c) >>> 0;
+  }
+  return (h1 >>> 0).toString(16) + (h2 >>> 0).toString(16) + '-' + buf.length.toString(16);
+}
+
 function extOf(u) {
   const m = u.split('?')[0].match(/\.([a-z0-9]{1,5})$/i);
   return m ? '.' + m[1].toLowerCase() : '';
@@ -71,13 +84,13 @@ export async function buildFromConsensus(pool, appCfg, K, BUNDLES_DIR) {
       if (!res.ok) { failed++; continue; }
       const buf = Buffer.from(await res.arrayBuffer());
       if (!buf.length) { failed++; continue; }
-      const h = sha256(buf);
-      if (h !== e.consensusHash) { mismatch++; continue; } // 服务端实测 hash ≠ 共识 → 丢弃(投毒/已变)
+      const fp = fingerprint(buf);
+      if (fp !== e.consensusHash) { mismatch++; continue; } // 服务端复算 djb2 ≠ 用户共识 → 丢弃(投毒/已变)
       if (total + buf.length > BUDGET) { skipped++; continue; }
       const file = fileNameFor(e.url);
       fs.writeFileSync(path.join(tmpDir, file), buf);
       total += buf.length;
-      manifest.push({ url: e.url, file, mime: e.mime || mimeOf(e.url), hash: h });
+      manifest.push({ url: e.url, file, mime: e.mime || mimeOf(e.url), hash: sha256(buf) });
       built++;
     } catch (err) { failed++; }
   }
