@@ -15,6 +15,7 @@ import crypto from 'node:crypto';
 import { execFile } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { initDb, dbReady, getPool } from './db.js';
+import { buildFromConsensus } from './consensus-builder.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const DATA_FILE = path.join(__dirname, 'data', 'config.json');
@@ -306,6 +307,20 @@ app.get('/api/admin/report/:id', async (req, res) => {
       else unstable.push({ url: u.url, variants: u.variants, votes: u.topVotes });
     }
     res.json({ appId, K, totalUrls: byUrl.size, stableCount: stable.length, unstableCount: unstable.length, stable: stable.slice(0, 100), unstable: unstable.slice(0, 50) });
+  } catch (e) {
+    res.status(500).json({ error: String(e && e.message || e) });
+  }
+});
+
+// 按共识建包:取 stable 资源 → 服务端抓字节 + 重算 hash 校验 → 写离线包 + manifest(带 hash)。?k=N 设阈值。
+app.post('/api/admin/report/:id/build', async (req, res) => {
+  if (!dbReady() || !getPool()) return res.status(503).json({ error: 'db not ready' });
+  const appCfg = (loadConfig().apps || []).find((a) => a.id === req.params.id);
+  if (!appCfg) return res.status(404).json({ error: 'app not found' });
+  const K = Math.max(1, parseInt(req.query.k || '2', 10));
+  try {
+    const r = await buildFromConsensus(getPool(), appCfg, K, BUNDLES_DIR);
+    res.json(r);
   } catch (e) {
     res.status(500).json({ error: String(e && e.message || e) });
   }
