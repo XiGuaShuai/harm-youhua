@@ -195,7 +195,7 @@ export class WebPool {
         if (murl.indexOf('http://') !== 0 && murl.indexOf('https://') !== 0) {
           murl = server + (murl.charAt(0) === '/' ? murl : ('/' + murl));
         }
-        webCache.loadRemoteBundle(a.url, murl);
+        webCache.loadRemoteBundle(a.url, murl, a.bundleVersion !== undefined ? a.bundleVersion : '');
         break;
       }
     }

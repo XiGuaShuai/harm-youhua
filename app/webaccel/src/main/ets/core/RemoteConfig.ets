@@ -19,7 +19,8 @@ export interface RemoteApp {
   prerender?: boolean;
   codeCache?: boolean;
   bundle?: boolean;
-  manifestUrl?: string; // 后台下发:启用离线包且已打包时才有,App 据此去服务器下载
+  manifestUrl?: string;  // 后台下发:启用离线包且已打包时才有,App 据此去服务器下载
+  bundleVersion?: string; // 离线包清单指纹:后台下发,设备据此判断"要不要更新本地离线包"
 }
 
 export interface RemoteSettings {

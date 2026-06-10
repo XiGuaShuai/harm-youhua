@@ -86,6 +86,13 @@ interface BundleProgressEntry {
   expected: Set<string>;
 }
 
+/** 离线包已应用状态(持久化):支撑"版本门 + 按 URL 增删"的更新检查 */
+interface BundleState {
+  origin: string;
+  version: string; // 已应用的 bundleVersion(与 /api/config 下发的对比,一致则跳过更新)
+  urls: string[];  // 已应用清单里的资源 URL(用于清理被服务端移除的旧资源)
+}
+
 /**
  * Web 离线缓存管理器(单例)。两层只读/可写缓存:
  *
@@ -127,6 +134,8 @@ class WebCacheManager {
   private prefetchedOrigins: Set<string> = new Set();             // 已预取过全部 chunk 的站点
   private loadedBundles: Set<string> = new Set();                 // 本次会话已拉过远程离线包的站点(按 origin)
   private bundleProgress: Map<string, BundleProgressEntry> = new Map(); // 各站离线包下载进度(按 origin)
+  private bundleState: Map<string, BundleState> = new Map();      // 各站离线包已应用状态(版本+URL清单,持久化,用于更新检查)
+  private bundleStatePath: string = '';                           // bundle-state.json 路径
   private lastCachedUrl: string = '';                             // 最近被后台缓存的资源 URL(调试浮窗用)
   private recentCached: string[] = [];                            // 最近若干条后台缓存(新→旧,调试浮窗列表用)
   private lastCacheAt: number = 0;                                // 最近一次"缓存成功"的时刻(判断是否真的还在缓存)
@@ -137,11 +146,13 @@ class WebCacheManager {
       this.resMgr = context.resourceManager;
       this.cacheDir = context.filesDir + '/webcache';
       this.indexPath = this.cacheDir + '/index.json';
+      this.bundleStatePath = this.cacheDir + '/bundle-state.json';
       if (!fs.accessSync(this.cacheDir)) {
         fs.mkdirSync(this.cacheDir, true);
       }
       this.loadRawManifest();
       this.loadDiskIndex();
+      this.loadBundleState();
       this.ready = true;
       hilog.info(DOMAIN, TAG, 'ready, raw=%{public}d disk=%{public}d bytes=%{public}d',
         this.rawIndex.size, this.diskIndex.size, this.totalBytes);
@@ -672,14 +683,19 @@ class WebCacheManager {
    * @param siteUrl     站点任意 URL(取 origin,完成后通知补注入字节码)
    * @param manifestUrl 后台 manifest 全地址(如 http://server:8787/bundles/<id>/manifest.json)
    */
-  async loadRemoteBundle(siteUrl: string, manifestUrl: string): Promise<void> {
+  async loadRemoteBundle(siteUrl: string, manifestUrl: string, bundleVersion: string = ''): Promise<void> {
     const om = siteUrl.match(/^https?:\/\/[^\/]+/);
     const origin: string = om ? om[0] : '';
     if (origin.length === 0 || manifestUrl.length === 0) {
       return;
     }
+    // 版本门:已应用版本 == 当前下发版本 → 离线包无变化,直接用本地(连清单都不拉)
+    const applied: BundleState | undefined = this.bundleState.get(origin);
+    if (bundleVersion.length > 0 && applied !== undefined && applied.version === bundleVersion) {
+      return;
+    }
     if (this.loadedBundles.has(origin)) {
-      return; // 本次会话已拉过该站离线包,不重复拉 manifest
+      return; // 本次会话已处理过该站
     }
     this.loadedBundles.add(origin);
     const base: string = manifestUrl.replace(/\/manifest\.json.*$/, ''); // 后台资源目录
@@ -701,24 +717,44 @@ class WebCacheManager {
     let total: number = 0;
     let done: number = 0;
     const expected: Set<string> = new Set();
+    const newUrls: string[] = [];
     for (let i = 0; i < arr.length; i++) {
       const e: RawEntry = arr[i];
       if (!e || !e.url || !e.file) {
         continue;
       }
       total++;
+      newUrls.push(e.url);
       if (this.diskIndex.has(e.url) || this.rawIndex.has(e.url)) {
-        done++; // 已在缓存里,算已完成
+        done++; // 已在缓存里(hash 命名:内容变=URL变,故同 URL 即同内容,无需重下)
       } else {
         expected.add(e.url);
-        // 来源 = 后台文件,缓存 key = 原站 URL(拦截器按原站 URL 命中)
-        this.enqueueBundleDownload(e, base + '/' + e.file);
+        this.enqueueBundleDownload(e, base + '/' + e.file); // 来源=后台文件,缓存 key=原站 URL
       }
     }
+    // 清理:上次清单里有、这次没有的资源 → 删本地(服务端移除/换名后去陈旧)
+    if (applied !== undefined && applied.urls.length > 0) {
+      const keep: Set<string> = new Set<string>(newUrls);
+      let removed: number = 0;
+      for (let i = 0; i < applied.urls.length; i++) {
+        const u: string = applied.urls[i];
+        if (!keep.has(u)) {
+          this.removeCached(u);
+          removed++;
+        }
+      }
+      if (removed > 0) {
+        this.saveDiskIndex();
+        hilog.info(DOMAIN, TAG, 'bundle cleanup removed %{public}d stale', removed);
+      }
+    }
+    // 记录已应用版本 + URL 清单(下次开机版本门据此判断要不要更新)
+    this.bundleState.set(origin, { origin: origin, version: bundleVersion, urls: newUrls });
+    this.saveBundleState();
     const prog: BundleProgressEntry = { total: total, done: done, expected: expected };
     this.bundleProgress.set(origin, prog);
-    hilog.info(DOMAIN, TAG, 'remote bundle: total %{public}d, to download %{public}d, from %{public}s',
-      total, total - done, manifestUrl);
+    hilog.info(DOMAIN, TAG, 'remote bundle: total %{public}d, to download %{public}d, ver %{public}s',
+      total, total - done, bundleVersion.length > 0 ? bundleVersion : '(none)');
   }
 
   private httpGetText(url: string): Promise<string> {
@@ -944,6 +980,60 @@ class WebCacheManager {
     } catch (e) {
       const er = e as BusinessError;
       hilog.error(DOMAIN, TAG, 'saveDiskIndex failed: %{public}s', er.message);
+    }
+  }
+
+  /** 删除一条沙箱缓存(文件 + 索引 + 体积),用于离线包更新时清理被移除的旧资源 */
+  private removeCached(url: string): void {
+    const e: DiskEntry | undefined = this.diskIndex.get(url);
+    if (e !== undefined) {
+      this.removeFile(this.cacheDir + '/' + e.file);
+      this.totalBytes -= e.size;
+      this.diskIndex.delete(url);
+    }
+  }
+
+  /** 读取离线包已应用状态(版本门 + 清理用) */
+  private loadBundleState(): void {
+    try {
+      if (!fs.accessSync(this.bundleStatePath)) {
+        return;
+      }
+      const size: number = fs.statSync(this.bundleStatePath).size;
+      const buf: ArrayBuffer = new ArrayBuffer(size);
+      const f = fs.openSync(this.bundleStatePath, fs.OpenMode.READ_ONLY);
+      fs.readSync(f.fd, buf);
+      fs.closeSync(f);
+      const txt: string = util.TextDecoder.create('utf-8').decodeToString(new Uint8Array(buf));
+      if (txt && txt.length > 0) {
+        const arr = JSON.parse(txt) as BundleState[];
+        for (let i = 0; i < arr.length; i++) {
+          const s: BundleState = arr[i];
+          if (s && s.origin) {
+            this.bundleState.set(s.origin, {
+              origin: s.origin, version: s.version ? s.version : '', urls: s.urls ? s.urls : []
+            });
+          }
+        }
+      }
+    } catch (e) {
+      // 忽略:首次无文件
+    }
+  }
+
+  private saveBundleState(): void {
+    try {
+      const arr: BundleState[] = [];
+      this.bundleState.forEach((v: BundleState) => {
+        arr.push(v);
+      });
+      const txt: string = JSON.stringify(arr);
+      const f = fs.openSync(this.bundleStatePath, fs.OpenMode.READ_WRITE | fs.OpenMode.CREATE | fs.OpenMode.TRUNC);
+      fs.writeSync(f.fd, txt);
+      fs.closeSync(f);
+    } catch (e) {
+      const er = e as BusinessError;
+      hilog.error(DOMAIN, TAG, 'saveBundleState failed: %{public}s', er.message);
     }
   }
 
