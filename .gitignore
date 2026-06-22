@@ -28,3 +28,9 @@ admin/server/bundles/
 *.log
 .DS_Store
 Thumbs.db
+
+# SDK/App 产物 + 临时文件(不进仓库)
+*.har
+*.hap
+*.xlsx
+_线上备份/
