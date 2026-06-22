@@ -6,7 +6,7 @@ import { resourceManager } from '@kit.LocalizationKit';
 import { webview } from '@kit.ArkWeb';
 import { BusinessError } from '@kit.BasicServicesKit';
 import { hilog } from '@kit.PerformanceAnalysisKit';
-import { RemoteSettings } from './RemoteConfig';
+import { RemoteSettings, RemoteApp } from './RemoteConfig';
 
 const TAG: string = 'WebCache';
 const DOMAIN: number = 0x0001;
@@ -127,6 +127,9 @@ class WebCacheManager {
   private docCheckMs: number = DOC_CHECK_MS;        // 主文档校验节流(可远程下发)
   private bundleConcurrency: number = BUNDLE_CONCURRENCY; // 远程离线包下载并发(可远程下发)
   private prefetchEnabled: boolean = true;          // 是否预取全站 chunk(可远程下发)
+  // 每应用精细配置:按 origin 索引。mergedBlockByOrigin = 全局黑名单 + 该应用 extraBlockHosts(预算好,intercept 热路径直接查)
+  private mergedBlockByOrigin: Map<string, string[]> = new Map();
+  private prefetchByOrigin: Map<string, boolean> = new Map(); // 该应用的 prefetchChunks 覆盖值
 
   private rawIndex: Map<string, RawEntry> = new Map();
   private diskIndex: Map<string, DiskEntry> = new Map();
@@ -183,6 +186,107 @@ class WebCacheManager {
     }
   }
 
+  private prefetchedRouteOrigins: Set<string> = new Set();
+
+  /**
+   * 通用路由预取(任何站点适用,不依赖 webpack):对配置了 routes 的应用,开机预拉这些路由页的
+   * 主文档进缓存 + 注册 SWR。点击二级页(如 K11 美食页 /zh-cn/taste/)时主文档已在本地,省去现拉主文档的时间。
+   * 注:只缓主文档,二级页的动态数据(跨境 API)仍实时拉,框架管不了那部分。
+   * @param origin 站点 origin(如 https://hk.k11.com)
+   * @param routes 路由列表(如 ['/zh-cn','/zh-cn/shop/','/zh-cn/taste/'])
+   */
+  prefetchRoutes(origin: string, routes: string[]): void {
+    if (!origin || origin.length === 0 || !routes || routes.length === 0) {
+      return;
+    }
+    if (this.prefetchedRouteOrigins.has(origin)) {
+      return; // 每站只预取一次
+    }
+    this.prefetchedRouteOrigins.add(origin);
+    const urls: string[] = [];
+    for (let i = 0; i < routes.length; i++) {
+      let r: string = routes[i];
+      if (!r || r.length === 0) {
+        continue;
+      }
+      if (r.charAt(0) !== '/') {
+        r = '/' + r;
+      }
+      urls.push(origin + r);
+    }
+    if (urls.length === 0) {
+      return;
+    }
+    // 只预下载这些路由页引用的【静态资源】,不缓主文档(主文档可能是动态页/带会话状态,
+    // 缓了会导致点进去拿到错误的旧版本 → error。动态页的 HTML 交给运行时正常加载,我们只把资源提前备好)。
+    for (let i = 0; i < urls.length; i++) {
+      const u: string = urls[i];
+      this.prefetchRoutePage(u, origin);
+    }
+    hilog.info(DOMAIN, TAG, 'prefetchRoutes %{public}d for %{public}s', urls.length, origin);
+  }
+
+  /** 抓单个路由页 HTML 仅用于【解析它引用的静态资源】并预下载;不缓主文档本身 */
+  private prefetchRoutePage(pageUrl: string, origin: string): void {
+    // 只用 HTML 文本解析资源链接,不把主文档写入缓存(避免动态页缓存导致 error)
+    this.httpGetText(pageUrl).then((html: string) => {
+      if (!html || html.length === 0) {
+        return;
+      }
+      // 解析 <script src> / <link href> / <img src> 引用的资源,取同源 + 可缓存的预下载
+      const refs: string[] = [];
+      const reSrc = /(?:src|href)\s*=\s*["']([^"']+)["']/gi;
+      let m: RegExpExecArray | null = reSrc.exec(html);
+      let guard: number = 0;
+      while (m !== null && guard < 500) {
+        refs.push(m[1]);
+        m = reSrc.exec(html);
+        guard++;
+      }
+      let queued: number = 0;
+      for (let i = 0; i < refs.length; i++) {
+        const abs: string = this.resolveUrl(refs[i], origin, pageUrl);
+        if (abs.length === 0) {
+          continue;
+        }
+        // 只预取同源 + 可缓存(hash/版本号 query)资源;跨域、动态接口、不可缓资源跳过
+        if (abs.indexOf(origin) === 0 && this.shouldCache(abs) &&
+          !this.diskIndex.has(abs) && !this.rawIndex.has(abs) && !this.inflight.has(abs)) {
+          this.download(abs);
+          queued++;
+        }
+      }
+      if (queued > 0) {
+        hilog.info(DOMAIN, TAG, 'prefetchRoutePage %{public}s queued %{public}d res', pageUrl, queued);
+      }
+    });
+  }
+
+  /** 把相对/绝对引用解析成完整 URL(失败返回空串) */
+  private resolveUrl(ref: string, origin: string, base: string): string {
+    if (!ref || ref.length === 0) {
+      return '';
+    }
+    if (ref.indexOf('http://') === 0 || ref.indexOf('https://') === 0) {
+      return ref;
+    }
+    if (ref.indexOf('//') === 0) {
+      return 'https:' + ref;
+    }
+    if (ref.charAt(0) === '/') {
+      return origin + ref;
+    }
+    if (ref.charAt(0) === '#' || ref.indexOf('data:') === 0 || ref.indexOf('javascript:') === 0) {
+      return '';
+    }
+    // 相对路径:相对于 base 的目录
+    const q: number = base.indexOf('?');
+    const clean: string = q >= 0 ? base.substring(0, q) : base;
+    const slash: number = clean.lastIndexOf('/');
+    const dir: string = slash >= 0 ? clean.substring(0, slash + 1) : (origin + '/');
+    return dir + ref;
+  }
+
   /** 注册"主文档检测到新版本"的回调。展示页用它在站点更新时刷新 WebView,做到最快失效 */
   setDocUpdateHandler(cb: (url: string) => void): void {
     this.docUpdateHandler = cb;
@@ -194,6 +298,59 @@ class WebCacheManager {
       this.blockHosts = hosts;
       hilog.info(DOMAIN, TAG, 'blockHosts injected: %{public}d', hosts.length);
     }
+  }
+
+  /**
+   * 应用每应用精细配置:按 origin 预算"全局黑名单 + 该应用 extraBlockHosts"的合并列表,
+   * 以及该应用的 prefetchChunks 覆盖值。intercept/预取时按当前请求的 origin 取用,做到每应用单独生效。
+   * 必须在 setBlockHosts 之后调用(依赖全局黑名单做合并)。
+   */
+  applyApps(apps: RemoteApp[]): void {
+    this.mergedBlockByOrigin.clear();
+    this.prefetchByOrigin.clear();
+    if (!apps || apps.length === 0) {
+      return;
+    }
+    for (let i = 0; i < apps.length; i++) {
+      const app: RemoteApp = apps[i];
+      if (!app || !app.url || app.url.length === 0) {
+        continue;
+      }
+      const om = app.url.match(/^https?:\/\/[^\/]+/);
+      const origin: string = om ? om[0] : '';
+      if (origin.length === 0) {
+        continue;
+      }
+      // 合并黑名单 = 全局 + 该应用额外
+      const merged: string[] = this.blockHosts.slice();
+      if (app.extraBlockHosts && app.extraBlockHosts.length > 0) {
+        for (let j = 0; j < app.extraBlockHosts.length; j++) {
+          const h: string = app.extraBlockHosts[j];
+          if (h && h.length > 0) {
+            merged.push(h);
+          }
+        }
+      }
+      this.mergedBlockByOrigin.set(origin, merged);
+      // 每应用 prefetchChunks 覆盖(只在显式下发布尔值时记录)
+      if (typeof app.prefetchChunks === 'boolean') {
+        this.prefetchByOrigin.set(origin, app.prefetchChunks);
+      }
+    }
+    hilog.info(DOMAIN, TAG, 'applyApps: %{public}d origins', this.mergedBlockByOrigin.size);
+  }
+
+  /** 取某 URL 对应的合并黑名单(全局+该应用额外);无应用匹配时退回全局 */
+  private blockListFor(url: string): string[] {
+    const om = url.match(/^https?:\/\/[^\/]+/);
+    const origin: string = om ? om[0] : '';
+    if (origin.length > 0) {
+      const merged: string[] | undefined = this.mergedBlockByOrigin.get(origin);
+      if (merged) {
+        return merged;
+      }
+    }
+    return this.blockHosts;
   }
 
   /** 远程下发全局设置(缓存上限 / 文档校验节流)。bytecodeCache 在元服务不支持,已忽略 */
@@ -243,11 +400,14 @@ class WebCacheManager {
    * @param originUrl 该站任意同源 URL(用于取 origin)
    */
   prefetchSiteChunks(originUrl: string): void {
-    if (!this.prefetchEnabled) {
-      return; // 后台关闭了全站 chunk 预取
-    }
     const om = originUrl.match(/^https?:\/\/[^\/]+/);
     const origin: string = om ? om[0] : '';
+    // 每应用 prefetchChunks 覆盖优先;未下发则用全局 prefetchEnabled
+    const appOverride: boolean | undefined = origin.length > 0 ? this.prefetchByOrigin.get(origin) : undefined;
+    const enabled: boolean = typeof appOverride === 'boolean' ? appOverride : this.prefetchEnabled;
+    if (!enabled) {
+      return; // 该应用/全局关闭了 chunk 预取
+    }
     if (origin.length === 0 || this.prefetchedOrigins.has(origin)) {
       return;
     }
@@ -304,9 +464,32 @@ class WebCacheManager {
    * 规则:静态扩展名,且文件名里含 ≥8 位的 hash 样 token(全 hex,或字母+数字混合)。
    * 例:webpack-628c76ac231d2361.js ✓ / index.4f3a9b2c.css ✓ / jquery-3.6.0.min.js ✗
    */
+  // 版本号型 query 识别:query 各参数值全是纯数字(如 ?2025121805、?v=20250117)才算"版本号"。
+  // 必须与后端 cache-builder.js 的 isVersionQuery 完全一致,否则端云判断不一致、离线包命不中。
+  private isVersionQuery(query: string): boolean {
+    if (!query || query.length === 0) {
+      return false;
+    }
+    const q: string = query.charAt(0) === '?' ? query.substring(1) : query;
+    if (q.length === 0) {
+      return false;
+    }
+    const parts: string[] = q.split('&');
+    for (let i = 0; i < parts.length; i++) {
+      const part: string = parts[i];
+      const eq: number = part.indexOf('=');
+      const v: string = eq >= 0 ? part.substring(eq + 1) : part; // 无 key= 时(如 ?2025121805)取整段
+      if (!/^[0-9]+$/.test(v)) {
+        return false; // 必须全数字
+      }
+    }
+    return true;
+  }
+
   private isHashedAsset(url: string): boolean {
     const q: number = url.indexOf('?');
     const path: string = q >= 0 ? url.substring(0, q) : url;
+    const query: string = q >= 0 ? url.substring(q) : '';
     const slash: number = path.lastIndexOf('/');
     const seg: string = (slash >= 0 ? path.substring(slash + 1) : path).toLowerCase();
     const dot: number = seg.lastIndexOf('.');
@@ -315,6 +498,10 @@ class WebCacheManager {
     }
     if (!STATIC_EXTS.has(seg.substring(dot + 1))) {
       return false;
+    }
+    // 带版本号 query(纯数字)→ 可缓存(query 变即新 URL,等效 hash);带随机参数 → 不缓(避免缓存爆炸)
+    if (query.length > 0) {
+      return this.isVersionQuery(query);
     }
     const tokens: string[] = seg.substring(0, dot).split(/[.\-_]/);
     for (let i = 0; i < tokens.length; i++) {
@@ -498,8 +685,10 @@ class WebCacheManager {
 
   /** 是否命中黑名单(会挂死的外部请求) */
   private isBlocked(url: string): boolean {
-    for (let i = 0; i < this.blockHosts.length; i++) {
-      if (url.indexOf(this.blockHosts[i]) >= 0) {
+    // 用"全局 + 该应用额外"的合并黑名单(按 origin);无应用匹配时退回全局
+    const hosts: string[] = this.blockListFor(url);
+    for (let i = 0; i < hosts.length; i++) {
+      if (url.indexOf(hosts[i]) >= 0) {
         return true;
       }
     }

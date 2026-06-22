@@ -1,6 +1,7 @@
-import { AbilityConstant, ConfigurationConstant, UIAbility, Want } from '@kit.AbilityKit';
+import { AbilityConstant, ConfigurationConstant, UIAbility, Want, abilityAccessCtrl, Permissions } from '@kit.AbilityKit';
 import { hilog } from '@kit.PerformanceAnalysisKit';
 import { window } from '@kit.ArkUI';
+import { BusinessError } from '@kit.BasicServicesKit';
 import { WebAccel, RemoteApp } from 'webaccel';
 
 const DOMAIN = 0x0000;
@@ -10,8 +11,9 @@ const DOMAIN = 0x0000;
  * 后台可达时以 /api/config 为准覆盖。这是「接入方/demo 自己的数据」,不进 SDK。
  */
 const FALLBACK_APPS: RemoteApp[] = [
-  { id: 'beacukai', name: '印尼海关 e-CD', url: 'https://ecd.beacukai.go.id/', swrDoc: true, prerender: true, bundle: true },
-  { id: 'rwsentosa', name: '圣淘沙名胜世界 RWS', url: 'https://www.rwsentosa.com/', swrDoc: true, prerender: true, bundle: true }
+  { id: 'k11', name: 'K11 香港', url: 'https://hk.k11.com/zh-cn', routes: ['/zh-cn', '/zh-cn/shop/', '/zh-cn/taste/'], swrDoc: true, prerender: true, bundle: false },
+  { id: 'booking', name: 'Booking.com', url: 'https://www.booking.com/?aid=376371', routes: ['/'], swrDoc: true, prerender: true, bundle: false },
+  { id: 'beacukai', name: '印尼入境卡', url: 'https://ecd.beacukai.go.id/', swrDoc: true, prerender: true, bundle: true }
 ];
 
 export default class EntryAbility extends UIAbility {
@@ -68,6 +70,27 @@ export default class EntryAbility extends UIAbility {
       }
       hilog.info(DOMAIN, 'testTag', 'Succeeded in loading the content.');
     });
+    // 申请定位权限:网页(如 Booking"当前位置搜索")要用定位,元服务自身先拿到系统定位授权,
+    // 否则网页里 navigator.geolocation 拿不到位置 → 搜索失败。
+    this.reqLocationPermission();
+  }
+
+  // 运行时弹系统授权框,申请定位权限(模糊定位即可满足"附近搜索")
+  private reqLocationPermission(): void {
+    try {
+      const perms: Array<Permissions> = ['ohos.permission.APPROXIMATELY_LOCATION'];
+      const atManager = abilityAccessCtrl.createAtManager();
+      atManager.requestPermissionsFromUser(this.context, perms)
+        .then((data) => {
+          hilog.info(DOMAIN, 'testTag', 'location permission result: %{public}s', JSON.stringify(data.authResults));
+        })
+        .catch((err: BusinessError) => {
+          hilog.error(DOMAIN, 'testTag', 'request location permission failed: %{public}s', err.message);
+        });
+    } catch (e) {
+      const er = e as BusinessError;
+      hilog.error(DOMAIN, 'testTag', 'reqLocationPermission err: %{public}s', er.message);
+    }
   }
 
   onWindowStageDestroy(): void {

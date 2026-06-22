@@ -17,6 +17,10 @@
       "value": "用于加载网页内容"
     },
     {
+      "name": "location_permission_reason",
+      "value": "用于网页按当前位置搜索附近内容"
+    },
+    {
       "name": "form_FormAbility_label",
       "value": "网页加速"
     },

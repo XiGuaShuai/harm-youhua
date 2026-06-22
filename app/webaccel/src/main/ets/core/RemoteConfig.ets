@@ -21,6 +21,8 @@ export interface RemoteApp {
   bundle?: boolean;
   manifestUrl?: string;  // 后台下发:启用离线包且已打包时才有,App 据此去服务器下载
   bundleVersion?: string; // 离线包清单指纹:后台下发,设备据此判断"要不要更新本地离线包"
+  extraBlockHosts?: string[]; // 每应用额外黑名单:只对本应用生效,叠加在全局 blockHosts 之上
+  prefetchChunks?: boolean;   // 每应用 chunk 预取开关:覆盖全局 settings.prefetchChunks(不下发=用全局)
 }
 
 export interface RemoteSettings {

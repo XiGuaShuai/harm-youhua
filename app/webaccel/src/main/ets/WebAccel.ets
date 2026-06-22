@@ -54,6 +54,7 @@ export class WebAccel {
     remoteConfig.load(context);
     webCache.setBlockHosts(remoteConfig.getBlockHosts());
     webCache.applySettings(remoteConfig.getSettings());
+    webCache.applyApps(remoteConfig.getApps()); // 每应用精细配置(额外黑名单/预取开关)按 origin 生效
     webPool.bindRemoteConfig();
 
     // ⑤ 异步:有后台且允许时拉服务器最新配置,成功后再注入一次
@@ -63,6 +64,7 @@ export class WebAccel {
         if (ok) {
           webCache.setBlockHosts(remoteConfig.getBlockHosts());
           webCache.applySettings(remoteConfig.getSettings());
+          webCache.applyApps(remoteConfig.getApps()); // 每应用精细配置按 origin 生效
           WebAccel.runExploreReports(); // 众包探索:对后台标记的待探索 app 匿名上报本地已缓存资源
         }
       });
@@ -131,6 +133,7 @@ export class WebAccel {
     if (ok) {
       webCache.setBlockHosts(remoteConfig.getBlockHosts());
       webCache.applySettings(remoteConfig.getSettings());
+      webCache.applyApps(remoteConfig.getApps()); // 每应用精细配置按 origin 生效
     }
     return ok;
   }

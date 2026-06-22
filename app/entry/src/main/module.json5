@@ -7,10 +7,37 @@
     "deviceTypes": [
       "phone"
     ],
+    // 真机联调:允许明文 HTTP(CONFIG_SERVER 指向本机局域网后端 http://192.168.20.197:8787)。正式发版用 HTTPS 时移除。
+    "metadata": [
+      {
+        "name": "ohos.security.networkSecurityConfig",
+        "resource": "$profile:network_config"
+      }
+    ],
     "requestPermissions": [
       {
         "name": "ohos.permission.INTERNET",
         "reason": "$string:internet_permission_reason",
+        "usedScene": {
+          "abilities": [
+            "EntryAbility"
+          ],
+          "when": "inuse"
+        }
+      },
+      {
+        "name": "ohos.permission.APPROXIMATELY_LOCATION",
+        "reason": "$string:location_permission_reason",
+        "usedScene": {
+          "abilities": [
+            "EntryAbility"
+          ],
+          "when": "inuse"
+        }
+      },
+      {
+        "name": "ohos.permission.LOCATION",
+        "reason": "$string:location_permission_reason",
         "usedScene": {
           "abilities": [
             "EntryAbility"

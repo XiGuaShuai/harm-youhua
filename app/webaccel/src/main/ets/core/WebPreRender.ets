@@ -95,21 +95,26 @@ export class WebPool {
     return true;
   }
 
+  // 同时离屏预渲染的应用数上限:只热预前 MAX_EAGER_PRERENDER 个,避免 N 个 Web 同时建抢首屏资源。
+  // 其余应用先做轻量预热(预连接 + 离线包预下 + SWR),再分批延迟补离屏预渲染。
+  private static readonly MAX_EAGER_PRERENDER: number = 2;
+  private static readonly LAZY_PRERENDER_STEP_MS: number = 1200;
+
   private prewarmConfiguredApps(apps: RemoteApp[]): void {
     if (!apps || apps.length === 0) {
       return;
     }
+    let eager: number = 0;
+    let lazyDelay: number = 0;
     for (let i = 0; i < apps.length; i++) {
       const app: RemoteApp = apps[i];
       if (!app || !app.url || app.url.length === 0) {
         continue;
       }
       const swr: boolean = app.swrDoc !== false;
-      if (app.prerender !== false && this.uiContext) {
-        this.prewarm(app.url, swr);
-        continue;
-      }
-      // 不离屏预渲染的应用:也提前预连接 +(可选)SWR + 预下离线包(bundle:true 才会真下)
+      const wantPrerender: boolean = app.prerender !== false && this.uiContext !== null;
+
+      // 轻量预热:所有应用都做(快、不占渲染线程)—— 预连接 + 离线包预下 + SWR
       this.loadBundleFor(app.url);
       try {
         webview.WebviewController.prepareForPageLoad(app.url, true, 4);
@@ -119,6 +124,35 @@ export class WebPool {
       }
       if (swr) {
         webCache.enableDocCache([app.url]);
+      }
+
+      // 通用路由预取:对配置了 routes 的站(任何打包器都适用),延迟预拉二级路由页主文档进缓存,
+      // 点二级页(如 K11 美食页)时主文档已在本地、秒一截。延迟 2.5s 触发,先让首屏加载完,不抢首屏资源。
+      if (app.routes && app.routes.length > 0) {
+        const om = app.url.match(/^https?:\/\/[^\/]+/);
+        const origin: string = om ? om[0] : '';
+        const routes: string[] = app.routes;
+        if (origin.length > 0) {
+          setTimeout(() => {
+            webCache.prefetchRoutes(origin, routes);
+          }, 2500);
+        }
+      }
+
+      if (!wantPrerender) {
+        continue;
+      }
+      if (eager < WebPool.MAX_EAGER_PRERENDER) {
+        // 前几个:立即离屏预渲染(集中首屏资源给最可能先点的应用)
+        this.prewarm(app.url, swr);
+        eager++;
+      } else {
+        // 其余:延迟分批离屏预渲染,错开避免和首屏抢资源
+        lazyDelay += WebPool.LAZY_PRERENDER_STEP_MS;
+        const url: string = app.url;
+        setTimeout(() => {
+          this.prewarm(url, swr);
+        }, lazyDelay);
       }
     }
   }
