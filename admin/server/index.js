@@ -16,6 +16,7 @@ import { execFile } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { initDb, dbReady, getPool } from './db.js';
 import { buildFromConsensus } from './consensus-builder.js';
+import { detectSite } from './cache-builder.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const DATA_FILE = path.join(__dirname, 'data', 'config.json');
@@ -168,6 +169,15 @@ function runCacheBuilder(mode, appId) {
     });
   });
 }
+
+// ——————————————— 定时自动更新离线包(一天一次)的配置 ———————————————
+// 每天自动遍历所有 bundle:true 的站:check 看源站有没有更新 → 有更新就 update(增量),
+// update 失败自动 fallback 到 build(全量重建),build 失败重试。一个站失败不影响其它站。
+// 结果写 data/auto-update-log.json,后台可查"上次自动更新时间/结果"。函数定义见文件末尾(会提升)。
+const AUTO_UPDATE_INTERVAL_MS = 24 * 60 * 60 * 1000; // 一天一次
+const AUTO_UPDATE_FIRST_DELAY_MS = 60 * 1000;        // 服务启动 1 分钟后先跑一次
+const AUTO_UPDATE_LOG = path.join(__dirname, 'data', 'auto-update-log.json');
+let autoUpdateRunning = false;
 
 // ——————————————— Express ———————————————
 const app = express();
@@ -353,6 +363,32 @@ app.get('/api/admin/config', (req, res) => res.json(loadConfig()));
 app.put('/api/admin/apps', (req, res) => {
   const c = loadConfig(); c.apps = req.body.apps || []; res.json(saveConfig(c));
 });
+// 立即手动触发一次"自动检查更新所有站"(后台按钮用);异步执行,立即返回
+app.post('/api/admin/auto-update/run', (req, res) => {
+  runAutoUpdateOnce('manual').catch(() => {});
+  res.json({ ok: true, message: '已触发自动检查更新(后台执行中,稍后查结果)' });
+});
+// 查上次自动更新结果
+app.get('/api/admin/auto-update/log', (req, res) => {
+  try {
+    const log = JSON.parse(fs.readFileSync(AUTO_UPDATE_LOG, 'utf8'));
+    res.json({ ok: true, running: autoUpdateRunning, log });
+  } catch {
+    res.json({ ok: true, running: autoUpdateRunning, log: null });
+  }
+});
+
+// 一键探测站点:填 URL → 自动返回 名称/类型/图标/建议加速参数,让新增应用更傻瓜。
+app.post('/api/admin/apps/detect', async (req, res) => {
+  const url = String((req.body && req.body.url) || '').trim();
+  if (!/^https?:\/\//.test(url)) return res.status(400).json({ ok: false, error: '请填写 http(s):// 开头的完整 URL' });
+  try {
+    const r = await detectSite(url);
+    res.json(r);
+  } catch (e) {
+    res.status(502).json({ ok: false, error: String(e && e.message || e) });
+  }
+});
 app.put('/api/admin/blockhosts', (req, res) => {
   const c = loadConfig(); c.blockHosts = req.body.blockHosts || []; res.json(saveConfig(c));
 });
@@ -437,6 +473,71 @@ if (fs.existsSync(WEB_DIST)) {
   });
 }
 
+async function buildWithRetry(appId, maxRetries = 3) {
+  let lastErr = null;
+  for (let i = 0; i < maxRetries; i++) {
+    try {
+      return await runCacheBuilder('build', appId);
+    } catch (e) {
+      lastErr = e;
+      console.warn(`[AutoUpdate] ${appId} build 第 ${i + 1}/${maxRetries} 次失败: ${e.message}`);
+      if (i < maxRetries - 1) await new Promise((r) => setTimeout(r, 5000 * (i + 1))); // 5s/10s 退避
+    }
+  }
+  throw lastErr;
+}
+
+async function runAutoUpdateOnce(trigger = 'scheduled') {
+  if (autoUpdateRunning) {
+    console.log('[AutoUpdate] 上一轮还在进行,跳过本轮');
+    return;
+  }
+  autoUpdateRunning = true;
+  const startedAt = new Date().toISOString();
+  console.log(`[AutoUpdate] 开始自动检查更新 (${trigger}) ...`);
+  const cfg = loadConfig();
+  const apps = (cfg.apps || []).filter((a) => a.bundle === true);
+  const results = [];
+  for (const app of apps) {
+    const item = { id: app.id, name: app.name || app.id, action: 'none', ok: true, detail: '' };
+    try {
+      const chk = await runCacheBuilder('check', app.id);
+      if (chk && chk.changed) {
+        console.log(`[AutoUpdate] ${app.id} 有更新 → 增量更新`);
+        try {
+          const up = await runCacheBuilder('update', app.id);
+          item.action = 'update';
+          item.detail = `下载 ${up.downloaded || 0} 个新资源`;
+        } catch (upErr) {
+          console.warn(`[AutoUpdate] ${app.id} 增量更新失败,改为全量重建: ${upErr.message}`);
+          const bd = await buildWithRetry(app.id);
+          item.action = 'rebuild';
+          item.detail = `重建 ${bd.count || 0} 个资源` + (bd.failed ? `(${bd.failed} 个失败)` : '');
+        }
+      } else {
+        item.action = 'no-change';
+        item.detail = '源站无更新';
+      }
+    } catch (e) {
+      item.ok = false;
+      item.detail = '检查/构建失败: ' + e.message;
+      console.error(`[AutoUpdate] ${app.id} 失败: ${e.message}`);
+    }
+    results.push(item);
+  }
+  const log = { startedAt, finishedAt: new Date().toISOString(), trigger, results };
+  try { fs.writeFileSync(AUTO_UPDATE_LOG, JSON.stringify(log, null, 2), 'utf8'); } catch {}
+  autoUpdateRunning = false;
+  console.log(`[AutoUpdate] 完成,处理 ${results.length} 个站`);
+  return log;
+}
+
+function startAutoUpdateScheduler() {
+  setTimeout(() => { runAutoUpdateOnce('startup').catch(() => {}); }, AUTO_UPDATE_FIRST_DELAY_MS);
+  setInterval(() => { runAutoUpdateOnce('scheduled').catch(() => {}); }, AUTO_UPDATE_INTERVAL_MS);
+  console.log(`[AutoUpdate] 定时器已启动:每 24 小时自动检查一次离线包更新`);
+}
+
 initDb(); // 后台连 MySQL 并建表(不阻塞;配置/离线包接口走文件,不依赖 DB)
 app.listen(PORT, () => {
   console.log(`[youhua-admin] server on http://localhost:${PORT}`);
@@ -444,4 +545,5 @@ app.listen(PORT, () => {
   console.log(`  离线包托管:      http://localhost:${PORT}/bundles/<id>/manifest.json`);
   console.log(`  后台登录:        账号 ${DEFAULT_USER} / 密码 ${DEFAULT_PASS}  (首登后可在后台改;或用 ADMIN_USER/ADMIN_PASS 环境变量)`);
   if (MASTER_TOKEN) console.log(`  主令牌已开启:    X-Admin-Token: <ADMIN_TOKEN>(脚本用)`);
+  startAutoUpdateScheduler(); // 启动定时自动更新
 });

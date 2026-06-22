@@ -1,5 +1,5 @@
 <script setup>
-import { ref } from 'vue';
+import { ref, onMounted, computed } from 'vue';
 import { storeToRefs } from 'pinia';
 import { ElMessage, ElMessageBox } from 'element-plus';
 import { Plus } from '@element-plus/icons-vue';
@@ -12,15 +12,53 @@ const { apps } = storeToRefs(store);
 const dialog = ref(false);
 const editing = ref(null); // null=新增
 const form = ref(emptyForm());
+const detecting = ref(false);
+
+// 每个应用的离线包状态(资源数/大小),用于表格"离线包"列一目了然
+const bundleMap = ref({});
+async function loadBundles() {
+  try {
+    const { data } = await api.get('/api/admin/bundles');
+    const m = {};
+    (data || []).forEach((b) => { m[b.id] = b; });
+    bundleMap.value = m;
+  } catch (e) { /* 忽略 */ }
+}
+onMounted(loadBundles);
 
 function emptyForm() {
-  return { id: '', name: '', url: '', routesText: '/', swrDoc: true, prerender: true, codeCache: true, bundle: true };
+  return { id: '', name: '', url: '', routesText: '/', swrDoc: true, prerender: true, codeCache: true, bundle: true,
+    prefetchChunks: true, extraBlockHostsText: '' };
 }
 function openAdd() { editing.value = null; form.value = emptyForm(); dialog.value = true; }
 function openEdit(row) {
   editing.value = row.id;
-  form.value = { ...row, routesText: (row.routes || []).join('\n') };
+  form.value = { ...emptyForm(), ...row, routesText: (row.routes || []).join('\n'),
+    extraBlockHostsText: (row.extraBlockHosts || []).join('\n') };
   dialog.value = true;
+}
+
+// 一键探测:填了 URL → 自动带出名称/类型/图标/建议加速参数,免手动判断
+async function detect() {
+  if (!form.value.url) { ElMessage.warning('请先填写 URL'); return; }
+  detecting.value = true;
+  try {
+    const { data } = await api.post('/api/admin/apps/detect', { url: form.value.url });
+    if (data && data.ok) {
+      if (data.name && !form.value.name) form.value.name = data.name;
+      const r = data.recommend || {};
+      form.value.swrDoc = r.swrDoc !== false;
+      form.value.prerender = r.prerender !== false;
+      form.value.bundle = !!r.bundle;
+      form.value.codeCache = !!r.codeCache;
+      form.value.prefetchChunks = r.prefetchChunks !== false;
+      ElMessage.success(`探测成功:${data.appType} 站,${data.sameOriginCacheable} 个可缓资源,已填入建议参数`);
+    }
+  } catch (e) {
+    ElMessage.error('探测失败:' + (e.response?.data?.error || e.message));
+  } finally {
+    detecting.value = false;
+  }
 }
 
 async function submit() {
@@ -28,7 +66,9 @@ async function submit() {
   const item = {
     id: form.value.id, name: form.value.name, url: form.value.url,
     routes: form.value.routesText.split('\n').map((s) => s.trim()).filter(Boolean),
-    swrDoc: form.value.swrDoc, prerender: form.value.prerender, codeCache: form.value.codeCache, bundle: form.value.bundle
+    swrDoc: form.value.swrDoc, prerender: form.value.prerender, codeCache: form.value.codeCache, bundle: form.value.bundle,
+    prefetchChunks: form.value.prefetchChunks,
+    extraBlockHosts: (form.value.extraBlockHostsText || '').split('\n').map((s) => s.trim()).filter(Boolean)
   };
   const list = [...apps.value];
   const idx = list.findIndex((a) => a.id === editing.value);
@@ -37,6 +77,14 @@ async function submit() {
   await store.saveApps();
   dialog.value = false;
   ElMessage.success('已保存');
+  // 新增/编辑后,若开了离线包且还没建,提示一键构建
+  if (item.bundle && !bundleMap.value[item.id]) {
+    try {
+      await ElMessageBox.confirm(`应用「${item.name || item.id}」已开启离线包但尚未构建,现在构建?`, '一键建离线包', { type: 'info', confirmButtonText: '立即构建', cancelButtonText: '稍后' });
+      await buildCache(item);
+      await loadBundles();
+    } catch (e) { /* 用户选稍后 */ }
+  }
 }
 
 async function remove(row) {
@@ -116,12 +164,23 @@ async function generateManifest(row) {
       <el-table-column prop="id" label="ID" width="120" />
       <el-table-column prop="name" label="名称" width="160" />
       <el-table-column prop="url" label="URL" show-overflow-tooltip />
-      <el-table-column label="加速项" width="220">
+      <el-table-column label="加速项" width="200">
         <template #default="{ row }">
           <el-tag v-if="row.bundle" size="small" type="success">离线包</el-tag>
           <el-tag v-if="row.prerender" size="small">预渲染</el-tag>
           <el-tag v-if="row.swrDoc" size="small">SWR</el-tag>
           <el-tag v-if="row.codeCache" size="small">字节码</el-tag>
+          <el-tag v-if="row.prefetchChunks" size="small" type="info">预取</el-tag>
+        </template>
+      </el-table-column>
+      <el-table-column label="离线包状态" width="150">
+        <template #default="{ row }">
+          <template v-if="bundleMap[row.id]">
+            <el-tag size="small" type="success">已建</el-tag>
+            <div class="muted" style="font-size:12px">{{ bundleMap[row.id].count }} 个 / {{ bundleMap[row.id].sizeKB || bundleMap[row.id].kb || 0 }} KB</div>
+          </template>
+          <el-tag v-else-if="row.bundle" size="small" type="warning">待构建</el-tag>
+          <el-tag v-else size="small" type="info">不启用</el-tag>
         </template>
       </el-table-column>
       <el-table-column label="操作" width="500">
@@ -141,17 +200,27 @@ async function generateManifest(row) {
         <el-form-item label="ID">
           <el-input v-model="form.id" :disabled="!!editing" placeholder="唯一标识,如 beacukai" />
         </el-form-item>
-        <el-form-item label="名称"><el-input v-model="form.name" /></el-form-item>
-        <el-form-item label="URL"><el-input v-model="form.url" placeholder="https://..." /></el-form-item>
+        <el-form-item label="URL">
+          <div style="display:flex; gap:8px; width:100%">
+            <el-input v-model="form.url" placeholder="https://..." />
+            <el-button :loading="detecting" @click="detect">一键探测</el-button>
+          </div>
+        </el-form-item>
+        <el-form-item label="名称"><el-input v-model="form.name" placeholder="探测可自动填入" /></el-form-item>
         <el-form-item label="路由">
-          <el-input v-model="form.routesText" type="textarea" :rows="4"
-            placeholder="每行一个,用于构建缓存与端侧预热" />
+          <el-input v-model="form.routesText" type="textarea" :rows="3"
+            placeholder="每行一个二级页路径(如 /shop/、/taste/),用于预取该页资源与构建缓存" />
         </el-form-item>
         <el-form-item label="加速项">
           <el-checkbox v-model="form.bundle">离线包</el-checkbox>
           <el-checkbox v-model="form.prerender">离屏预渲染</el-checkbox>
           <el-checkbox v-model="form.swrDoc">主文档 SWR</el-checkbox>
           <el-checkbox v-model="form.codeCache">字节码缓存</el-checkbox>
+          <el-checkbox v-model="form.prefetchChunks">chunk 预取</el-checkbox>
+        </el-form-item>
+        <el-form-item label="额外黑名单">
+          <el-input v-model="form.extraBlockHostsText" type="textarea" :rows="2"
+            placeholder="只对本应用生效的额外屏蔽域(每行一个),叠加在全局黑名单之上。如 Booking 的遥测域" />
         </el-form-item>
       </el-form>
       <template #footer>

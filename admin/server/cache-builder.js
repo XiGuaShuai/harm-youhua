@@ -10,13 +10,14 @@ const BUNDLES_DIR = path.join(__dirname, 'bundles');
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36';
 
 function mimeOf(u) {
-  if (u.endsWith('.js')) return 'application/javascript';
-  if (u.endsWith('.css')) return 'text/css';
-  if (u.endsWith('.ttf')) return 'font/ttf';
-  if (u.endsWith('.woff2')) return 'font/woff2';
-  if (u.endsWith('.woff')) return 'font/woff';
-  if (u.endsWith('.otf')) return 'font/otf';
-  if (u.endsWith('.html')) return 'text/html';
+  const p = u.split('?')[0]; // 剥掉版本号 query 再判扩展名
+  if (p.endsWith('.js') || p.endsWith('.mjs')) return 'application/javascript';
+  if (p.endsWith('.css')) return 'text/css';
+  if (p.endsWith('.ttf')) return 'font/ttf';
+  if (p.endsWith('.woff2')) return 'font/woff2';
+  if (p.endsWith('.woff')) return 'font/woff';
+  if (p.endsWith('.otf')) return 'font/otf';
+  if (p.endsWith('.html')) return 'text/html';
   return 'application/octet-stream';
 }
 
@@ -33,13 +34,39 @@ function matchGroup(text, re) {
   return Array.from(text.matchAll(re)).map((m) => m[1]).filter(Boolean);
 }
 
-// 与 SDK 的 isHashedAsset 一致:只认"内容 hash 命名的不可变静态资源",
+// 版本号型 query 识别:query 各参数值全是纯数字(如 ?2025121805、?v=20250117)才算"版本号"。
+// 版本号变 = URL 变 = 重新拉,等效内容 hash,缓存安全。排除随机参数(?t=时间戳含字母、?token=xxx)避免缓存爆炸。
+// 注:端侧 WebCacheManager.ets 的 isVersionQuery 必须与此完全一致。
+function isVersionQuery(query) {
+  if (!query || query.length === 0) return false;
+  const q = query.charAt(0) === '?' ? query.substring(1) : query;
+  if (q.length === 0) return false;
+  const parts = q.split('&');
+  for (const part of parts) {
+    const eq = part.indexOf('=');
+    const v = eq >= 0 ? part.substring(eq + 1) : part; // 无 key= 时(如 ?2025121805)取整段
+    if (!/^[0-9]+$/.test(v)) return false; // 必须全数字
+  }
+  return true;
+}
+
+// 与 SDK 的 isHashedAsset 一致:认"内容 hash 命名"或"带版本号 query"的不可变静态资源,
 // 这样设备端拦截器(shouldCache)才会真正命中并服务,避免打进一堆永远不被用到的资源。
 function isHashedAsset(p) {
-  const seg = (p.split('?')[0].split('/').pop() || '').toLowerCase();
+  const qIdx = p.indexOf('?');
+  const query = qIdx >= 0 ? p.substring(qIdx) : '';
+  const pathname = qIdx >= 0 ? p.substring(0, qIdx) : p;
+  const seg = (pathname.split('/').pop() || '').toLowerCase();
+  // sourcemap 仅供调试,设备运行不需要 → 不打进离线包(省体积)
+  if (seg.endsWith('.map')) return false;
   const dot = seg.lastIndexOf('.');
   if (dot <= 0) return false;
   if (!/^(js|mjs|css|woff2?|ttf|otf|eot|png|jpe?g|gif|svg|webp|avif|ico)$/.test(seg.slice(dot + 1))) return false;
+  // 带版本号 query(纯数字)→ 可缓存(query 变即新 URL,等效 hash)
+  if (query && isVersionQuery(query)) return true;
+  // 带随机参数(非版本号 query)→ 不缓(避免缓存爆炸)
+  if (query) return false;
+  // 无 query → 按文件名是否含内容 hash 判断
   return seg.slice(0, dot).split(/[.\-_]/).some((t) => t.length >= 8 && !/^[0-9]+x[0-9]+$/.test(t) && (/^[a-f0-9]+$/.test(t) || (/[0-9]/.test(t) && /[a-z]/.test(t))));
 }
 
@@ -100,7 +127,10 @@ function cacheFileRank(file) {
 function sameOriginPath(ref, origin, baseForResolve) {
   try {
     const abs = new URL(ref, baseForResolve);
-    return abs.origin === origin ? abs.pathname : '';
+    if (abs.origin !== origin) return '';
+    // 保留版本号型 query(如 ?2025121805)→ 缓存 key 含版本号,版本变即新资源;随机参数仍丢弃
+    if (abs.search && isVersionQuery(abs.search)) return abs.pathname + abs.search;
+    return abs.pathname;
   } catch {
     return '';
   }
@@ -138,8 +168,9 @@ async function discoverResources(appCfg) {
   for (const ref of refs) {
     const p = sameOriginPath(ref, origin, entryUrl);
     if (!p || !isHashedAsset(p)) continue;
-    if (p.endsWith('.js')) jsSet.add(p);
-    else if (p.endsWith('.css')) cssSet.add(p);
+    const pathOnly = p.split('?')[0]; // 剥掉版本号 query 再判扩展名(否则 bundle.min.js?2025121805 不以 .js 结尾)
+    if (pathOnly.endsWith('.js') || pathOnly.endsWith('.mjs')) jsSet.add(p);
+    else if (pathOnly.endsWith('.css')) cssSet.add(p);
   }
 
   // ③ 从每个 CSS 里抓字体/媒体(Next 的 /_next/static/media + 通用 url() 同源 hash 资源)
@@ -344,6 +375,54 @@ function buildCacheManifest(appCfg) {
   return { id: appCfg.id, count: manifest.length, builtAt: new Date().toISOString(), mode: 'cache-manifest' };
 }
 
+// 探测一个站点:抓首页 HTML → 判框架类型 + 提取名称/图标 + 给加速参数建议。
+// 供后台"新增应用一键探测"用,让上架更傻瓜(填 URL 自动带出名称/类型/建议开关)。
+export async function detectSite(url) {
+  const u = new URL(url);
+  const origin = u.origin;
+  const html = await fetchText(url);
+  if (!html) throw new Error('抓取目标站失败(可能反爬或不可达)');
+
+  // 框架类型
+  const isNext = /\/_next\/static\//.test(html) || /__NEXT_DATA__/.test(html);
+  const isVite = /type=["']module["'][^>]+src=["'][^"']*\/assets\//.test(html) || /\/@vite\//.test(html);
+  const isCRA = /\/static\/js\/main\.[a-f0-9]+\.js/.test(html);
+  const appType = isNext ? 'next' : (isVite ? 'vite' : (isCRA ? 'cra' : 'other'));
+
+  // 网站名称:<title> 优先,退化用 og:site_name
+  let name = '';
+  const tm = html.match(/<title[^>]*>([^<]+)<\/title>/i);
+  if (tm) name = tm[1].trim().replace(/\s+/g, ' ').slice(0, 40);
+  if (!name) { const og = html.match(/<meta[^>]+property=["']og:site_name["'][^>]+content=["']([^"']+)/i); if (og) name = og[1].trim().slice(0, 40); }
+
+  // 图标:<link rel=icon|apple-touch-icon>
+  let icon = '';
+  const im = html.match(/<link[^>]+rel=["'][^"']*icon[^"']*["'][^>]+href=["']([^"']+)/i);
+  if (im) { try { icon = new URL(im[1], origin).href; } catch {} }
+
+  // 同源静态资源数(粗估,判断离线包是否值得做)
+  const refs = [
+    ...matchGroup(html, /<script[^>]+src=["']([^"']+\.js(?:\?[^"']*)?)["']/gi),
+    ...matchGroup(html, /<link[^>]+href=["']([^"']+\.css(?:\?[^"']*)?)["']/gi)
+  ];
+  let sameOriginCacheable = 0;
+  for (const ref of refs) {
+    const p = sameOriginPath(ref, origin, url);
+    if (p && isHashedAsset(p)) sameOriginCacheable++;
+  }
+
+  // 加速参数建议:动态 SPA 一律 swrDoc+prerender;有同源可缓资源才建议 bundle;Next 站开 codeCache+prefetch
+  const recommend = {
+    swrDoc: true,
+    prerender: true,
+    bundle: sameOriginCacheable > 0,
+    codeCache: isNext,
+    prefetchChunks: isNext, // chunk 预取目前只对 Next/webpack 有效
+  };
+
+  return { ok: true, url, origin, appType, name, icon, sameOriginCacheable, recommend };
+}
+
 function appFromArg(raw) {
   if (!raw) throw new Error('缺少 appId 或 app 配置 JSON');
   const text = String(raw).trim();
@@ -376,12 +455,16 @@ async function main() {
   throw new Error(`未知模式: ${mode}`);
 }
 
-main()
-  .then((result) => {
-    process.stdout.write(JSON.stringify({ ok: true, result }) + '\n');
-  })
-  .catch((err) => {
-    process.stderr.write(String(err && err.stack || err) + '\n');
-    process.stdout.write(JSON.stringify({ ok: false, error: String(err && err.message || err) }) + '\n');
-    process.exit(1);
-  });
+// 只在【直接命令行运行】时执行 main();被 index.js import(用 detectSite)时不执行,避免误读 argv。
+const isDirectRun = process.argv[1] && fileURLToPath(import.meta.url) === path.resolve(process.argv[1]);
+if (isDirectRun) {
+  main()
+    .then((result) => {
+      process.stdout.write(JSON.stringify({ ok: true, result }) + '\n');
+    })
+    .catch((err) => {
+      process.stderr.write(String(err && err.stack || err) + '\n');
+      process.stdout.write(JSON.stringify({ ok: false, error: String(err && err.message || err) }) + '\n');
+      process.exit(1);
+    });
+}
