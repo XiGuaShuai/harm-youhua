@@ -34,3 +34,5 @@ Thumbs.db
 *.hap
 *.xlsx
 _线上备份/
+_产物交付/
+*.zip
