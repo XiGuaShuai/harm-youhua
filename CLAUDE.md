@@ -1,208 +1,181 @@
-# CLAUDE.md
+# CLAUDE.md — 项目导航（给新对话快速上手）
 
-本文件给 Claude Code(以及任何接手的人)提供这个仓库的导航。先读这里,再下钻到子目录的 README。
+> 本文件让任何新对话快速熟悉这个项目并继续迭代。先读这里，再下钻子目录 README / TROUBLESHOOTING.md。
+> **读完这份就能上手。** 最后两节「迭代指南」「踩坑铁律」尤其重要——避免重复踩坑。
 
-## 这是什么
+---
 
-`youhua-mono` —— 「网页应用集合」**鸿蒙加速方案**的单仓库(monorepo)。
+## 一、这是什么
 
-目标:把一组网页应用(如新加坡环球影城购票、印尼海关、Booking 等)包进一个**鸿蒙元服务(Atomic Service,免安装)**,通过多层加速(离线缓存 / 主文档 SWR / 离屏预渲染 / chunk 预取 / 黑名单拦遥测)让用户**点开即秒显**;并配一个后台,让"应用列表 / 黑名单 / 离线包"都能**远程下发、改东西不用重新发版**。
+`youhua-mono` —— 「网页应用集合」**鸿蒙加速方案**单仓库。目标：把一批网页应用（K11、印尼入境卡、Booking 等）包进**鸿蒙元服务(免安装)**，靠多层加速做到「点开秒显」；配一个**后台**让应用列表/加速参数/离线包**远程下发、改东西不用重新发版**。
 
-近期方向(见 git log):端侧加速 → Docker 一键部署 → 离线包版本化增量更新 → **众包上报 / 共识自动建包**(设备匿名采样上报资源,服务端用同款 djb2 指纹复算校验防投毒,投票数达阈值即自动建离线包)。
+```
+用户点图标 → 元服务(免安装, 装机包~260KB) → 多层加速的 ArkWeb 网页 → 秒开
+                    ↑ 开机拉 /api/config、按需下离线包
+               后台(配置 + 离线包托管 + 定时自动更新)
+```
 
-## 仓库结构
+**两条产品线：**
+1. **端侧 SDK（webaccel HAR）**——加速能力库，一套逻辑所有应用共用。**给别的鸿蒙工程集成用**（这是核心交付物）。
+2. **后台（admin）**——Node+Express 配置/离线包服务 + Vue3 管理界面，集中管理所有接了 SDK 的 App。
+
+---
+
+## 二、仓库结构
 
 ```
 youhua-mono/
-├── app/                鸿蒙元服务工程(端侧)—— DevEco Studio / hvigor 构建
-│   ├── webaccel/       加速能力封装成的 HAR SDK(可被别的工程复用)
-│   └── entry/          元服务本体 HAP(installationFree,几行代码消费 webaccel)
-├── admin/              配套后台
-│   ├── server/         Node + Express:配置 API + 离线包托管 + 众包上报
-│   └── web/            Vue3 + Vite + Element Plus + Pinia 管理界面
-├── deploy/             部署脚本 / nginx 配置(bootstrap-server.sh、nginx-maidun.conf)
-├── docker-compose.yml  后台编排(admin 容器 + mysql 容器,命名卷持久化)
-├── DEPLOY.md           部署 / 运维(服务器、nginx、HTTPS、git push 自动部署)
-└── TROUBLESHOOTING.md  联调问题汇总 + 根因 + 修复(强烈建议接手前先读)
+├── app/                鸿蒙元服务工程(DevEco/hvigor 构建)
+│   ├── webaccel/       ★ 加速 SDK(HAR)—— 所有加速逻辑在这
+│   └── entry/          元服务本体 HAP(几行代码消费 webaccel)
+├── admin/              后台
+│   ├── server/         Node+Express(配置 API + 离线包 + 定时自动更新)
+│   └── web/            Vue3+Vite+ElementPlus+Pinia 管理界面
+├── deploy/             部署脚本/nginx 配置
+├── docker-compose.yml  后台编排(admin + mysql 容器)
+├── DEPLOY.md           部署/运维
+└── TROUBLESHOOTING.md  联调踩坑(改加速前必读)
 ```
 
-**端 ↔ 后台关系**:元服务开机从后台拉 `/api/config`(应用 / 黑名单 / 设置),打开网页时按需下载离线包进沙箱(自愈式缓存);后台改配置或打包,端侧下次启动即生效,**无需重新发版**。
-
-> 子文档:SDK API 见 `app/webaccel/README.md`;工程维护 / 发版见 `app/UPDATE.md`;后台接入见 `admin/README.md`;部署见 `DEPLOY.md`;踩坑见 `TROUBLESHOOTING.md`。
+**端↔后台**：元服务开机拉 `/api/config`(应用/黑名单/设置)，打开网页按需下离线包进沙箱(自愈缓存)；后台改配置/打包，端侧下次启动即生效，**不重新发版**。
 
 ---
 
-## app/ —— 鸿蒙元服务工程
-
-两层模块:`webaccel`(HAR,加速能力 SDK)+ `entry`(HAP,元服务本体,只几行代码消费 SDK)。
+## 三、app/ — 鸿蒙元服务工程（两层：webaccel HAR + entry HAP）
 
 ### 关键文件
-
 | 文件(相对 app/) | 职责 |
 |---|---|
-| `AppScope/app.json5` | `bundleType: "atomicService"` —— ★ 声明整体为元服务(免安装) |
-| `entry/src/main/module.json5` | `installationFree: true` + `INTERNET` 权限 —— ★ 本 HAP 免安装声明 |
-| `entry/src/main/ets/entryability/EntryAbility.ets` | `WebAccel.init(...)` 一行初始化 + `setDebug(true)` + 卡片直达 |
-| `entry/src/main/ets/pages/Index.ets` | 入口页:`WebAccelLauncher()` 一行,全程序就这一个页面 |
-| `webaccel/src/main/ets/WebAccel.ets` | ★ 门面 API(init/attach/prewarm/obtain/goBack/getApps/refreshConfig/stats/setDebug) |
-| `webaccel/src/main/ets/WebAccelLauncher.ets` | 开箱即用整页组件(列表 + Navigation + 网页 + 调试浮窗) |
-| `webaccel/src/main/ets/WebAccelView.ets` | 网页展示组件(占位 + 离线进度条) |
-| `webaccel/src/main/ets/WebAccelDebugBadge.ets` | 可拖动调试浮窗(缓存命中 / 后台缓存进度 / 配置来源) |
-| `webaccel/src/main/ets/core/RemoteConfig.ets` | 远程配置单例:拉 `/api/config`、写 `AppStorage('apps')`、缓存到沙箱 |
-| `webaccel/src/main/ets/core/WebCacheManager.ets` | `onInterceptRequest` 拦截 + LRU 缓存 + 主文档 SWR + 黑名单短路 + 离线包增量 + 众包上报 |
-| `webaccel/src/main/ets/core/WebPreRender.ets` | 离屏预渲染池(`BuilderNode` 离屏建 Web,点开秒显) |
-| `webaccel/src/main/ets/core/WebShared.ets` | Web 统一配置 + ViewModel + buildWeb @Builder |
-| `webaccel/Index.ets` | SDK 对外导出入口 |
-| `webaccel/build-profile.json5` | ★ `CONFIG_SERVER` 内置后台地址(debug/release 各一份) |
+| `AppScope/app.json5` | `bundleType:"atomicService"` ★元服务声明 + bundleName |
+| `entry/.../module.json5` | `installationFree:true` + 权限(INTERNET / 定位) + 网络安全配置 |
+| `entry/.../EntryAbility.ets` | `WebAccel.init()` 一行初始化 + 申请定位权限 + FALLBACK_APPS 兜底 |
+| `entry/.../pages/Index.ets` | 入口页:`WebAccelLauncher()` 一行 |
+| **`webaccel/.../WebAccel.ets`** | ★门面 API(init/prewarm/refreshConfig/setDebug 等) |
+| `webaccel/.../WebAccelLauncher.ets` | 开箱即用整页组件(列表+导航+网页+调试浮窗) |
+| `webaccel/.../WebAccelView.ets` | 网页展示组件(占位 + 离线进度条,进度条有超时收起) |
+| **`webaccel/.../core/WebCacheManager.ets`** | ★核心:onInterceptRequest 拦截 + LRU缓存 + 主文档SWR + 黑名单(全局+每应用) + 离线包增量 + 路由预取 + 众包 |
+| `webaccel/.../core/WebPreRender.ets` | 离屏预渲染池(BuilderNode,只热预前2个) + 路由预取触发 |
+| `webaccel/.../core/WebShared.ets` | Web 统一配置 buildWeb(含 onGeolocationShow 定位授权) + ViewModel(占位绑FCP/进度85%) |
+| `webaccel/.../core/RemoteConfig.ets` | 远程配置:拉 /api/config、RemoteApp 接口(含 extraBlockHosts/prefetchChunks) |
+| `webaccel/build-profile.json5` | ★`CONFIG_SERVER` 后端地址(debug段/release段各一) |
 
-### SDK 核心 API(`WebAccel` 静态门面)
+### SDK 门面 API
+`init(ctx,options?)` · `prewarm(url,swrDoc?)` · `refreshConfig()` · `setDebug(on)` · `stats()`；组件 `WebAccelLauncher()` / `WebAccelView({url})` / `WebAccelDebugBadge`。
+**RemoteApp 每应用开关**：`swrDoc`/`prerender`/`bundle`/`routes`/`codeCache`/`extraBlockHosts`(每应用额外黑名单)/`prefetchChunks`(每应用预取开关)/`manifestUrl`/`bundleVersion`。
 
-`init(ctx, options?)`(开机调一次)· `attach(uiContext)` · `prewarm(url, swrDoc?)` · `obtain(url)` · `goBack(url)` · `getApps()`/`setApps(apps)` · `refreshConfig()` · `stats()`/`bundleProgress(origin)` · `setDebug(on)`/`isDebug()`。
-
-组件:`WebAccelLauncher(title?, accentColor?)`、`WebAccelView({ url })`、`WebAccelDebugBadge`。
-
-每个 app 的关键开关(`RemoteApp`):`swrDoc`(主文档陈旧即用,默认 true)、`prerender`(离屏预渲染)、`bundle`(启用离线包)、`routes`(chunk 预取)、`manifestUrl`/`bundleVersion`(后台下发)。
-
-### 构建
-
-```bash
-cd app
-# 单独产出 SDK(HAR;entry 构建会自动并入,无需手动先跑)
-hvigorw assembleHar -p module=webaccel@default
-# 构建元服务 HAP
-hvigorw --mode module -p module=entry@default -p product=default assembleHap
+### 构建（在本机命令行，见下方"本机编译"节）
+```
+hvigorw assembleHar -p module=webaccel@default -p buildMode=release   # 出 SDK(HAR)
+hvigorw --mode module -p module=entry@default -p product=default -p buildMode=release assembleHap  # 出元服务 HAP
 ```
 
-### 元服务硬约束(改 app/ 前务必记住)
-
-- **单包 ≤ 2MB、总计 ≤ 10MB** —— **不打 rawfile 内置离线包**,所有离线资源运行时下载进沙箱(`filesDir`),不计包体。
-- **签名**:元服务需在 DevEco `File > Project Structure > Signing Configs` 配自动签名(需已开通元服务的华为账号);**普通 App 证书不能用**。
-- **字节码注入已禁用**(元服务不支持 `injectOfflineResources` / `OfflineResourceType`)。
+### 元服务硬约束（改 app/ 前必记）
+- **单包≤2MB / 总≤10MB**，不打 rawfile 内置包，离线资源运行时下载进沙箱。
+- **元服务签名**需 DevEco 登录已开通元服务的华为账号自动签名，普通 App 证书不行。
+- **SDK(HAR)不需要签名**——给别人用只给 .har，对方用他自己的签名打他的 App。
+- **API 版本**：当前 SDK 编译为 **API 15**(`compatibleSdkVersion:15`,在 app/build-profile.json5 products)，接入方需 API 15+。
 
 ---
 
-## admin/ —— 后台(Node + Express + Vue3)
+## 四、admin/ — 后台（Node+Express+Vue3）
 
-后端 8787(同源托管前端 dist),Vue 管理界面开发时 5174 代理到 8787。
+后端 8787(同源托管前端)，Vue 开发时 5174 代理到 8787。
 
-### server/(Node + Express)
-
-| 文件(相对 admin/) | 职责 |
+| server/ 文件 | 职责 |
 |---|---|
-| `server/index.js` | Express 核心入口:配置读写、账号 / 会话鉴权、所有 API 路由、缓存触发 |
-| `server/cache-builder.js` | 离线包构建:抓首页 + 路由 chunk、按内容 hash 命名、生成 manifest(check/update/build/manifest 四模式) |
-| `server/consensus-builder.js` | 众包共识建包:从 votes 表取 ≥K 票的稳定资源,服务端用 djb2 复算 hash 校验防投毒,产物与 cache-builder 同构 |
-| `server/db.js` | MySQL 连接池 + 幂等建表(`votes` 表,一人一票) |
-| `server/data/config.json` | 配置持久化(apps + blockHosts + settings + version),纯文件改完即生效 |
-| `server/data/users.json` | 登录账号(密码 scrypt 加盐哈希) |
-| `server/data/sessions.json` | 会话 token(7 天,重启不掉线) |
-| `server/bundles/<appId>/` | 离线包托管(资源 + manifest.json) |
-| `admin/Dockerfile` | 多阶段构建(web build → server 运行,同源托管 dist) |
+| **`index.js`** | Express 入口:所有 API、鉴权、`runCacheBuilder`、**定时自动更新**(runAutoUpdateOnce)、detect API |
+| **`cache-builder.js`** | 离线包构建(check/update/build/manifest 四模式) + `detectSite`(探测站点类型) + 版本号query可缓存 + 剔sourcemap |
+| `consensus-builder.js` | 众包共识建包(djb2 复算防投毒) |
+| `db.js` | MySQL 连接池(votes 表，众包用；连不上不影响配置/离线包) |
+| `data/config.json` | 配置持久化(apps+blockHosts+settings)，纯文件改完即生效 |
+| `bundles/<id>/` | 离线包托管 |
 
-### API 接口
+**关键 API**：`GET /api/config`(端侧拉) · `/bundles/<id>/...` · `POST /api/login` · `POST /api/report`(众包)。
+后台管理(需 X-Admin-Token)：`PUT /api/admin/{apps,blockhosts,settings}` · `POST /api/admin/apps/detect`(一键探测) · `POST /api/admin/bundles/:id/{check,update,build,manifest}` · `POST /api/admin/auto-update/run`(手动触发自动更新) · `GET /api/admin/auto-update/log`(查结果)。
 
-**公开**:`GET /api/config`(端侧开机拉)· `GET /bundles/<id>/manifest.json` + `/bundles/<id>/*` · `POST /api/login` · `POST /api/report`(设备众包上报,限频 + 校验)。
-
-**后台管理**(需 `X-Admin-Token` 头):`/api/admin/config`、`PUT /api/admin/{apps,blockhosts,settings}`、`POST /api/admin/password`、`/api/admin/db`、`GET /api/admin/report/:id`(共识统计)、`POST /api/admin/report/:id/build`(众包建包)、`POST /api/admin/bundles/:id/{check,update,build,manifest}`(离线包操作)。
-
-### web/(Vue3 + Vite + Element Plus + Pinia)
-
-视图:`Dashboard`(概览)· `Apps`(应用增删改 + 各加速开关)· `Blocklist`(黑名单)· `Bundles`(离线包检查 / 更新 / 构建 / 共识建包)· `Settings`(全局设置)。
-状态:`stores/auth.js`(登录态)· `stores/config.js`(配置)。`api/index.js` 自动带 `X-Admin-Token`、401 跳登录。
+**web/ 视图**：Dashboard / Apps(应用增删改+探测+离线包状态列+每应用黑名单/预取) / Blocklist / Bundles(离线包操作+自动更新UI) / Settings。
 
 ### 本地起后台
-
-```bash
-cd admin/server && npm install && npm start      # 后端 8787(npm run dev = node --watch 自动重启)
-cd admin/web && npm install && npm run dev        # 管理界面 5174(代理 /api、/bundles → 8787)
+```
+cd admin/server && npm install && npm start   # 8787
+cd admin/web && npm install && npm run dev     # 5174
 ```
 
-依赖:server = `express` / `cors` / `mysql2`;web = `vue3` / `vue-router` / `pinia` / `element-plus` / `axios` / `vite`。
-
 ---
 
-## 部署(摘要,详见 DEPLOY.md)
+## 五、部署与环境（重要）
 
-- 后台用 **Docker + git push 自动部署**,跑在服务器 `47.236.73.89`,由宿主机 nginx 反代,对外域名 **`maidun.chujingservice.com`**。
-- 容器只绑 `127.0.0.1:8787`,不暴露公网;数据用命名卷(`admin-data` / `admin-bundles` / `admin-mysql`)持久化,换镜像不丢。
-- 日常更新:本地 `git add -A && git commit && git push server main` → 服务器自动 `docker compose up -d --build`。
-- 端侧后台地址在 `app/webaccel/build-profile.json5` 的 `CONFIG_SERVER`;release 包要求 HTTPS。
+### 线上后台（生产）
+- 服务器 **`47.236.73.89`**(主机名 meta-proxy1)，Docker 跑 `youhua-admin`+`youhua-mysql`，nginx 反代 → 域名 **`https://maidun.chujingservice.com`**。
+- **部署 = git push 自动部署**：裸仓库 `/srv/youhua.git`，工作树 `/srv/youhua`，push main → 自动 `docker compose up -d --build`。
+- 数据卷(换代码不丢)：`youhua_admin-data`(config.json) / `youhua_admin-bundles`(离线包) / `youhua_admin-mysql`。
+- **后台只用 admin/**，不编译 app/。所以部署只需 admin/ 改动；app/ 端侧改动推上去仅存档、不影响线上。
+- 登录：界面 admin / 密码在服务器 `/srv/youhua/.env` 的 `ADMIN_PASS`。
 
----
-
-## 给 Claude 的工作提示
-
-- **改加速行为前先读 `TROUBLESHOOTING.md`** —— 里面记了多个反直觉的坑(如 `2160x1140` 尺寸串被误判成内容 hash 导致坏副本永不回源;动态 SPA 喂服务器快照导致内容不全 → 正确配置是 `bundle:false + swrDoc:true + prerender:true`)。
-- **黑名单 / 应用列表是后台下发的**,要给某站加屏蔽域请改 admin 配置(`web` 界面或 `config.json`),**不要往 SDK 硬编码里加**。
-- **缓存逻辑改动通常涉及两处**:SDK 的 `WebCacheManager.ets` 和后台的 `cache-builder.js`(如 `isHashedAsset` 判定要两边一致);众包指纹算法(djb2)要求**端侧上报与服务端复算一致**。
-- `.gitignore` 已排除运行时数据(`admin/server/data/`、`bundles/`)和 `.env`(含密码),不要提交这些。
-- 本仓库**当前 git 远程走代理 `127.0.0.1:7896`,但该代理坏掉**(502 / TLS 失败);需要 git 联网时用 `git -c http.proxy= -c https.proxy= <命令>` 绕过(直连 GitHub 是通的)。
-
----
-
-## 当前工作进展(2026-06-17,下次会话从这里接上)
-
-**任务**:把 3 个应用(K11/Booking/印尼入境卡)优化到"秒点秒开",离线包做小,HAR+后台简化(后续要上架十几个,目标"纯后台配置上架")。截止周一(2026-06-22)前要看效果。已获授权:**实测+改代码+重编验证,只在本地改、不提交 git**。性能验收标准见 `性能测试报告.xlsx`(B标牵引,要超出)。
-
-### 已搭好的真机联调环境(本机 admin 用户)
-- **真机**:HUAWEI HBP-AL00(HarmonyOS 6.0,API22),hdc 序列号 `2NX0123C29000677`。**必须用 DevEco 自带 hdc**:`D:\Huawei\DevEco Studio\sdk\default\openharmony\toolchains\hdc.exe`(3.2.0b),不能用 `D:\hdc`(3.1.0b,版本不匹配)。
-- **本地后端** 8787 + **管理界面** 5174(admin/admin123)。MySQL 没起不影响配置/离线包(优雅降级)。
-- **真机连本地后端**:`CONFIG_SERVER` 已改指 `http://192.168.20.197:8787`(本机以太网 IP,真机已 ping 通),并加了网络安全配置放行明文 HTTP。
-
-### 命令行编译/装真机(关键,见记忆 harm-youhua-build-on-this-machine)
+### 本机编译（这台机 admin 用户，无独立 DevEco PATH）
 ```
 $deveco="D:\Huawei\DevEco Studio"; $env:DEVECO_SDK_HOME="$deveco\sdk"
 $env:Path="$deveco\tools\node;$deveco\tools\hvigor\bin;$deveco\tools\ohpm\bin;$env:Path"
 cd D:\Work\KCP\harm-youhua\app
-hvigorw.bat --mode module -p module=entry@default -p product=default assembleHap --no-daemon
+hvigorw.bat --mode module -p module=entry@default -p product=default [-p buildMode=release] assembleHap --no-daemon
 ```
-产物 `app/entry/build/default/outputs/default/entry-default-signed.hap`(约 410KB)。装:`hdc file send` 到 data/local/tmp + `hdc shell bm install -p`;启动 `aa start -b com.atomicservice.6917596829912522753 -a EntryAbility`。
+- 用 **DevEco 自带 hdc**：`D:\Huawei\DevEco Studio\sdk\default\openharmony\toolchains\hdc.exe`（3.2.0b），不能用 `D:\hdc`。真机序列号 `2NX0123C29000677`(HUAWEI HBP-AL00, HarmonyOS 6.0)。
+- **本机编译需 4 处临时适配（不进 git，git 里是干净的原值）**：① `app/build-profile.json5` 签名换成本机 `C:\Users\admin\.ohos\config\default_pin2atm_...`(借 D:\Work\Pin2eat 的签名，密码照抄其 build-profile)；② `app/AppScope/app.json5` bundleName 改 `com.atomicservice.6917596829912522753`(证书授权的)；③ `app/hvigor/hvigor-config.json5` + `app/oh-package.json5` modelVersion 6.0.1→6.0.0(本机 hvigor 只支持6.0.0)。**正式发版要用项目自己的元服务签名+原 bundleName。**
+- debug 包 CONFIG_SERVER 指本地 `http://192.168.20.197:8787`(局域网调试)；release 包指线上 maidun。真机连本地后端需 module.json5 放行明文 HTTP(network_config.json，已配)。
 
-### 为"在本机能编译"做的环境适配改动(4 处,未提交 git,正式发版要还原)
-1. `app/hvigor/hvigor-config.json5` + `app/oh-package.json5`:modelVersion 6.0.1→6.0.0。
-2. `app/build-profile.json5`:签名换成本机现成证书(借 `D:\Work\Pin2eat\pin2atm` 的 admin 名下 debug 签名)。
-3. `app/AppScope/app.json5`:bundleName 改成证书授权的 `com.atomicservice.6917596829912522753`(原值 `...6917607803528486696`)。
+### git
+- 远程：`origin`(GitHub) + `server`(线上部署服务器)。**功能代码在 GitHub 分支 `feature/auto-update-and-optimize`**(不碰 main)；server 远程推 main 触发部署。git 身份 L-kook / 3164288669@qq.com。
+- 本仓库**git 全局代理 `127.0.0.1:7896` 已坏**(502/TLS失败)；git 联网用 `git -c http.proxy= -c https.proxy= <命令>` 绕过(直连 GitHub 通)。线上 push 用部署密钥 `~/.ssh/youhua_deploy`(已配 core.sshCommand)。
 
-### 优化前真机基线(3轮稳定值)
-冷启动 e2e ≈490ms;印尼入境卡加载≈730ms(有离线包);K11≈1690ms;Booking≈2714ms(瓶颈在源站+代理)。三站当前同时 prebuild 互抢资源。
+---
 
-### 性能报告关键发现(`性能测试报告.xlsx`)
-报告已自带问题归类。**最该拿分的是 ③ "loading 遮罩滞后"**(页面已加载完但 loading 还挂几秒,框架可解):K11停1.7s、新加坡环球影城结算页虚耗7s、booking搜索/详情停几秒。其次 ② JS大/首屏重(缓存/离线包/预取可解)。① 跨境回源/④ 源站慢是天花板,框架碰不了,报告要如实标注。
+## 六、当前状态（截至 2026-06-22）
 
-### 已完成的优化(端侧 HAR webaccel + 后端,均已真机验证,用户确认"确实快")
-**端侧加速代码(在 webaccel HAR 里,改完编译 entry HAP 装真机):**
-- `webaccel/.../core/WebShared.ets`:① chunk 预取从 onPageEnd+3s 提前到 FCP 即取;② **秒开**:onProgressChange 进度≥85% 且未FCP 时主动消占位(治动态SPA占位傻等到 onPageEnd)。注:曾加"注入脚本隐藏网站loading元素",因 `[class*=loading]`/`[splash]` 模糊匹配会误伤正常容器(后证实那次"样式变了"其实是网站本身),**已移除,勿再加改页面DOM的方案**。
-- `webaccel/.../core/WebPreRender.ets`:① 预渲染加优先级 MAX_EAGER_PRERENDER=2,只热预前2个,其余轻量预热+延迟分批补,避免多站同时建Web抢首屏。② **通用路由预取**(治"点二级页慢"):原 prefetchSiteChunks 只认 Next.js/webpack(K11非Next站→空转,二级页资源没预取),新增 WebCacheManager.prefetchRoutes(origin,routes):对配了 routes 的站,冷启动延迟2.5s 对每个路由页 httpGetText 抓主文档→入缓存+SWR→**解析其引用的 `<script>/<link>/<img>` 同源可缓存资源(shouldCache 判断)→ download 预下载**(治"二级页资源多很卡")。已真机验证 `prefetchRoutePage .../forms/bc22 queued 1 res`。**用户配合方式**:用户测出哪些页面卡→给URL→加进该应用 config.json 的 routes→重下发即预取该页主文档+同源资源。**边界**:只缓同源静态资源;跨域资源/动态接口数据(餐厅列表/酒店搜索)仍实时拉,框架管不了——抓日志时帮用户分清"缓资源有用 vs 数据慢缓不了"。
-- **⚠️ 重大教训(2026-06-18)**:路由预取最初版本会**抓二级页主文档并缓存(enableDocCache+fetchAndStore text/html)**,结果印尼入境卡(Next.js动态站)点 keberangkatan 下表单页**直接 error**——因为动态页主文档带会话状态,缓了旧版就出错。这正是 TROUBLESHOOTING.md 早警告的"动态SPA不能喂缓存主文档"。**已修正:prefetchRoutePage 只用 httpGetText 拿 HTML 文本来【解析引用的静态资源并预下载】,绝不缓主文档本身、不 enableDocCache**。用户原话定调:"页面是动态的就不要缓存,缓存的是资源、提早下载的那种"。**铁律:预取/缓存只针对静态资源(JS/CSS/图片),永远不缓动态页的 HTML 主文档**(主文档的 SWR 只对入口首页由 prewarm 单独管)。
-- `entry/.../EntryAbility.ets`:FALLBACK_APPS=K11/Booking/印尼入境卡三站。
-**离线包覆盖增强:版本号 query 资源可缓存(端云一致改,2026-06-17)**
-- 背景:K11(hk.k11.com)核心 JS/CSS 其实**同源**(/files/art/,793KB JS+793KB CSS含内嵌字体),但命名是 `bundle.min.js?2025121805`(query版本号,非内容hash),被原 isHashedAsset 判为不可缓存而漏掉。实测推翻了"K11资源全跨域"的旧判断(只有图片跨域)。
-- 改法(端云必须一致):新增 `isVersionQuery`(query各参数值全纯数字才算版本号,排除随机参数如?t=时间戳/?token=xxx 防缓存爆炸);isHashedAsset 对带版本号query的资源返回可缓存,缓存key保留query(版本变=新URL=重拉,等效hash)。**后端 cache-builder.js**(isVersionQuery+isHashedAsset+sameOriginPath保留query+mimeOf剥query+资源发现处 `pathOnly=p.split('?')[0]` 再判.js/.css扩展名)、**端侧 WebCacheManager.ets**(isVersionQuery+isHashedAsset 同款逻辑)两边都改。
-- 结果:K11 改 bundle:true,离线包 4个资源1.6MB,真机浮窗"K11 包4/4"。**通用能力**:后面任何用版本号query的站都受益。**注意**:改 isHashedAsset 这类端云一致判断,两边必须同步改+真机验证浮窗"包N/N"(见 TROUBLESHOOTING.md 端云一致铁律)。
+**三个测试应用**：K11 香港(hk.k11.com/zh-cn)、印尼入境卡(ecd.beacukai.go.id)、Booking(booking.com)。线上后台配的就这三站，离线包：K11 4个资源/印尼 41个/Booking 无(反爬+跨域做不了)。
 
-**后台产品化 + 每应用精细配置(2026-06-18,端云闭环,真机验证)**
-- **后台 detect API**:`POST /api/admin/apps/detect`(index.js)调 cache-builder.js 导出的 `detectSite(url)`——抓首页HTML→判类型(next/vite/cra/other)+抽title当名称+找icon+数同源可缓资源+给建议加速参数(动态站 swrDoc+prerender;有同源可缓资源才 bundle:true;Next才 codeCache+prefetch)。注:cache-builder.js 的 main() 已改成只在直接CLI运行时执行(`isDirectRun` 判断),被 import 时不跑,否则误读 argv。
-- **Apps.vue 升级**:URL行加"一键探测"按钮(detect回填名称/建议参数)、表格加"离线包状态"列(已建N个/XKB、待构建、不启用,数据来自 GET /api/admin/bundles)、表单加"额外黑名单"textarea + "chunk预取"checkbox、保存后若开bundle未建弹窗"一键构建"。
-- **每应用精细配置端云闭环**:RemoteApp 加 `extraBlockHosts?:string[]`(每应用额外黑名单,叠加全局)+ `prefetchChunks?:boolean`(每应用预取开关覆盖)。端侧 WebCacheManager 加 `applyApps(apps)`:按 origin 预算"全局+该应用额外"的合并黑名单存 mergedBlockByOrigin、预取开关存 prefetchByOrigin;isBlocked 改用 blockListFor(url)(按 origin 取合并列表);prefetchSiteChunks 按 origin 优先用应用覆盖值。WebAccel.ets 三处配置注入(init/refresh回调/手动refresh)在 setBlockHosts 后都加了 `webCache.applyApps(remoteConfig.getApps())`。真机验证 `applyApps: 3 origins`,Booking 额外黑名单(otel-gw/sink.gw等)生效且只对 booking origin,页面功能正常。
+**已实测达成**：冷启动 ~430ms、点进应用/翻页预渲染秒开、印尼首屏136ms(离线包)。装机包 release 258KB。**用户确认"确实快"。**
 
-**离线包自动更新(2026-06-22,定时一天一次)**
-- 需求:网站源站更新/出错时自动检测+重建离线包,不用人工点。`admin/server/index.js` 用 Node 内置 setInterval(无新依赖):`runAutoUpdateOnce()` 遍历所有 bundle:true 的站 → check → changed 就 update → update失败 fallback `buildWithRetry`(build重试3次,5s/10s退避)→ 一个站失败不影响其它。`AUTO_UPDATE_INTERVAL_MS=24h`、启动后1min先跑一次、`autoUpdateRunning`防重叠、结果写 `data/auto-update-log.json`。API:`POST /api/admin/auto-update/run`(手动触发)、`GET /api/admin/auto-update/log`(查结果)。已验证:k11 update OK、beacukai fetch failed 被捕获不影响 k11、防重叠生效。注意变量声明在 runCacheBuilder 后(避免TDZ)、函数在文件末尾(声明提升)。端侧自愈已较完整(坏缓清理、SWR版本校验、版本门),不强改。
+**已做的功能（都真机验证、已部署线上）**：
+- 端侧秒开：离屏预渲染+优先级、离线包、主文档SWR、路由预取(只下静态资源)、占位绑FCP、黑名单拦遥测。
+- 版本号query资源可缓存(端云一致)——让 K11 这种 `?2025121805` 命名的资源也能离线。
+- 每应用精细配置：额外黑名单(如Booking遥测域只对Booking) + 预取开关，按 origin 生效。
+- 定位权限：网页"当前位置搜索"能用(module.json5 加权限 + EntryAbility 申请 + WebShared onGeolocationShow)。
+- 后台：一键探测detect、Apps离线包状态列、Bundles自动更新UI。
+- **离线包定时自动更新(一天一次)**：遍历 bundle:true 站 check→有更新update→失败fallback build重试3次，结果写 data/auto-update-log.json。
 
-**后端(纯配置,端侧零改动):**
-- `admin/server/data/config.json`:三站配置;apps顺序=K11/印尼入境卡(前2优先预渲染)/Booking;settings.bundleConcurrency=12;blockHosts含Booking遥测域。
-- `admin/server/cache-builder.js`:isHashedAsset 加 `.endsWith('.map')` 排除 sourcemap(减小离线包,零风险)。
-- 印尼入境卡(beacukai)离线包已建(`node cache-builder.js build beacukai`,本机直连政府站OK),39文件1.8MB,真机下到54条。
+**交付物**：`webaccel-SDK-api15.har`(58.6KB, API15, 连线上后台, 无签名无外部依赖, 给别人集成)。
 
-### 当前实测数据(优化后,稳定可演示)
-- 冷启动 e2e 430~473ms;印尼入境卡FCP 136ms(离线包)、K11 ~410ms、Booking ~1100ms(源站天花板)。点进应用/翻页=预渲染秒开无卡顿。
-- 存储:HAP装机包412KB;后端离线包1.8MB(仅beacukai);真机沙箱7.7MB/72条(64MB上限+LRU)。
+---
 
-### 关键结论:加载这块端侧代码已到位,不要再激进改
-工作流分析结论(task wydxglm7q):端侧已秒开,cacheMode改PREFER_CACHE=高风险不做;并发/节流/预渲染排序都走**后台 settings/apps 顺序**调即可(端侧零改动)。**"更快"的剩余空间在后台配置层,不在端侧代码——别为有限收益冒险改端侧。**
+## 七、迭代指南（下一步可做 + 怎么做）
 
-### 还没做的(用户提过,优先级在后,按需推进)
-1. **出对照报告文档**给周一评审:三站优化前后数据 + 框架能优化的 vs 源站/网络天花板。
-2. **离线包 gzip**:已搁置。HarmonyOS @ohos.zlib 无 gzip 内存解压API(只能走临时文件笨路,多磁盘IO可能反拖慢),当前离线包本就不大,性价比低。要做优先用**传输层 gzip**(后端对 /bundles 开 gzip,端侧零改动)。
-3. **管理平台更好用 + 每应用精细配置**(支撑上架几十个):工作流方案已出(detect一键探测上架、RemoteApp加extraBlockHosts/prefetchChunks做每应用黑名单/精细配置)。用户说"按推荐慢慢做"。
+**还没做、按需推进**：
+1. **离线包 gzip 压缩** = 已评估搁置。HarmonyOS @ohos.zlib 无 gzip 内存解压API，端侧走临时文件笨路可能反拖慢。要做优先**传输层 gzip**(后端对 /bundles 开 gzip，端侧零改动)。
+2. **多租户配置**：当前所有接 SDK 的 App 共享一份后台配置。若要不同 App 显示不同站，需按 App 区分配置(新功能)。
+3. **后台规模化**(上架几十个应用时)：配置内存缓存、cache-builder 并发下载、Apps 批量操作/搜索、删应用清理 bundles。
+4. **端侧"更快/更小"已到位**——工作流分析结论：继续抠端侧代码收益小且有风险，剩余空间在后台配置层。LRU优化/预渲染节点上限等只在几十应用时才值得做。
 
-详见用户记忆:`harm-youhua-test-plan`、`harm-youhua-build-on-this-machine`、`harm-youhua-perf-report-findings`。
+**改代码的正确姿势**：
+- 改加速行为/缓存 → 先读 TROUBLESHOOTING.md。
+- 缓存判定改动**端云两处必须一致**：SDK `WebCacheManager.ets` 的 isHashedAsset/isVersionQuery ↔ 后端 `cache-builder.js` 的同名函数。改完真机验证浮窗"包N/N"。
+- 黑名单/应用列表是**后台下发**的 → 改 admin 配置(界面或 config.json)，不往 SDK 硬编码加。
+- 端侧改完要编译装真机验证(用上面本机编译命令)。后台改完重启 server。
+
+---
+
+## 八、踩坑铁律（血泪教训，务必遵守）
+
+1. **永不缓存动态页的 HTML 主文档**——曾让路由预取缓 Next.js 表单页主文档(带会话状态)，导致印尼 BC32 直接 error。**预取/缓存只针对静态资源(JS/CSS/图片)，动态页 HTML 交给正常加载。** 主文档 SWR 只对入口首页。
+2. **不用脚本改页面 DOM/隐藏元素**——曾注入脚本用 `[class*=loading]` 模糊匹配隐藏元素，误伤正常轮播/banner 导致三站排版错乱。治 loading 滞后只控制"框架占位何时消失"(绑FCP/进度85%)，不碰页面。
+3. **不激进改缓存模式**——cacheMode 改 PREFER_CACHE 会破坏 SWR/动态内容，已否决，保持 Default。
+4. **PowerShell 传中文会乱码**——curl PUT 中文到线上曾整批乱码。传中文配置用 base64 编码经 SSH，或直接写文件，别走 PowerShell+curl。
+5. **源站/网络问题不是框架的锅，别瞎改**——印尼 BC32 表单 error = 源站接口返回401(curl 绕过框架也401)；Booking 同意页顿一秒 = 网站自身加载脚本。这些是天花板，框架碰不了，如实标注。
+6. **本机适配文件不提交 git**——签名/bundleName/CONFIG_SERVER/hvigor版本是本机编译临时改，git 里保持原值，否则别人 clone 编译不了。
+
+---
+
+## 九、相关记忆（用户 memory，跨会话）
+- `harm-youhua-test-plan` — 三应用测试计划+基线+实测数据
+- `harm-youhua-build-on-this-machine` — 本机编译方法+适配改动
+- `harm-youhua-perf-report-findings` — 性能报告问题归类+框架边界+踩坑
+- `beacukai-reference-error-source-side` — 印尼BC32 error=源站401(非框架)
