@@ -105,6 +105,11 @@ interface ReportBody {
   anonId: string;
   resources: ReportItem[];
 }
+/** 离线包资源损坏 → 后台自愈上报体 */
+interface SelfHealBody {
+  appId: string;
+  reason: string;
+}
 
 /**
  * Web 离线缓存管理器(单例)。两层只读/可写缓存:
@@ -130,6 +135,9 @@ class WebCacheManager {
   // 每应用精细配置:按 origin 索引。mergedBlockByOrigin = 全局黑名单 + 该应用 extraBlockHosts(预算好,intercept 热路径直接查)
   private mergedBlockByOrigin: Map<string, string[]> = new Map();
   private prefetchByOrigin: Map<string, boolean> = new Map(); // 该应用的 prefetchChunks 覆盖值
+  private bundleAppByOrigin: Map<string, string> = new Map(); // origin → appId(仅 bundle:true 的站):离线包资源丢失自愈上报用
+  private reportedSelfHeal: Set<string> = new Set();          // 已上报过自愈的 appId(本次会话只报一次,防刷)
+  private serverBase: string = '';                            // 后端地址(applyApps 时由 remoteConfig.getServer() 注入,自愈上报用)
 
   private rawIndex: Map<string, RawEntry> = new Map();
   private diskIndex: Map<string, DiskEntry> = new Map();
@@ -305,9 +313,13 @@ class WebCacheManager {
    * 以及该应用的 prefetchChunks 覆盖值。intercept/预取时按当前请求的 origin 取用,做到每应用单独生效。
    * 必须在 setBlockHosts 之后调用(依赖全局黑名单做合并)。
    */
-  applyApps(apps: RemoteApp[]): void {
+  applyApps(apps: RemoteApp[], server: string = ''): void {
     this.mergedBlockByOrigin.clear();
     this.prefetchByOrigin.clear();
+    this.bundleAppByOrigin.clear();
+    if (server && server.length > 0) {
+      this.serverBase = server.replace(/\/+$/, '');
+    }
     if (!apps || apps.length === 0) {
       return;
     }
@@ -335,6 +347,10 @@ class WebCacheManager {
       // 每应用 prefetchChunks 覆盖(只在显式下发布尔值时记录)
       if (typeof app.prefetchChunks === 'boolean') {
         this.prefetchByOrigin.set(origin, app.prefetchChunks);
+      }
+      // 仅 bundle:true 的站记 origin→appId,用于"离线包资源实际读不出→上报后台自愈"
+      if (app.bundle === true && app.id && app.id.length > 0) {
+        this.bundleAppByOrigin.set(origin, app.id);
       }
     }
     hilog.info(DOMAIN, TAG, 'applyApps: %{public}d origins', this.mergedBlockByOrigin.size);
@@ -604,6 +620,9 @@ class WebCacheManager {
       }
       this.totalBytes -= disk.size; // 文件丢了,清脏索引
       this.diskIndex.delete(url);
+      // 自愈:若这个读不出的文件属于某站离线包(不是普通运行时缓存被LRU清掉),上报后台重建该站离线包。
+      // 端侧本身已"清脏索引→放行走网络"不会白屏;上报只为让服务端离线包恢复,下个用户首屏即快。
+      this.reportBundleCorruptIfNeeded(url);
     }
 
     // ② rawfile 内置包
@@ -1303,6 +1322,48 @@ class WebCacheManager {
       client.destroy();
       if (!err && data) {
         hilog.info(DOMAIN, TAG, 'explore report %{public}s code=%{public}d n=%{public}d', appId, data.responseCode, resources.length);
+      }
+    });
+  }
+
+  /**
+   * 离线包资源实际读不出(文件丢/坏)→ 上报后台自愈重建该站离线包。
+   * 仅当该 url 属于某 bundle:true 站时才报(普通运行时缓存被 LRU 清掉不报);本会话每站只报一次,避免刷请求。
+   * 全程 fire-and-forget,不阻塞 intercept 热路径,上报失败也不影响用户(端侧已放行走网络兜底)。
+   */
+  private reportBundleCorruptIfNeeded(url: string): void {
+    if (this.serverBase.length === 0) {
+      return; // 无后端(纯本地/直供模式),不上报
+    }
+    const om: RegExpMatchArray | null = url.match(/^https?:\/\/[^\/]+/);
+    const origin: string = om ? om[0] : '';
+    if (origin.length === 0) {
+      return;
+    }
+    const appId: string | undefined = this.bundleAppByOrigin.get(origin);
+    if (appId === undefined || appId.length === 0) {
+      return; // 不是离线包站的资源,无需自愈
+    }
+    if (this.reportedSelfHeal.has(appId)) {
+      return; // 本会话已为该站报过,防刷
+    }
+    this.reportedSelfHeal.add(appId);
+    const body: SelfHealBody = { appId: appId, reason: 'bundle-resource-missing' };
+    const client = http.createHttp();
+    const header: Record<string, string> = { 'Content-Type': 'application/json' };
+    const options: http.HttpRequestOptions = {
+      method: http.RequestMethod.POST,
+      header: header,
+      extraData: JSON.stringify(body),
+      connectTimeout: 15000,
+      readTimeout: 30000
+    };
+    client.request(this.serverBase + '/api/report-error', options, (err: BusinessError, data: http.HttpResponse) => {
+      client.destroy();
+      if (!err && data) {
+        hilog.info(DOMAIN, TAG, 'self-heal report %{public}s code=%{public}d', appId, data.responseCode);
+      } else {
+        hilog.warn(DOMAIN, TAG, 'self-heal report failed %{public}s', appId);
       }
     });
   }

@@ -7,7 +7,7 @@
     "deviceTypes": [
       "phone"
     ],
-    // 真机联调:允许明文 HTTP(CONFIG_SERVER 指向本机局域网后端 http://192.168.20.197:8787)。正式发版用 HTTPS 时移除。
+    // 网络安全:全站仅允许 HTTPS(后端 maidun 已是 HTTPS)。如需连本地明文后端联调,在 network_config 里临时加该 IP 的 cleartext 放行,勿提交。
     "metadata": [
       {
         "name": "ohos.security.networkSecurityConfig",

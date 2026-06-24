@@ -82,6 +82,19 @@ export function buildWeb(model: WebViewModel) {
     .geolocationAccess(true)
     .width('100%')
     .height('100%')
+    // 设手机 UA:有些站(如 bilibili.tv)按 UA 判断是否手机,默认 UA 会被当非手机 → 返回不适配/白屏。
+    // controller 就绪、加载前追加手机标识(Mobile),让站点返回移动版页面。
+    .onControllerAttached(() => {
+      try {
+        const ua: string = model.controller.getUserAgent();
+        // 已含 Mobile 就不重复加
+        if (ua.indexOf('Mobile') < 0) {
+          model.controller.setCustomUserAgent(ua + ' Mobile Safari/537.36');
+        }
+      } catch (e) {
+        // 设 UA 失败不影响加载
+      }
+    })
     // 网页请求定位(如 Booking"当前位置搜索")时授权给网页 → 网页能拿到位置才能搜。
     // 元服务本身的系统定位权限在 EntryAbility 启动时申请(见 EntryAbility.ets)。
     .onGeolocationShow((event) => {
