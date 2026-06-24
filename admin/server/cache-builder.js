@@ -411,6 +411,27 @@ export async function detectSite(url) {
     if (p && isHashedAsset(p)) sameOriginCacheable++;
   }
 
+  // 预连接域建议:从页面引用的资源里提取"跨域"域名(和主域不同的 host)= 该站的 CDN/接口域。
+  // 开机对这些域提前 DNS+TLS 握手,点进去时资源直连不等握手,压短白屏(尤其 JS 渲染型站主文档空、资源全在跨域CDN)。
+  const allRefs = [
+    ...matchGroup(html, /<script[^>]+src=["']([^"']+)["']/gi),
+    ...matchGroup(html, /<link[^>]+href=["']([^"']+)["']/gi),
+    ...matchGroup(html, /<img[^>]+src=["']([^"']+)["']/gi),
+    ...matchGroup(html, /(?:href|src|content)=["'](https?:\/\/[^"']+)["']/gi),
+  ];
+  const mainHost = u.host;
+  const crossHosts = new Set();
+  for (const ref of allRefs) {
+    try {
+      const h = new URL(ref, origin).host;
+      // 只收和主域不同、且非纯统计/广告的域 = 该站的 CDN/接口域
+      if (h && h !== mainHost && !/(google-analytics|googletagmanager|doubleclick|facebook|hotjar|sentry)\./i.test(h)) {
+        crossHosts.add(h);
+      }
+    } catch {}
+  }
+  const preconnectHosts = [...crossHosts].slice(0, 12); // 最多 12 个,避免预连过多反占资源
+
   // 加速参数建议:动态 SPA 一律 swrDoc+prerender;有同源可缓资源才建议 bundle;Next 站开 codeCache+prefetch
   const recommend = {
     swrDoc: true,
@@ -418,9 +439,10 @@ export async function detectSite(url) {
     bundle: sameOriginCacheable > 0,
     codeCache: isNext,
     prefetchChunks: isNext, // chunk 预取目前只对 Next/webpack 有效
+    preconnectHosts, // 探测到的跨域CDN/接口域,建议预连接
   };
 
-  return { ok: true, url, origin, appType, name, icon, sameOriginCacheable, recommend };
+  return { ok: true, url, origin, appType, name, icon, sameOriginCacheable, preconnectHosts, recommend };
 }
 
 function appFromArg(raw) {

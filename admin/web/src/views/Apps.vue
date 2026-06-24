@@ -53,7 +53,10 @@ async function detect() {
       form.value.bundle = !!r.bundle;
       form.value.codeCache = !!r.codeCache;
       form.value.prefetchChunks = r.prefetchChunks !== false;
-      ElMessage.success(`探测成功:${data.appType} 站,${data.sameOriginCacheable} 个可缓资源,已填入建议参数`);
+      // 探测到的跨域CDN/接口域 → 自动填入"预连接域"(管理员可再增删)
+      const pc = r.preconnectHosts || data.preconnectHosts || [];
+      if (pc.length) form.value.preconnectHostsText = pc.join('\n');
+      ElMessage.success(`探测成功:${data.appType} 站,${data.sameOriginCacheable} 个可缓资源,${pc.length} 个CDN域建议预连接,已填入建议参数`);
     }
   } catch (e) {
     ElMessage.error('探测失败:' + (e.response?.data?.error || e.message));
