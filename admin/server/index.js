@@ -254,6 +254,39 @@ app.post('/api/report', async (req, res) => {
   res.json({ ok: true, accepted });
 });
 
+// ——————————————— 端侧报错 → 后台离线包自愈 ———————————————
+// 端侧发现"离线包登记的资源实际读不出/坏了"时上报这里,后端立即重建该站离线包(自愈),
+// 不用等每天一次的定时检查。带防抖:同一站 5 分钟内只重建一次,避免大量上报打爆服务器。
+const selfHealLast = new Map();      // appId -> 上次自愈重建时刻
+const SELF_HEAL_COOLDOWN_MS = 5 * 60 * 1000;
+app.post('/api/report-error', (req, res) => {
+  const body = req.body || {};
+  const appId = String(body.appId || '').trim();
+  const reason = String(body.reason || 'bundle-resource-missing').slice(0, 64);
+  if (!appId) return res.status(400).json({ ok: false, error: 'bad request' });
+  // 只对"配了离线包(bundle:true)"的站做自愈;动态站/未配离线包的站忽略(它们本就没离线包,无所谓坏)
+  const app0 = (loadConfig().apps || []).find((a) => a.id === appId);
+  if (!app0) return res.status(404).json({ ok: false, error: 'unknown app' });
+  if (app0.bundle !== true) return res.json({ ok: true, action: 'ignored', detail: '该站未配离线包,无需自愈' });
+  const now = Date.now();
+  const last = selfHealLast.get(appId) || 0;
+  if (now - last < SELF_HEAL_COOLDOWN_MS) {
+    return res.json({ ok: true, action: 'cooldown', detail: '近期已自愈,本次跳过' });
+  }
+  selfHealLast.set(appId, now);
+  // 异步重建,立即返回(不阻塞端侧)
+  (async () => {
+    try {
+      console.log(`[self-heal] ${appId} 端侧报错(${reason}) → 立即重建离线包...`);
+      const bd = await buildWithRetry(appId);
+      console.log(`[self-heal] ${appId} 重建完成: ${bd && bd.count || 0} 个资源`);
+    } catch (e) {
+      console.warn(`[self-heal] ${appId} 重建失败:`, e && e.message);
+    }
+  })();
+  res.json({ ok: true, action: 'rebuilding', detail: '已触发离线包重建' });
+});
+
 // 登录:账号 + 密码 → 颁发会话 token
 app.post('/api/login', (req, res) => {
   const { username, password } = req.body || {};
