@@ -361,7 +361,32 @@ app.post('/api/admin/password', (req, res) => {
 
 app.get('/api/admin/config', (req, res) => res.json(loadConfig()));
 app.put('/api/admin/apps', (req, res) => {
-  const c = loadConfig(); c.apps = req.body.apps || []; res.json(saveConfig(c));
+  const c = loadConfig();
+  const nextApps = req.body.apps || [];
+  // 保存前先算出"需要自动构建离线包"的站:bundle:true 且服务器上还没有离线包(manifest 不存在)。
+  // 这样后台加一个新静态站(或把某站改成 bundle:true)保存后,离线包会自动在后台建好,
+  // 用户第一次进入就能直接从离线包加载(首屏即快),不用再手动去 Bundles 页点构建。
+  const autoBuildIds = nextApps
+    .filter(a => a && a.id && a.bundle === true)
+    .filter(a => !fs.existsSync(path.join(BUNDLES_DIR, a.id, 'manifest.json')))
+    .map(a => a.id);
+  c.apps = nextApps;
+  const saved = saveConfig(c);
+  // 异步触发构建,不阻塞保存响应(构建可能要几十秒~几分钟)。逐个串行,避免并发抢网络。
+  if (autoBuildIds.length) {
+    (async () => {
+      for (const id of autoBuildIds) {
+        try {
+          console.log(`[auto-build] 新静态站 ${id}: 自动构建离线包...`);
+          await runCacheBuilder('build', id);
+          console.log(`[auto-build] ${id} 离线包构建完成`);
+        } catch (e) {
+          console.warn(`[auto-build] ${id} 构建失败(可去 Bundles 页手动重试):`, e && e.message);
+        }
+      }
+    })();
+  }
+  res.json(Object.assign({}, saved, { autoBuilding: autoBuildIds }));
 });
 // 立即手动触发一次"自动检查更新所有站"(后台按钮用);异步执行,立即返回
 app.post('/api/admin/auto-update/run', (req, res) => {

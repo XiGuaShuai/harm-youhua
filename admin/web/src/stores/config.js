@@ -26,6 +26,8 @@ export const useConfigStore = defineStore('config', () => {
   async function saveApps() {
     const { data } = await api.put('/api/admin/apps', { apps: apps.value });
     version.value = data.version;
+    // 后端会对"新加的 bundle:true 且还没离线包的站"自动在后台构建离线包,返回其 id 列表
+    return data.autoBuilding || [];
   }
   async function saveBlockHosts() {
     const { data } = await api.put('/api/admin/blockhosts', { blockHosts: blockHosts.value });

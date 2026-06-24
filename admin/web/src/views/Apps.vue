@@ -74,16 +74,15 @@ async function submit() {
   const idx = list.findIndex((a) => a.id === editing.value);
   if (idx >= 0) list[idx] = item; else list.push(item);
   apps.value = list;
-  await store.saveApps();
+  const autoBuilding = await store.saveApps();
   dialog.value = false;
-  ElMessage.success('已保存');
-  // 新增/编辑后,若开了离线包且还没建,提示一键构建
-  if (item.bundle && !bundleMap.value[item.id]) {
-    try {
-      await ElMessageBox.confirm(`应用「${item.name || item.id}」已开启离线包但尚未构建,现在构建?`, '一键建离线包', { type: 'info', confirmButtonText: '立即构建', cancelButtonText: '稍后' });
-      await buildCache(item);
-      await loadBundles();
-    } catch (e) { /* 用户选稍后 */ }
+  // 后端对"开了离线包且还没建"的站会自动在后台构建,前端不再弹手动构建窗,只提示+稍后刷新状态列
+  if (autoBuilding && autoBuilding.includes(item.id)) {
+    ElMessage.success(`已保存,正在后台自动构建「${item.name || item.id}」的离线包...`);
+    // 离线包构建需时间(几十秒~几分钟),延迟刷新一次离线包状态列让用户看到结果
+    setTimeout(() => { loadBundles().catch(() => {}); }, 30000);
+  } else {
+    ElMessage.success('已保存');
   }
 }
 
