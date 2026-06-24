@@ -122,6 +122,9 @@ export class WebPool {
         const er = e as BusinessError;
         hilog.error(DOMAIN, TAG, 'preconnect failed: %{public}s', er.message);
       }
+      // 后台配置的额外预连接域:对该站资源/接口所在的跨域CDN提前做DNS+TLS握手。
+      // 通用能力(SDK不认识具体站,域名全由后台 preconnectHosts 下发):JS渲染型站(主文档空、资源在跨域CDN)预连其CDN域可压短白屏。
+      this.preconnectHosts(app.preconnectHosts);
       if (swr) {
         webCache.enableDocCache([app.url]);
       }
@@ -153,6 +156,33 @@ export class WebPool {
         setTimeout(() => {
           this.prewarm(url, swr);
         }, lazyDelay);
+      }
+    }
+  }
+
+  /**
+   * 对后台配置的额外域做预连接(DNS+TLS 握手提前到点击之前)。通用:域名全部来自后台 preconnectHosts,SDK 不硬编码任何站。
+   * 接受 'host'、'host:port'、'https://host' 等形式,统一规范成 https://host 再预连;非法/空项跳过。
+   */
+  private preconnectHosts(hosts: string[] | undefined): void {
+    if (!hosts || hosts.length === 0) {
+      return;
+    }
+    for (let i = 0; i < hosts.length; i++) {
+      let h: string = (hosts[i] || '').trim();
+      if (h.length === 0) {
+        continue;
+      }
+      // 没带协议就补 https://(预连接走 https)
+      if (h.indexOf('http://') !== 0 && h.indexOf('https://') !== 0) {
+        h = 'https://' + h;
+      }
+      try {
+        webview.WebviewController.prepareForPageLoad(h, true, 2); // socket 数小一点,只为握手预热
+        hilog.info(DOMAIN, TAG, 'preconnect host %{public}s', h);
+      } catch (e) {
+        const er = e as BusinessError;
+        hilog.warn(DOMAIN, TAG, 'preconnect host failed %{public}s: %{public}s', h, er.message);
       }
     }
   }
@@ -199,11 +229,22 @@ export class WebPool {
     return node;
   }
 
+  /** 查某 url 在远程配置里的 swrDoc(默认 true;显式配 false 的动态站如 bilibili 返回 false,避免给空主文档做SWR) */
+  private swrDocFor(url: string): boolean {
+    const apps: RemoteApp[] = remoteConfig.getApps();
+    for (let i = 0; i < apps.length; i++) {
+      if (apps[i] && apps[i].url === url) {
+        return apps[i].swrDoc !== false;
+      }
+    }
+    return true;
+  }
+
   /** 显示时获取节点;未预热则即时创建(退化为普通加载) */
   obtain(url: string): WebNode {
     let node: WebNode | undefined = this.nodes.get(url);
     if (!node) {
-      node = this.prewarm(url, true);
+      node = this.prewarm(url, this.swrDocFor(url)); // 用该站真实 swrDoc(动态站如 bilibili 为 false),不硬塞 true
     }
     this.loadBundleFor(url); // 打开该网页应用时,按需从后台下载它的离线包(WebCache 内部按 origin 去重)
     return node;

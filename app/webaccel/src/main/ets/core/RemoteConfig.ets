@@ -23,6 +23,8 @@ export interface RemoteApp {
   bundleVersion?: string; // 离线包清单指纹:后台下发,设备据此判断"要不要更新本地离线包"
   extraBlockHosts?: string[]; // 每应用额外黑名单:只对本应用生效,叠加在全局 blockHosts 之上
   prefetchChunks?: boolean;   // 每应用 chunk 预取开关:覆盖全局 settings.prefetchChunks(不下发=用全局)
+  preconnectHosts?: string[]; // 每应用额外预连接域:开机提前对这些CDN/接口域做DNS+TLS握手,点进去时资源直连不等握手。
+                              // 通用能力:动态/JS渲染站(如视频站)主文档空、资源在跨域CDN,预连其CDN域能压短白屏期。后台按站配置。
 }
 
 export interface RemoteSettings {

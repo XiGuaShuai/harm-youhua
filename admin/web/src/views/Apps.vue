@@ -28,13 +28,14 @@ onMounted(loadBundles);
 
 function emptyForm() {
   return { id: '', name: '', url: '', routesText: '/', swrDoc: true, prerender: true, codeCache: true, bundle: true,
-    prefetchChunks: true, extraBlockHostsText: '' };
+    prefetchChunks: true, extraBlockHostsText: '', preconnectHostsText: '' };
 }
 function openAdd() { editing.value = null; form.value = emptyForm(); dialog.value = true; }
 function openEdit(row) {
   editing.value = row.id;
   form.value = { ...emptyForm(), ...row, routesText: (row.routes || []).join('\n'),
-    extraBlockHostsText: (row.extraBlockHosts || []).join('\n') };
+    extraBlockHostsText: (row.extraBlockHosts || []).join('\n'),
+    preconnectHostsText: (row.preconnectHosts || []).join('\n') };
   dialog.value = true;
 }
 
@@ -68,7 +69,8 @@ async function submit() {
     routes: form.value.routesText.split('\n').map((s) => s.trim()).filter(Boolean),
     swrDoc: form.value.swrDoc, prerender: form.value.prerender, codeCache: form.value.codeCache, bundle: form.value.bundle,
     prefetchChunks: form.value.prefetchChunks,
-    extraBlockHosts: (form.value.extraBlockHostsText || '').split('\n').map((s) => s.trim()).filter(Boolean)
+    extraBlockHosts: (form.value.extraBlockHostsText || '').split('\n').map((s) => s.trim()).filter(Boolean),
+    preconnectHosts: (form.value.preconnectHostsText || '').split('\n').map((s) => s.trim()).filter(Boolean)
   };
   const list = [...apps.value];
   const idx = list.findIndex((a) => a.id === editing.value);
@@ -220,6 +222,10 @@ async function generateManifest(row) {
         <el-form-item label="额外黑名单">
           <el-input v-model="form.extraBlockHostsText" type="textarea" :rows="2"
             placeholder="只对本应用生效的额外屏蔽域(每行一个),叠加在全局黑名单之上。如 Booking 的遥测域" />
+        </el-form-item>
+        <el-form-item label="预连接域">
+          <el-input v-model="form.preconnectHostsText" type="textarea" :rows="2"
+            placeholder="该站资源/接口所在的跨域CDN域(每行一个),开机提前做DNS+TLS握手,点进去时资源直连不等握手。如视频/JS渲染站(主文档空、资源在跨域CDN)填其CDN域,能压短白屏。例:s1.hdslb.com" />
         </el-form-item>
       </el-form>
       <template #footer>
