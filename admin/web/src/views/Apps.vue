@@ -28,7 +28,7 @@ onMounted(loadBundles);
 
 function emptyForm() {
   return { id: '', name: '', url: '', routesText: '/', swrDoc: true, prerender: true, codeCache: true, bundle: true,
-    prefetchChunks: true, extraBlockHostsText: '', preconnectHostsText: '' };
+    prefetchChunks: true, extraBlockHostsText: '', preconnectHostsText: '', userAgent: '' };
 }
 function openAdd() { editing.value = null; form.value = emptyForm(); dialog.value = true; }
 function openEdit(row) {
@@ -73,7 +73,8 @@ async function submit() {
     swrDoc: form.value.swrDoc, prerender: form.value.prerender, codeCache: form.value.codeCache, bundle: form.value.bundle,
     prefetchChunks: form.value.prefetchChunks,
     extraBlockHosts: (form.value.extraBlockHostsText || '').split('\n').map((s) => s.trim()).filter(Boolean),
-    preconnectHosts: (form.value.preconnectHostsText || '').split('\n').map((s) => s.trim()).filter(Boolean)
+    preconnectHosts: (form.value.preconnectHostsText || '').split('\n').map((s) => s.trim()).filter(Boolean),
+    userAgent: (form.value.userAgent || '').trim()  // 自定义UA:空=用默认(不含Mobile则自动追加Mobile);填了=整体替换该站UA
   };
   const list = [...apps.value];
   const idx = list.findIndex((a) => a.id === editing.value);
@@ -229,6 +230,10 @@ async function generateManifest(row) {
         <el-form-item label="预连接域">
           <el-input v-model="form.preconnectHostsText" type="textarea" :rows="2"
             placeholder="该站资源/接口所在的跨域CDN域(每行一个),开机提前做DNS+TLS握手,点进去时资源直连不等握手。如视频/JS渲染站(主文档空、资源在跨域CDN)填其CDN域,能压短白屏。例:s1.hdslb.com" />
+        </el-form-item>
+        <el-form-item label="自定义UA">
+          <el-input v-model="form.userAgent" type="textarea" :rows="2"
+            placeholder="留空=用默认UA(不含Mobile会自动追加,多数站返回移动版)。某些站按UA分手机/桌面分支,需指定时填整条UA覆盖。例(桌面):Mozilla/5.0 (Windows NT 10.0; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36" />
         </el-form-item>
       </el-form>
       <template #footer>

@@ -41,9 +41,15 @@ function isVersionQuery(query) {
   if (!query || query.length === 0) return false;
   const q = query.charAt(0) === '?' ? query.substring(1) : query;
   if (q.length === 0) return false;
+  // 变换型参数键(出现即"同一资源不同输出",如图片CDN ?w=500&h=500):不当版本号,否则缓坏副本。
+  // 与 SDK WebCacheManager.isVersionQuery 完全一致(端云一致;米其林 cloudimg.io 图片实测踩坑,2026-06-25)。
+  const TRANSFORM_KEYS = ['w', 'h', 'width', 'height', 'q', 'quality', 'dpr', 'fit', 'crop', 'func',
+    'format', 'fmt', 'resize', 'scale', 'size', 'org_if_sml', 'blur', 'rotate'];
   const parts = q.split('&');
   for (const part of parts) {
     const eq = part.indexOf('=');
+    const key = eq >= 0 ? part.substring(0, eq).toLowerCase() : '';
+    if (key.length > 0 && TRANSFORM_KEYS.includes(key)) return false; // 尺寸/裁剪类 → 非版本号
     const v = eq >= 0 ? part.substring(eq + 1) : part; // 无 key= 时(如 ?2025121805)取整段
     if (!/^[0-9]+$/.test(v)) return false; // 必须全数字
   }
