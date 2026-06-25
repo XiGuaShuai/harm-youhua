@@ -135,6 +135,7 @@ class WebCacheManager {
   // 每应用精细配置:按 origin 索引。mergedBlockByOrigin = 全局黑名单 + 该应用 extraBlockHosts(预算好,intercept 热路径直接查)
   private mergedBlockByOrigin: Map<string, string[]> = new Map();
   private prefetchByOrigin: Map<string, boolean> = new Map(); // 该应用的 prefetchChunks 覆盖值
+  private uaByOrigin: Map<string, string> = new Map();        // 该应用的自定义 UA(覆盖默认手机化 UA;按 origin 索引)
   private bundleAppByOrigin: Map<string, string> = new Map(); // origin → appId(仅 bundle:true 的站):离线包资源丢失自愈上报用
   private reportedSelfHeal: Set<string> = new Set();          // 已上报过自愈的 appId(本次会话只报一次,防刷)
   private serverBase: string = '';                            // 后端地址(applyApps 时由 remoteConfig.getServer() 注入,自愈上报用)
@@ -316,6 +317,7 @@ class WebCacheManager {
   applyApps(apps: RemoteApp[], server: string = ''): void {
     this.mergedBlockByOrigin.clear();
     this.prefetchByOrigin.clear();
+    this.uaByOrigin.clear();
     this.bundleAppByOrigin.clear();
     if (server && server.length > 0) {
       this.serverBase = server.replace(/\/+$/, '');
@@ -348,6 +350,10 @@ class WebCacheManager {
       if (typeof app.prefetchChunks === 'boolean') {
         this.prefetchByOrigin.set(origin, app.prefetchChunks);
       }
+      // 每应用自定义 UA(非空才记录;覆盖默认手机化逻辑)
+      if (app.userAgent && app.userAgent.length > 0) {
+        this.uaByOrigin.set(origin, app.userAgent);
+      }
       // 仅 bundle:true 的站记 origin→appId,用于"离线包资源实际读不出→上报后台自愈"
       if (app.bundle === true && app.id && app.id.length > 0) {
         this.bundleAppByOrigin.set(origin, app.id);
@@ -367,6 +373,22 @@ class WebCacheManager {
       }
     }
     return this.blockHosts;
+  }
+
+  /**
+   * 取某 URL 所属应用的自定义 UA(后台 app.userAgent 下发);未配置返回空串。
+   * WebShared 在 onControllerAttached 据此决定:有自定义 UA → 用它(覆盖手机化);否则走默认手机化逻辑。
+   */
+  userAgentFor(url: string): string {
+    const om = url.match(/^https?:\/\/[^\/]+/);
+    const origin: string = om ? om[0] : '';
+    if (origin.length > 0) {
+      const ua: string | undefined = this.uaByOrigin.get(origin);
+      if (ua && ua.length > 0) {
+        return ua;
+      }
+    }
+    return '';
   }
 
   /** 远程下发全局设置(缓存上限 / 文档校验节流)。bytecodeCache 在元服务不支持,已忽略 */
@@ -482,6 +504,10 @@ class WebCacheManager {
    */
   // 版本号型 query 识别:query 各参数值全是纯数字(如 ?2025121805、?v=20250117)才算"版本号"。
   // 必须与后端 cache-builder.js 的 isVersionQuery 完全一致,否则端云判断不一致、离线包命不中。
+  // ★ 关键修正(2026-06-25):图片处理 CDN(如 Scaleflex cloudimg.io)用 ?w=500&h=500 这类"尺寸/裁剪"参数
+  //   指定同一原图的不同输出,值也是纯数字,会被误判成"版本号 query"→ 缓存后 http 裸抓(无Referer)
+  //   拿到坏副本/防盗链响应,且打 max-age 永久缓 → 图片裂(米其林详情页实测)。
+  //   所以:query 里出现尺寸/裁剪/质量类参数键时,一律不当版本号(同URL不同输出,缓了会发错)。
   private isVersionQuery(query: string): boolean {
     if (!query || query.length === 0) {
       return false;
@@ -490,10 +516,19 @@ class WebCacheManager {
     if (q.length === 0) {
       return false;
     }
+    // 变换型参数键(出现即说明"同一资源不同输出"):宽/高/质量/裁剪/格式/dpr/缩放/"小图返原图"等
+    const TRANSFORM_KEYS: string[] = [
+      'w', 'h', 'width', 'height', 'q', 'quality', 'dpr', 'fit', 'crop', 'func',
+      'format', 'fmt', 'resize', 'scale', 'size', 'org_if_sml', 'blur', 'rotate'
+    ];
     const parts: string[] = q.split('&');
     for (let i = 0; i < parts.length; i++) {
       const part: string = parts[i];
       const eq: number = part.indexOf('=');
+      const key: string = eq >= 0 ? part.substring(0, eq).toLowerCase() : '';
+      if (key.length > 0 && TRANSFORM_KEYS.indexOf(key) >= 0) {
+        return false; // 尺寸/裁剪类参数 → 不是版本号,不可当不可变缓存
+      }
       const v: string = eq >= 0 ? part.substring(eq + 1) : part; // 无 key= 时(如 ?2025121805)取整段
       if (!/^[0-9]+$/.test(v)) {
         return false; // 必须全数字

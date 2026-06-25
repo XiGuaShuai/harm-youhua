@@ -82,14 +82,20 @@ export function buildWeb(model: WebViewModel) {
     .geolocationAccess(true)
     .width('100%')
     .height('100%')
-    // 设手机 UA:有些站(如 bilibili.tv)按 UA 判断是否手机,默认 UA 会被当非手机 → 返回不适配/白屏。
-    // controller 就绪、加载前追加手机标识(Mobile),让站点返回移动版页面。
+    // UA 策略:
+    //  ① 该应用后台下发了自定义 UA(app.userAgent,如 bilibili.tv 要桌面 UA)→ 整体用它,不再追加 Mobile;
+    //  ② 否则走默认手机化:不含 Mobile 则追加,让多数站返回移动版(避免被当非手机 → 不适配/白屏)。
+    // 站点按 UA 分手机/桌面分支,个别站(国际版视频站)桌面分支才正常,故开放每应用覆盖,由后台按站配置。
     .onControllerAttached(() => {
       try {
-        const ua: string = model.controller.getUserAgent();
-        // 已含 Mobile 就不重复加
-        if (ua.indexOf('Mobile') < 0) {
-          model.controller.setCustomUserAgent(ua + ' Mobile Safari/537.36');
+        const customUa: string = webCache.userAgentFor(model.url);
+        if (customUa.length > 0) {
+          model.controller.setCustomUserAgent(customUa); // 每应用 UA:整体替换
+        } else {
+          const ua: string = model.controller.getUserAgent();
+          if (ua.indexOf('Mobile') < 0) {
+            model.controller.setCustomUserAgent(ua + ' Mobile Safari/537.36'); // 默认手机化
+          }
         }
       } catch (e) {
         // 设 UA 失败不影响加载

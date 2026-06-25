@@ -25,6 +25,9 @@ export interface RemoteApp {
   prefetchChunks?: boolean;   // 每应用 chunk 预取开关:覆盖全局 settings.prefetchChunks(不下发=用全局)
   preconnectHosts?: string[]; // 每应用额外预连接域:开机提前对这些CDN/接口域做DNS+TLS握手,点进去时资源直连不等握手。
                               // 通用能力:动态/JS渲染站(如视频站)主文档空、资源在跨域CDN,预连其CDN域能压短白屏期。后台按站配置。
+  userAgent?: string;         // 每应用自定义 UA:覆盖该应用 origin 下的 UA。某些站(如 bilibili.tv 国际版)按 UA 判断
+                              // 手机/桌面分支,默认追加 Mobile 反而触发不适配/白屏 → 给它单独下发桌面 UA。
+                              // 不下发=维持 SDK 默认"不含 Mobile 则追加 Mobile"的手机化逻辑。后台按站配置,不硬编码。
 }
 
 export interface RemoteSettings {

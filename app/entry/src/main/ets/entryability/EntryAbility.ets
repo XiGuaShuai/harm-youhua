@@ -13,7 +13,10 @@ const DOMAIN = 0x0000;
 const FALLBACK_APPS: RemoteApp[] = [
   { id: 'k11', name: 'K11 香港', url: 'https://hk.k11.com/zh-cn', routes: ['/zh-cn', '/zh-cn/shop/', '/zh-cn/taste/'], swrDoc: true, prerender: true, bundle: false },
   { id: 'booking', name: 'Booking.com', url: 'https://www.booking.com/?aid=376371', routes: ['/'], swrDoc: true, prerender: true, bundle: false },
-  { id: 'beacukai', name: '印尼入境卡', url: 'https://ecd.beacukai.go.id/', swrDoc: true, prerender: true, bundle: true }
+  { id: 'beacukai', name: '印尼入境卡', url: 'https://ecd.beacukai.go.id/', swrDoc: true, prerender: true, bundle: true },
+  // bilibili.tv 国际版:CSR 视频站,按 UA 分手机/桌面分支 → 下发桌面 UA(覆盖默认手机化)。bundle:false(资源走独立 CDN 域,缓不了)。
+  { id: 'bilibili', name: '哔哩哔哩', url: 'https://www.bilibili.tv/en', swrDoc: false, prerender: false, bundle: false,
+    userAgent: 'Mozilla/5.0 (Windows NT 10.0; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36' }
 ];
 
 export default class EntryAbility extends UIAbility {
