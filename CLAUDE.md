@@ -87,7 +87,7 @@ hvigorw --mode module -p module=entry@default -p product=default -p buildMode=re
 | **`cache-builder.js`** | 离线包构建(check/update/build/manifest 四模式) + `detectSite`(探测站点类型) + 版本号query可缓存 + 剔sourcemap |
 | `consensus-builder.js` | 众包共识建包(djb2 复算防投毒) |
 | `db.js` | MySQL 连接池(votes 表，众包用；连不上不影响配置/离线包) |
-| `data/config.json` | 配置持久化(apps+blockHosts+settings)，纯文件改完即生效 |
+| `data/config.json` | 配置持久化(apps+blockHosts+settings)，后端读文件即生效。**线上生效的这份在 docker 数据卷,不在 git;改它见第五节"改配置只改线上"** |
 | `bundles/<id>/` | 离线包托管 |
 
 **关键 API**：`GET /api/config`(端侧拉) · `/bundles/<id>/...` · `POST /api/login` · `POST /api/report`(众包)。
@@ -112,6 +112,21 @@ cd admin/web && npm install && npm run dev     # 5174
 - **后台只用 admin/**，不编译 app/。所以部署只需 admin/ 改动；app/ 端侧改动推上去仅存档、不影响线上。
 - 登录：界面 admin / 密码在服务器 `/srv/youhua/.env` 的 `ADMIN_PASS`。
 
+#### ⭐ 改配置 / 新增应用 = 只改线上,不动本地(铁律)
+**生效的 `config.json` 在 docker 数据卷里,不在 git 仓库。** 仓库里 `admin/server/data/config.json` 是过时副本,改它推 git **不会**覆盖生效配置 —— 别拿它当基准、别往它写。标准流程:
+1. **拉线上当前生效配置做基准**(绝不用本地副本):`curl -s https://maidun.chujingservice.com/api/config`
+2. 构造新的**整份** config，`node -e "require('./x.json')"` 校验是合法 JSON。
+3. SSH 进服务器换容器内文件(`yuan` 读不了数据卷目录但能跑 docker,故走 `docker exec`/`docker cp`)：
+   ```bash
+   ssh -i ~/.ssh/youhua_deploy yuan@47.236.73.89   # 容器名 youhua-admin
+   # 先备份再替换(后端读文件即生效,无需重启)
+   scp -i ~/.ssh/youhua_deploy x.json yuan@47.236.73.89:/tmp/c.json
+   docker exec youhua-admin sh -c 'cp /app/server/data/config.json /app/server/data/config.json.bak.$(date +%s)'
+   docker cp /tmp/c.json youhua-admin:/app/server/data/config.json
+   ```
+4. `curl` 公网 API **复验**生效；用过的本地临时文件删掉,不留工作区。
+- **含中文(应用名)别用 curl PUT**(会乱码),`docker cp` 整份文件替换最稳。`id` 必须英文 ASCII(中文坏离线包 URL)。
+
 ### 本机编译（这台机 admin 用户，无独立 DevEco PATH）
 ```
 $deveco="D:\Huawei\DevEco Studio"; $env:DEVECO_SDK_HOME="$deveco\sdk"
@@ -129,11 +144,14 @@ hvigorw.bat --mode module -p module=entry@default -p product=default [-p buildMo
 
 ---
 
-## 六、当前状态（截至 2026-06-22）
+## 六、当前状态（截至 2026-06-29）
 
-**三个测试应用**：K11 香港(hk.k11.com/zh-cn)、印尼入境卡(ecd.beacukai.go.id)、Booking(booking.com)。线上后台配的就这三站，离线包：K11 4个资源/印尼 41个/Booking 无(反爬+跨域做不了)。
+**线上后台配了 10 个应用**(`curl https://maidun.chujingservice.com/api/config` 为准)：
+- 早期三测试站 K11 香港 / 印尼入境卡(beacukai) / Booking —— 离线包：K11 4资源 / 印尼 41资源 / Booking 无(反爬+跨域做不了)。
+- 后加 bilibili(国际版,桌面 UA) / michelin(米其林,AWS WAF 反爬,Android UA)。
+- **2026-06-29 新增 5 站**:translate(Google 翻译) / foodpanda / youtube / twitch / tiktok —— 全 `bundle:false + prerender:true + swrDoc:true`,各带指定**每应用 UA**;三个视频重站(youtube/twitch/tiktok)排 apps 数组**末尾**(防预渲染抢渲染线程卡屏)。同时从全局 blockHosts **移除 4 条 translate 相关**(否则拦死翻译站接口/字体)。这 5 站为境外站,快慢看国际节点(网络天花板),TikTok 反爬强可能撞验证码,均未真机逐一实测。
 
-**已实测达成**：冷启动 ~430ms、点进应用/翻页预渲染秒开、印尼首屏136ms(离线包)。装机包 release 258KB。**用户确认"确实快"。**
+**已实测达成**:冷启动 ~430ms、点进应用/翻页预渲染秒开、印尼首屏136ms(离线包)。装机包 release 258KB。**用户确认"确实快"。**
 
 **已做的功能（都真机验证、已部署线上）**：
 - 端侧秒开：离屏预渲染+优先级、离线包、主文档SWR、路由预取(只下静态资源)、占位绑FCP、黑名单拦遥测。
@@ -158,7 +176,7 @@ hvigorw.bat --mode module -p module=entry@default -p product=default [-p buildMo
 **改代码的正确姿势**：
 - 改加速行为/缓存 → 先读 TROUBLESHOOTING.md。
 - 缓存判定改动**端云两处必须一致**：SDK `WebCacheManager.ets` 的 isHashedAsset/isVersionQuery ↔ 后端 `cache-builder.js` 的同名函数。改完真机验证浮窗"包N/N"。
-- 黑名单/应用列表是**后台下发**的 → 改 admin 配置(界面或 config.json)，不往 SDK 硬编码加。
+- 黑名单/应用列表是**后台下发**的 → 改线上 admin 配置(界面 或 `docker cp` 换数据卷里的 config.json,见第五节),不往 SDK 硬编码加、不改 git 里的本地 config.json。
 - 端侧改完要编译装真机验证(用上面本机编译命令)。后台改完重启 server。
 
 ---
