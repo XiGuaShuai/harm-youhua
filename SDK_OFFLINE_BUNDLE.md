@@ -56,12 +56,22 @@ SDK 在 `WebPreRender.prewarmConfiguredApps()` 中遍历所有 `apps`。只要�
 - 原始 manifest: `6365.1 KB`
 - 压缩后端侧落盘: `5794.4 KB`
 - 节省: `570.7 KB`
-- 资源数: `14`
+- 资源数: `29`
 - 压缩资源: `hk.k11.com_files_art_js_bundle.min.js.zz`
 - JS 原始大小: `793.8 KB`
 - JS zlib 后大小: `223.2 KB`
 
 K11 图片主要是 JPG/PNG/WebP,本身已压缩,继续压缩收益很低,所以仍按原始图片文件缓存。真正有效的压缩对象主要是 JS/CSS/HTML/JSON/SVG 等文本类资源。
+
+## 2026-07-01 线上站点状态
+
+当前线上后台启用三项测试配置:
+
+- K11 香港: `bundle:true`,原始 `6365.1 KB`,压缩落盘 `5794.4 KB`。
+- 印尼出境卡: `bundle:true`,按 `>=64 KB` 或 `>=3000 ms` 保留关键资源,原始 `1690.2 KB`,压缩落盘 `607.7 KB`,资源数 `13`。
+- Booking.com: `bundle:false`,服务端请求首页返回 AWS WAF challenge,拿不到可构建离线包的 HTML;当前使用运行时缓存 `bstatic.com` / `bstatic.cn` 大资源 + Booking 遥测黑名单 + preconnect。
+
+Booking 不应该伪造空离线包。若后续要做 Booking 离线包,必须先用真机 WebView 采集实际 `bstatic` 稳定静态资源,再把可直接下载且 URL 稳定的资源配置进 `bundleExtraUrls`,并验证端侧命中。
 
 ## 资源选择原则
 
@@ -110,4 +120,3 @@ WebAccel.init(this.context)
 后台可达时,SDK 会自动拉配置和离线包。接入方不需要手动下载每个站点的资源。若后台配置中有多个 `bundle: true` 站点,端侧会逐站预下载,所以后台配置必须谨慎控制总量。
 
 如果接入方只传本地 `apps` 且没有 `configServer`,则不会从后台下载离线包,只能依赖运行时缓存。要实现“进入前已缓存,页面秒开”,必须配置后台地址并让站点有离线包 manifest。
-

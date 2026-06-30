@@ -144,12 +144,14 @@ hvigorw.bat --mode module -p module=entry@default -p product=default [-p buildMo
 
 ---
 
-## 六、当前状态（截至 2026-06-29）
+## 六、当前状态（截至 2026-07-01）
 
-**线上后台配了 10 个应用**(`curl https://maidun.chujingservice.com/api/config` 为准)：
-- 早期三测试站 K11 香港 / 印尼入境卡(beacukai) / Booking —— 离线包：K11 4资源 / 印尼 41资源 / Booking 无(反爬+跨域做不了)。
-- 后加 bilibili(国际版,桌面 UA) / michelin(米其林,AWS WAF 反爬,Android UA)。
-- **2026-06-29 新增 5 站**:translate(Google 翻译) / foodpanda / youtube / twitch / tiktok —— 全 `bundle:false + prerender:true + swrDoc:true`,各带指定**每应用 UA**;三个视频重站(youtube/twitch/tiktok)排 apps 数组**末尾**(防预渲染抢渲染线程卡屏)。同时从全局 blockHosts **移除 4 条 translate 相关**(否则拦死翻译站接口/字体)。这 5 站为境外站,快慢看国际节点(网络天花板),TikTok 反爬强可能撞验证码,均未真机逐一实测。
+**线上后台当前只配 3 个测试应用**(`curl https://maidun.chujingservice.com/api/config` 为准)：
+- K11 香港: `bundle:true`,29资源,压缩后约5.8MB。
+- 印尼出境卡(beacukai): `bundle:true`,13资源,按 `>=64KB` 或 `>=3000ms` 选择关键静态资源,压缩后约608KB。
+- Booking.com: `bundle:false`,首页被 AWS WAF challenge 拦截,服务端无法构建可靠离线包;当前走运行时缓存 `bstatic.com/bstatic.cn` + Booking 遥测黑名单 + preconnect。
+
+历史上曾临时加过 bilibili / michelin / translate / foodpanda / youtube / twitch / tiktok 等 7 个站点,当前线上配置已按本轮测试收敛,没有继续下发这些站点。
 
 **已实测达成**:冷启动 ~430ms、点进应用/翻页预渲染秒开、印尼首屏136ms(离线包)。装机包 release 258KB。**用户确认"确实快"。**
 
