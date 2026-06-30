@@ -3,6 +3,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
+import zlib from 'node:zlib';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const DATA_FILE = path.join(__dirname, 'data', 'config.json');
@@ -10,7 +11,7 @@ const BUNDLES_DIR = path.join(__dirname, 'bundles');
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36';
 
 function mimeOf(u) {
-  const p = u.split('?')[0]; // 剥掉版本号 query 再判扩展名
+  const p = u.split('?')[0].toLowerCase(); // 剥掉版本号 query 再判扩展名
   if (p.endsWith('.js') || p.endsWith('.mjs')) return 'application/javascript';
   if (p.endsWith('.css')) return 'text/css';
   if (p.endsWith('.ttf')) return 'font/ttf';
@@ -18,6 +19,13 @@ function mimeOf(u) {
   if (p.endsWith('.woff')) return 'font/woff';
   if (p.endsWith('.otf')) return 'font/otf';
   if (p.endsWith('.html')) return 'text/html';
+  if (p.endsWith('.png')) return 'image/png';
+  if (p.endsWith('.jpg') || p.endsWith('.jpeg')) return 'image/jpeg';
+  if (p.endsWith('.webp')) return 'image/webp';
+  if (p.endsWith('.avif')) return 'image/avif';
+  if (p.endsWith('.gif')) return 'image/gif';
+  if (p.endsWith('.svg')) return 'image/svg+xml';
+  if (p.endsWith('.ico')) return 'image/x-icon';
   return 'application/octet-stream';
 }
 
@@ -76,14 +84,148 @@ function isHashedAsset(p) {
   return seg.slice(0, dot).split(/[.\-_]/).some((t) => t.length >= 8 && !/^[0-9]+x[0-9]+$/.test(t) && (/^[a-f0-9]+$/.test(t) || (/[0-9]/.test(t) && /[a-z]/.test(t))));
 }
 
+function matchesPattern(url, pattern) {
+  if (!pattern) return false;
+  const u = String(url).toLowerCase();
+  const p = String(pattern).toLowerCase();
+  if (!p.includes('*')) return u.includes(p);
+  const parts = p.split('*').filter(Boolean);
+  if (!parts.length) return true;
+  if (!p.startsWith('*') && !u.startsWith(parts[0])) return false;
+  let pos = 0;
+  for (const part of parts) {
+    const idx = u.indexOf(part, pos);
+    if (idx < 0) return false;
+    pos = idx + part.length;
+  }
+  if (!p.endsWith('*') && !u.endsWith(parts[parts.length - 1])) return false;
+  return true;
+}
+
+function matchesAny(url, patterns) {
+  return Array.isArray(patterns) && patterns.some((p) => matchesPattern(url, p));
+}
+
+function isBundleExcluded(appCfg, url) {
+  return matchesAny(url, appCfg.bundleExcludeUrls);
+}
+
+function configuredBundleUrls(appCfg) {
+  const out = new Set();
+  for (const ref of (Array.isArray(appCfg.bundleExtraUrls) ? appCfg.bundleExtraUrls : [])) {
+    try {
+      out.add(new URL(ref, appCfg.url).href);
+    } catch {}
+  }
+  return out;
+}
+
+// 与端侧 staticCache 语义一致:exclude 优先,include 强制保留;否则按大资源/慢资源阈值保留。
+function shouldKeepStaticByPolicy(appCfg, url, sizeBytes, costMs) {
+  const p = appCfg.staticCache || {};
+  if (p.enabled === false) return false;
+  if (matchesAny(url, p.exclude)) return false;
+  if (matchesAny(url, p.include)) return true;
+  const maxKB = Number(p.maxSizeKB || 0);
+  if (maxKB > 0 && sizeBytes > maxKB * 1024) return false;
+  const minKB = Number(p.minSizeKB || 0);
+  const minMs = Number(p.minDurationMs || 0);
+  if (minKB <= 0 && minMs <= 0) return true;
+  return (minKB > 0 && sizeBytes >= minKB * 1024) || (minMs > 0 && costMs >= minMs);
+}
+
 function sha256(data) {
   return crypto.createHash('sha256').update(data).digest('hex');
 }
 
+function manifestEntry(entry, outDir, extra = {}) {
+  const target = path.join(outDir, entry.file);
+  let size = Number(extra.size || entry.size || 0);
+  let hash = extra.hash || entry.hash || '';
+  if (fs.existsSync(target)) {
+    const buf = fs.readFileSync(target);
+    size = buf.length;
+    if (!hash) hash = sha256(buf);
+  }
+  const out = { url: entry.url, file: entry.file, mime: entry.mime || mimeOf(entry.file), size, hash };
+  if (typeof extra.costMs === 'number') out.costMs = extra.costMs;
+  return out;
+}
+
+function bundleBudgetBytes(appCfg) {
+  const kb = Number(appCfg.bundleMaxSizeKB || 5120);
+  if (kb <= 0) return Number.MAX_SAFE_INTEGER;
+  return kb * 1024;
+}
+
+function fitManifestToBudget(manifest, outDir, appCfg) {
+  const budget = bundleBudgetBytes(appCfg);
+  let total = 0;
+  const kept = [];
+  const skipped = [];
+  for (const entry of manifest) {
+    const target = path.join(outDir, entry.file);
+    const size = Number(entry.size || (fs.existsSync(target) ? fs.statSync(target).size : 0));
+    if (entry.file !== 'home.html' && total + size > budget) {
+      skipped.push(entry.file);
+      continue;
+    }
+    kept.push(Object.assign({}, entry, { size }));
+    total += size;
+  }
+  return { manifest: kept, total, skipped };
+}
+
+function isCompressibleBundleEntry(entry) {
+  const mime = String(entry && entry.mime || '').toLowerCase();
+  const file = String(entry && entry.file || '').toLowerCase();
+  return mime.includes('javascript') || mime === 'text/css' || mime === 'text/html' ||
+    mime.includes('json') || mime.includes('svg') ||
+    /\.(?:js|mjs|css|html|json|svg|txt)$/i.test(file);
+}
+
+function writeCompressedManifest(outDir, manifest) {
+  for (const f of fs.readdirSync(outDir)) {
+    if (f.endsWith('.br') || f.endsWith('.gz') || f.endsWith('.zz') ||
+        f === 'manifest.br.json' || f === 'manifest.gz.json' || f === 'manifest.zz.json') {
+      fs.rmSync(path.join(outDir, f), { force: true });
+    }
+  }
+  const compressed = [];
+  for (const entry of manifest) {
+    const rawPath = path.join(outDir, entry.file);
+    if (!isCompressibleBundleEntry(entry) || !fs.existsSync(rawPath)) {
+      compressed.push(entry);
+      continue;
+    }
+    const raw = fs.readFileSync(rawPath);
+    const packed = zlib.deflateSync(raw, { level: 6 });
+    if (packed.length >= raw.length - 1024) {
+      compressed.push(entry);
+      continue;
+    }
+    const packedFile = `${entry.file}.zz`;
+    fs.writeFileSync(path.join(outDir, packedFile), packed);
+    compressed.push(Object.assign({}, entry, {
+      file: packedFile,
+      rawFile: entry.file,
+      encoding: 'zlib',
+      rawSize: raw.length,
+      size: packed.length
+    }));
+  }
+  fs.writeFileSync(path.join(outDir, 'manifest.zz.json'), JSON.stringify(compressed, null, 2), 'utf8');
+  return compressed;
+}
+
 function fileNameForPath(u) {
-  const p = u.split('?')[0];
+  let p = u.split('?')[0];
+  try {
+    const parsed = new URL(u);
+    p = parsed.host + parsed.pathname;
+  } catch {}
   if (p.startsWith('/_next/static/')) return p.slice('/_next/static/'.length).replace(/\//g, '_'); // Next:短名 + 兼容 inferCachedUrl
-  return p.replace(/^\//, '').replace(/\//g, '_'); // 通用:整路径转安全文件名(如 dist_..._main.f852479f.chunk.js)
+  return p.replace(/^\//, '').replace(/[^A-Za-z0-9._-]+/g, '_'); // 通用:整路径转安全文件名(含跨域资源 host)
 }
 
 function inferCachedUrl(appCfg, file) {
@@ -149,6 +291,7 @@ async function discoverResources(appCfg) {
   const entryKey = origin + entryU.pathname + entryU.search;    // 主文档缓存键 = 入口页真实路径(设备端按此 URL 命中)
   const routes = (appCfg.routes && appCfg.routes.length) ? appCfg.routes : ['/'];
   const jsSet = new Set(), cssSet = new Set(), fontSet = new Set();
+  const extraSet = new Set();
 
   const html = await fetchText(entryUrl);
   if (!html) throw new Error('抓取入口页失败');
@@ -188,6 +331,14 @@ async function discoverResources(appCfg) {
       if (p && isHashedAsset(p)) fontSet.add(p);
     }
   }
+  // 手动纳入固定静态资源:适合 K11 这类跨域但 URL 固定/带版本号的大背景图。
+  // 自动发现仍只抓同源,避免把运营图片/CDN 小碎片全塞进包;确认为固定资源后由配置显式列入。
+  for (const ref of (Array.isArray(appCfg.bundleExtraUrls) ? appCfg.bundleExtraUrls : [])) {
+    try {
+      const abs = new URL(ref, entryUrl).href;
+      if (isHashedAsset(abs)) extraSet.add(abs);
+    } catch {}
+  }
 
   const resources = [
     { url: entryKey, sourceUrl: entryUrl, file: 'home.html', mime: 'text/html' }
@@ -195,6 +346,9 @@ async function discoverResources(appCfg) {
   const all = [...jsSet, ...cssSet, ...fontSet];
   for (const u of all) {
     resources.push({ url: origin + u, sourceUrl: origin + u, file: fileNameForPath(u), mime: mimeOf(u) });
+  }
+  for (const u of extraSet) {
+    resources.push({ url: u, sourceUrl: u, file: fileNameForPath(u), mime: mimeOf(u) });
   }
 
   const seen = new Set();
@@ -220,6 +374,7 @@ function compareDiscovered(appCfg, discovered) {
   const added = discovered.resources.filter((e) => !oldUrls.has(e.url)).map((e) => e.url);
   const removed = oldManifest.filter((e) => e.url && !nextUrls.has(e.url)).map((e) => e.url);
   const missingFiles = discovered.resources
+    .filter((e) => !isBundleExcluded(appCfg, e.url))
     .filter((e) => !fs.existsSync(path.join(outDir, e.file)))
     .map((e) => e.file);
   let oldHomeHash = '';
@@ -255,15 +410,33 @@ function atomicReplace(tmp, target) {
   fs.renameSync(tmp, target);
 }
 
+function looksLikeHtml(buf) {
+  const head = buf.subarray(0, Math.min(buf.length, 512)).toString('utf8').trim().toLowerCase();
+  return head.startsWith('<!doctype html') || head.startsWith('<html') || head.includes('<iframe');
+}
+
+function validateDownloaded(entry, res, buf) {
+  const ct = String(res.headers.get('content-type') || '').toLowerCase();
+  const expected = String(entry.mime || '').toLowerCase();
+  const htmlBody = looksLikeHtml(buf);
+  if ((expected.includes('javascript') || expected === 'text/css' || expected.startsWith('image/')) &&
+      (ct.includes('text/html') || htmlBody)) {
+    throw new Error(`unexpected html response for ${entry.sourceUrl}`);
+  }
+}
+
 async function downloadResource(entry, outDir) {
+  const started = Date.now();
   const res = await fetch(entry.sourceUrl, { headers: { 'User-Agent': UA } });
   if (!res.ok) throw new Error(`${res.status} ${entry.sourceUrl}`);
   const buf = Buffer.from(await res.arrayBuffer());
   if (!buf.length) throw new Error(`empty ${entry.sourceUrl}`);
+  validateDownloaded(entry, res, buf);
   const target = path.join(outDir, entry.file);
   const tmp = target + '.tmp';
   fs.writeFileSync(tmp, buf);
   atomicReplace(tmp, target);
+  return { size: buf.length, costMs: Date.now() - started };
 }
 
 async function updateServerCache(appCfg) {
@@ -271,20 +444,49 @@ async function updateServerCache(appCfg) {
   const diff = compareDiscovered(appCfg, discovered);
   const outDir = path.join(BUNDLES_DIR, appCfg.id);
   fs.mkdirSync(outDir, { recursive: true });
+  const previous = readManifestByFile(outDir);
+  const requiredUrls = configuredBundleUrls(appCfg);
 
   const downloaded = [];
   const skipped = [];
+  const skippedByPolicy = [];
+  const skippedByConfig = [];
   const failed = [];
+  const manifest = [];
   for (const entry of discovered.resources) {
-    if (entry.file === 'home.html') continue;
+    if (isBundleExcluded(appCfg, entry.url)) {
+      skippedByConfig.push(entry.file);
+      continue;
+    }
+    if (entry.file === 'home.html') {
+      continue;
+    }
     const target = path.join(outDir, entry.file);
     if (fs.existsSync(target)) {
+      const old = previous.get(entry.file);
+      const size = fs.statSync(target).size;
+      const oldCostMs = old && typeof old.costMs === 'number' ? old.costMs : 0;
+      if (!requiredUrls.has(entry.url) && !shouldKeepStaticByPolicy(appCfg, entry.url, size, oldCostMs)) {
+        skippedByPolicy.push(entry.file);
+        continue;
+      }
       skipped.push(entry.file);
+      manifest.push(manifestEntry(entry, outDir, old ? {
+        size: old.size,
+        hash: old.hash,
+        costMs: old.costMs
+      } : {}));
       continue;
     }
     try {
-      await downloadResource(entry, outDir);
+      const got = await downloadResource(entry, outDir);
+      if (!requiredUrls.has(entry.url) && !shouldKeepStaticByPolicy(appCfg, entry.url, got.size, got.costMs)) {
+        fs.rmSync(target, { force: true });
+        skippedByPolicy.push(entry.file);
+        continue;
+      }
       downloaded.push(entry.file);
+      manifest.push(manifestEntry(entry, outDir, got));
     } catch (e) {
       failed.push({ file: entry.file, error: String(e && e.message || e) });
     }
@@ -293,24 +495,38 @@ async function updateServerCache(appCfg) {
     throw new Error(`增量更新失败,有 ${failed.length} 个资源未下载: ${failed.slice(0, 3).map((e) => e.file).join(', ')}`);
   }
 
-  const homeTmp = path.join(outDir, 'home.html.tmp');
-  fs.writeFileSync(homeTmp, discovered.html, 'utf8');
-  const manifest = discovered.resources.map((e) => ({ url: e.url, file: e.file, mime: e.mime }));
+  if (appCfg.swrDoc === true) {
+    const homeTmp = path.join(outDir, 'home.html.tmp');
+    fs.writeFileSync(homeTmp, discovered.html, 'utf8');
+    atomicReplace(homeTmp, path.join(outDir, 'home.html'));
+    const homeEntry = discovered.resources.find((e) => e.file === 'home.html');
+    manifest.unshift(manifestEntry(homeEntry || { url: new URL(appCfg.url).origin + '/', file: 'home.html', mime: 'text/html' }, outDir));
+  } else {
+    fs.rmSync(path.join(outDir, 'home.html'), { force: true });
+  }
+  const budgeted = fitManifestToBudget(manifest, outDir, appCfg);
+  const manifestOut = budgeted.manifest;
   const manifestTmp = path.join(outDir, 'manifest.json.tmp');
-  fs.writeFileSync(manifestTmp, JSON.stringify(manifest, null, 2), 'utf8');
+  fs.writeFileSync(manifestTmp, JSON.stringify(manifestOut, null, 2), 'utf8');
 
-  atomicReplace(homeTmp, path.join(outDir, 'home.html'));
   atomicReplace(manifestTmp, path.join(outDir, 'manifest.json'));
+  const compressed = writeCompressedManifest(outDir, manifestOut);
+  const compressedTotal = compressed.reduce((sum, entry) => sum + Number(entry.size || 0), 0);
   return {
     id: appCfg.id,
     mode: 'incremental-update',
-    count: manifest.length,
+    count: manifestOut.length,
     changed: diff.changed,
     homeChanged: diff.homeChanged,
     addedCount: diff.addedCount,
     removedCount: diff.removedCount,
     downloaded: downloaded.length,
     skipped: skipped.length,
+    skippedByPolicy: skippedByPolicy.length,
+    skippedByConfig: skippedByConfig.length,
+    skippedByBudget: budgeted.skipped.length,
+    kb: Math.round(budgeted.total / 1024),
+    compressedKB: Math.round(compressedTotal / 1024),
     builtAt: new Date().toISOString()
   };
 }
@@ -320,36 +536,68 @@ async function buildServerCache(appCfg) {
   const discovered = await discoverResources(appCfg); // 通用发现(Next + CRA/AEM 等)
 
   const outDir = path.join(BUNDLES_DIR, appCfg.id);
-  fs.rmSync(outDir, { recursive: true, force: true });
-  fs.mkdirSync(outDir, { recursive: true });
+  const tmpDir = path.join(BUNDLES_DIR, `.${appCfg.id}.build-${process.pid}-${Date.now()}`);
+  fs.rmSync(tmpDir, { recursive: true, force: true });
+  fs.mkdirSync(tmpDir, { recursive: true });
+  const requiredUrls = configuredBundleUrls(appCfg);
 
   const manifest = [];
   const homeEntry = discovered.resources.find((e) => e.file === 'home.html');
-  fs.writeFileSync(path.join(outDir, 'home.html'), discovered.html, 'utf8');
-  // hash:内容指纹,设备据此判断该文件是否需要更新(同 URL 内容变了 → hash 变)
-  manifest.push({ url: homeEntry ? homeEntry.url : origin + '/', file: 'home.html', mime: 'text/html', hash: sha256(discovered.html) });
+  let total = 0;
+  if (appCfg.swrDoc === true) {
+    fs.writeFileSync(path.join(tmpDir, 'home.html'), discovered.html, 'utf8');
+    // hash:内容指纹,设备据此判断该文件是否需要更新(同 URL 内容变了 → hash 变)
+    const home = manifestEntry(homeEntry || { url: origin + '/', file: 'home.html', mime: 'text/html' }, tmpDir);
+    manifest.push(home);
+    total += home.size;
+  }
 
   // 体积上限:资源已按 rank 排序(css/js 在前、字体在后),超预算就跳过 → 砍掉的主要是靠后的字体
   // (字体非首屏关键,文字先用系统字体显示,真正用到时再走运行时缓存)
-  const BUDGET = 5 * 1024 * 1024;
-  let total = 0, failed = 0, skipped = 0;
+  const BUDGET = bundleBudgetBytes(appCfg);
+  let failed = 0, skipped = 0, skippedByPolicy = 0, skippedByConfig = 0;
+  const requiredFailed = [];
   for (const e of discovered.resources) {
     if (e.file === 'home.html') continue;
+    if (isBundleExcluded(appCfg, e.url)) { skippedByConfig++; continue; }
     try {
+      const started = Date.now();
       const res = await fetch(e.sourceUrl, { headers: { 'User-Agent': UA } });
-      if (!res.ok) { failed++; continue; }
+      if (!res.ok) {
+        failed++;
+        if (requiredUrls.has(e.url)) requiredFailed.push({ url: e.url, error: `${res.status}` });
+        continue;
+      }
       const len = parseInt(res.headers.get('content-length') || '0', 10);
       if (len > 0 && total + len > BUDGET) { skipped++; try { await res.body?.cancel(); } catch {} continue; }
       const buf = Buffer.from(await res.arrayBuffer());
-      if (!buf.length) { failed++; continue; }
+      if (!buf.length) {
+        failed++;
+        if (requiredUrls.has(e.url)) requiredFailed.push({ url: e.url, error: 'empty response' });
+        continue;
+      }
+      validateDownloaded(e, res, buf);
+      const costMs = Date.now() - started;
+      if (!requiredUrls.has(e.url) && !shouldKeepStaticByPolicy(appCfg, e.url, buf.length, costMs)) { skippedByPolicy++; continue; }
       if (total + buf.length > BUDGET) { skipped++; continue; }
       total += buf.length;
-      fs.writeFileSync(path.join(outDir, e.file), buf);
-      manifest.push({ url: e.url, file: e.file, mime: e.mime, hash: sha256(buf) });
-    } catch { failed++; }
+      fs.writeFileSync(path.join(tmpDir, e.file), buf);
+      manifest.push(manifestEntry(e, tmpDir, { size: buf.length, hash: sha256(buf), costMs }));
+    } catch (err) {
+      failed++;
+      if (requiredUrls.has(e.url)) requiredFailed.push({ url: e.url, error: String(err && err.message || err) });
+    }
   }
-  fs.writeFileSync(path.join(outDir, 'manifest.json'), JSON.stringify(manifest, null, 2), 'utf8');
-  return { id: appCfg.id, count: manifest.length, discovered: discovered.resources.length, failed, skipped, kb: Math.round(total / 1024), builtAt: new Date().toISOString(), mode: 'server-cache' };
+  if (requiredFailed.length > 0) {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+    throw new Error(`关键固定资源下载失败,保留旧离线包: ${requiredFailed.slice(0, 3).map((e) => e.url).join(', ')}`);
+  }
+  fs.writeFileSync(path.join(tmpDir, 'manifest.json'), JSON.stringify(manifest, null, 2), 'utf8');
+  const compressed = writeCompressedManifest(tmpDir, manifest);
+  const compressedTotal = compressed.reduce((sum, entry) => sum + Number(entry.size || 0), 0);
+  fs.rmSync(outDir, { recursive: true, force: true });
+  fs.renameSync(tmpDir, outDir);
+  return { id: appCfg.id, count: manifest.length, discovered: discovered.resources.length, failed, skipped, skippedByPolicy, skippedByConfig, kb: Math.round(total / 1024), compressedKB: Math.round(compressedTotal / 1024), builtAt: new Date().toISOString(), mode: 'server-cache' };
 }
 
 function buildCacheManifest(appCfg) {
@@ -358,8 +606,20 @@ function buildCacheManifest(appCfg) {
     throw new Error(`服务器缓存目录不存在: ${outDir}`);
   }
   const previous = readManifestByFile(outDir);
+  const configuredByFile = new Map();
+  const configuredUrls = [
+    ...(Array.isArray(appCfg.bundleExtraUrls) ? appCfg.bundleExtraUrls : []),
+    ...(Array.isArray(appCfg.bundleExcludeUrls) ? appCfg.bundleExcludeUrls : [])
+  ];
+  for (const ref of configuredUrls) {
+    try {
+      const u = new URL(ref, appCfg.url).href;
+      configuredByFile.set(fileNameForPath(u), u);
+    } catch {}
+  }
   const files = fs.readdirSync(outDir)
-    .filter((f) => f !== 'manifest.json' && fs.statSync(path.join(outDir, f)).isFile())
+    .filter((f) => !/^manifest\.(?:json|br\.json|gz\.json|zz\.json)$/.test(f) &&
+      !/\.(?:br|gz|zz)$/.test(f) && fs.statSync(path.join(outDir, f)).isFile())
     .sort((a, b) => {
       const ra = cacheFileRank(a), rb = cacheFileRank(b);
       return ra === rb ? a.localeCompare(b) : ra - rb;
@@ -370,15 +630,31 @@ function buildCacheManifest(appCfg) {
   const manifest = [];
   for (const file of files) {
     const old = previous.get(file);
-    const url = old && old.url ? old.url : inferCachedUrl(appCfg, file);
+    const url = old && old.url ? old.url : (configuredByFile.get(file) || inferCachedUrl(appCfg, file));
     if (!url) continue;
-    manifest.push({ url, file, mime: old && old.mime ? old.mime : mimeOf(file) });
+    if (isBundleExcluded(appCfg, url)) continue;
+    manifest.push(manifestEntry({ url, file, mime: old && old.mime ? old.mime : mimeOf(file) }, outDir, old ? {
+      size: old.size,
+      hash: old.hash,
+      costMs: old.costMs
+    } : {}));
   }
   if (!manifest.length) {
     throw new Error('未能从缓存文件推导出任何原站 URL,请保留旧 manifest 或使用 chunks_/css_/media_/home.html 命名');
   }
-  fs.writeFileSync(path.join(outDir, 'manifest.json'), JSON.stringify(manifest, null, 2), 'utf8');
-  return { id: appCfg.id, count: manifest.length, builtAt: new Date().toISOString(), mode: 'cache-manifest' };
+  const budgeted = fitManifestToBudget(manifest, outDir, appCfg);
+  fs.writeFileSync(path.join(outDir, 'manifest.json'), JSON.stringify(budgeted.manifest, null, 2), 'utf8');
+  const compressed = writeCompressedManifest(outDir, budgeted.manifest);
+  const compressedTotal = compressed.reduce((sum, entry) => sum + Number(entry.size || 0), 0);
+  return {
+    id: appCfg.id,
+    count: budgeted.manifest.length,
+    skippedByBudget: budgeted.skipped.length,
+    kb: Math.round(budgeted.total / 1024),
+    compressedKB: Math.round(compressedTotal / 1024),
+    builtAt: new Date().toISOString(),
+    mode: 'cache-manifest'
+  };
 }
 
 // 探测一个站点:抓首页 HTML → 判框架类型 + 提取名称/图标 + 给加速参数建议。

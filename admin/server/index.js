@@ -12,6 +12,7 @@ import cors from 'cors';
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
+import zlib from 'node:zlib';
 import { execFile } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { initDb, dbReady, getPool } from './db.js';
@@ -125,7 +126,7 @@ function defaultConfig() {
       'aem-kakao-collector.onkakao.net', 'aichat.com'
     ],
     settings: {
-      diskCapMB: 64,         // 运行时缓存上限
+      diskCapMB: 160,        // 运行时缓存上限(按 200MB 沙箱预留余量)
       docCheckSec: 60,       // 主文档版本校验节流(秒)
       bundleConcurrency: 8,  // 远程离线包后台下载并发(上限 8)
       prefetchChunks: true,  // 是否预取全站 chunk(Next.js 系有效)
@@ -194,12 +195,24 @@ app.get('/api/config', (req, res) => {
   const c = loadConfig();
   const apps = (c.apps || []).map((a) => {
     const mfPath = path.join(BUNDLES_DIR, a.id, 'manifest.json');
+    const compressedMfPath = path.join(BUNDLES_DIR, a.id, 'manifest.zz.json');
     const hasBundle = fs.existsSync(mfPath);
     if (a.bundle && hasBundle) {
       // bundleVersion = 清单内容指纹:清单一变(资源增删改)它就变,设备据此判断"要不要更新离线包"
       let bundleVersion = '';
+      let compressedBundleVersion = '';
       try { bundleVersion = crypto.createHash('sha256').update(fs.readFileSync(mfPath)).digest('hex').slice(0, 16); } catch {}
-      return Object.assign({}, a, { manifestUrl: `/bundles/${a.id}/manifest.json`, bundleVersion });
+      const extra = { manifestUrl: `/bundles/${a.id}/manifest.json`, bundleVersion };
+      if (fs.existsSync(compressedMfPath)) {
+        try {
+          compressedBundleVersion = crypto.createHash('sha256').update(fs.readFileSync(compressedMfPath)).digest('hex').slice(0, 16);
+        } catch {}
+        Object.assign(extra, {
+          compressedManifestUrl: `/bundles/${a.id}/manifest.zz.json`,
+          compressedBundleVersion
+        });
+      }
+      return Object.assign({}, a, extra);
     }
     return a;
   });
@@ -454,21 +467,306 @@ app.put('/api/admin/settings', (req, res) => {
   const c = loadConfig(); c.settings = req.body.settings || {}; res.json(saveConfig(c));
 });
 
+function readJsonArray(file) {
+  try {
+    const arr = JSON.parse(fs.readFileSync(file, 'utf8'));
+    return Array.isArray(arr) ? arr : [];
+  } catch {
+    return [];
+  }
+}
+
+function safeBundlePath(dir, file) {
+  const root = path.resolve(dir);
+  const p = path.resolve(dir, String(file || ''));
+  if (p !== root && p.startsWith(root + path.sep)) return p;
+  return '';
+}
+
+function isCompressibleResource(mime, file) {
+  const m = String(mime || '').toLowerCase();
+  const f = String(file || '').toLowerCase();
+  return m.startsWith('text/') ||
+    m.includes('javascript') ||
+    m.includes('json') ||
+    m.includes('xml') ||
+    f.endsWith('.js') ||
+    f.endsWith('.mjs') ||
+    f.endsWith('.css') ||
+    f.endsWith('.html') ||
+    f.endsWith('.svg');
+}
+
+function compressionEstimate(buf) {
+  try {
+    const gzip = zlib.gzipSync(buf, { level: 6 }).length;
+    const br = zlib.brotliCompressSync(buf, {
+      params: { [zlib.constants.BROTLI_PARAM_QUALITY]: 5 }
+    }).length;
+    return { gzip, br };
+  } catch {
+    return { gzip: 0, br: 0 };
+  }
+}
+
+function mimeOfPath(u) {
+  const p = String(u || '').split('?')[0].toLowerCase();
+  if (p.endsWith('.js') || p.endsWith('.mjs')) return 'application/javascript';
+  if (p.endsWith('.css')) return 'text/css';
+  if (p.endsWith('.html')) return 'text/html';
+  if (p.endsWith('.png')) return 'image/png';
+  if (p.endsWith('.jpg') || p.endsWith('.jpeg')) return 'image/jpeg';
+  if (p.endsWith('.webp')) return 'image/webp';
+  if (p.endsWith('.avif')) return 'image/avif';
+  if (p.endsWith('.gif')) return 'image/gif';
+  if (p.endsWith('.svg')) return 'image/svg+xml';
+  if (p.endsWith('.woff2')) return 'font/woff2';
+  if (p.endsWith('.woff')) return 'font/woff';
+  if (p.endsWith('.ttf')) return 'font/ttf';
+  if (p.endsWith('.otf')) return 'font/otf';
+  return 'application/octet-stream';
+}
+
+function fileNameForUrl(u) {
+  let p = String(u || '').split('?')[0];
+  try {
+    const parsed = new URL(u);
+    p = parsed.host + parsed.pathname;
+  } catch {}
+  if (p.startsWith('/_next/static/')) return p.slice('/_next/static/'.length).replace(/\//g, '_');
+  return p.replace(/^\//, '').replace(/[^A-Za-z0-9._-]+/g, '_');
+}
+
+function matchesPattern(url, pattern) {
+  if (!pattern) return false;
+  const u = String(url).toLowerCase();
+  const p = String(pattern).toLowerCase();
+  if (!p.includes('*')) return u.includes(p);
+  const parts = p.split('*').filter(Boolean);
+  if (!parts.length) return true;
+  if (!p.startsWith('*') && !u.startsWith(parts[0])) return false;
+  let pos = 0;
+  for (const part of parts) {
+    const idx = u.indexOf(part, pos);
+    if (idx < 0) return false;
+    pos = idx + part.length;
+  }
+  if (!p.endsWith('*') && !u.endsWith(parts[parts.length - 1])) return false;
+  return true;
+}
+
+function matchesAny(url, patterns) {
+  return Array.isArray(patterns) && patterns.some((p) => matchesPattern(url, p));
+}
+
+function bundleInfo(id, appCfg) {
+  const dir = path.join(BUNDLES_DIR, id);
+  const mf = path.join(dir, 'manifest.json');
+  if (!fs.existsSync(mf)) return null;
+  const stat = fs.statSync(mf);
+  const manifest = readJsonArray(mf);
+  const compressedMf = path.join(dir, 'manifest.zz.json');
+  const compressedManifest = fs.existsSync(compressedMf) ? readJsonArray(compressedMf) : [];
+  const compressedByUrl = new Map();
+  for (const item of compressedManifest) {
+    if (item && item.url) compressedByUrl.set(item.url, item);
+  }
+  const resources = [];
+  const byUrl = new Set();
+  const excludes = appCfg && Array.isArray(appCfg.bundleExcludeUrls) ? appCfg.bundleExcludeUrls : [];
+  let resourceBytes = 0;
+  let compressedResourceBytes = 0;
+  let compressibleBytes = 0;
+  let gzipBytes = 0;
+  let brBytes = 0;
+  for (const item of manifest) {
+    if (!item || !item.file) continue;
+    const p = safeBundlePath(dir, item.file);
+    const exists = p && fs.existsSync(p) && fs.statSync(p).isFile();
+    const size = exists ? fs.statSync(p).size : Number(item.size || 0);
+    const mime = item.mime || '';
+    const compressible = exists && isCompressibleResource(mime, item.file);
+    let gzipSize = 0;
+    let brSize = 0;
+    if (compressible && size <= 10 * 1024 * 1024) {
+      const est = compressionEstimate(fs.readFileSync(p));
+      gzipSize = est.gzip;
+      brSize = est.br;
+      compressibleBytes += size;
+      gzipBytes += gzipSize;
+      brBytes += brSize;
+    }
+    resourceBytes += size;
+    const compressedItem = compressedByUrl.get(item.url || '');
+    let storedFile = item.file;
+    let storedSize = size;
+    let encoding = '';
+    if (compressedItem && compressedItem.file) {
+      const sp = safeBundlePath(dir, compressedItem.file);
+      storedFile = compressedItem.file;
+      storedSize = sp && fs.existsSync(sp) && fs.statSync(sp).isFile()
+        ? fs.statSync(sp).size
+        : Number(compressedItem.size || size);
+      encoding = compressedItem.encoding || '';
+    }
+    compressedResourceBytes += storedSize;
+    byUrl.add(item.url || '');
+    resources.push({
+      url: item.url || '',
+      file: item.file,
+      storedFile,
+      mime,
+      size,
+      sizeKB: Math.round(size / 102.4) / 10,
+      storedSize,
+      storedSizeKB: Math.round(storedSize / 102.4) / 10,
+      encoding,
+      hash: item.hash || '',
+      costMs: item.costMs || 0,
+      enabled: !(appCfg && matchesAny(item.url || '', excludes)),
+      inManifest: true,
+      configured: appCfg && Array.isArray(appCfg.bundleExtraUrls) ? matchesAny(item.url || '', appCfg.bundleExtraUrls) : false,
+      compressible,
+      gzipSize,
+      gzipKB: gzipSize ? Math.round(gzipSize / 102.4) / 10 : 0,
+      brSize,
+      brKB: brSize ? Math.round(brSize / 102.4) / 10 : 0
+    });
+  }
+  const configuredUrls = [
+    ...(appCfg && Array.isArray(appCfg.bundleExtraUrls) ? appCfg.bundleExtraUrls : []),
+    ...excludes
+  ];
+  for (const url of configuredUrls) {
+    if (!url || byUrl.has(url)) continue;
+    const file = fileNameForUrl(url);
+    const p = safeBundlePath(dir, file);
+    const exists = p && fs.existsSync(p) && fs.statSync(p).isFile();
+    const size = exists ? fs.statSync(p).size : 0;
+    const mime = mimeOfPath(file || url);
+    resources.push({
+      url,
+      file,
+      mime,
+      size,
+      sizeKB: Math.round(size / 102.4) / 10,
+      storedSize: size,
+      storedSizeKB: Math.round(size / 102.4) / 10,
+      encoding: '',
+      hash: '',
+      costMs: 0,
+      enabled: !matchesAny(url, excludes),
+      inManifest: false,
+      configured: true,
+      compressible: exists && isCompressibleResource(mime, file),
+      gzipSize: 0,
+      gzipKB: 0,
+      brSize: 0,
+      brKB: 0
+    });
+  }
+  const serverBytes = fs.readdirSync(dir)
+    .reduce((s, f) => s + fs.statSync(path.join(dir, f)).size, 0);
+  return {
+    id,
+    name: appCfg && appCfg.name ? appCfg.name : id,
+    url: appCfg && appCfg.url ? appCfg.url : '',
+    count: resources.length,
+    sizeBytes: resourceBytes,
+    sizeKB: Math.round(resourceBytes / 102.4) / 10,
+    compressedSizeBytes: compressedResourceBytes,
+    compressedSizeKB: Math.round(compressedResourceBytes / 102.4) / 10,
+    serverSizeKB: Math.round(serverBytes / 102.4) / 10,
+    bundleMaxSizeKB: appCfg && appCfg.bundleMaxSizeKB ? appCfg.bundleMaxSizeKB : 5120,
+    configuredExtraCount: appCfg && Array.isArray(appCfg.bundleExtraUrls) ? appCfg.bundleExtraUrls.length : 0,
+    builtAt: stat.mtime,
+    manifestUrl: `/bundles/${id}/manifest.json`,
+    config: {
+      bundle: appCfg ? appCfg.bundle === true : false,
+      swrDoc: appCfg ? appCfg.swrDoc !== false : false,
+      prerender: appCfg ? appCfg.prerender !== false : false,
+      bundleMaxSizeKB: appCfg && appCfg.bundleMaxSizeKB ? appCfg.bundleMaxSizeKB : 5120,
+      bundleExtraUrls: appCfg && Array.isArray(appCfg.bundleExtraUrls) ? appCfg.bundleExtraUrls : [],
+      bundleExcludeUrls: appCfg && Array.isArray(appCfg.bundleExcludeUrls) ? appCfg.bundleExcludeUrls : [],
+      staticCache: appCfg && appCfg.staticCache ? appCfg.staticCache : null
+    },
+    compression: {
+      compressibleKB: Math.round(compressibleBytes / 102.4) / 10,
+      gzipKB: Math.round(gzipBytes / 102.4) / 10,
+      brKB: Math.round(brBytes / 102.4) / 10,
+      brSavingKB: Math.round(Math.max(0, compressibleBytes - brBytes) / 102.4) / 10,
+      enabled: compressedManifest.length > 0,
+      storedKB: Math.round(compressedResourceBytes / 102.4) / 10,
+      rawKB: Math.round(resourceBytes / 102.4) / 10,
+      savingKB: Math.round(Math.max(0, resourceBytes - compressedResourceBytes) / 102.4) / 10
+    },
+    resources
+  };
+}
+
 // 已生成缓存清单的离线资源列表
 app.get('/api/admin/bundles', (req, res) => {
   const out = [];
+  const cfg = loadConfig();
+  const seen = new Set();
+  for (const appCfg of (cfg.apps || [])) {
+    if (!appCfg || !appCfg.id) continue;
+    seen.add(appCfg.id);
+    const info = bundleInfo(appCfg.id, appCfg);
+    out.push(info || {
+      id: appCfg.id,
+      name: appCfg.name || appCfg.id,
+      url: appCfg.url || '',
+      count: 0,
+      sizeBytes: 0,
+      sizeKB: 0,
+      compressedSizeBytes: 0,
+      compressedSizeKB: 0,
+      serverSizeKB: 0,
+      bundleMaxSizeKB: appCfg.bundleMaxSizeKB || 5120,
+      configuredExtraCount: Array.isArray(appCfg.bundleExtraUrls) ? appCfg.bundleExtraUrls.length : 0,
+      builtAt: null,
+      manifestUrl: `/bundles/${appCfg.id}/manifest.json`,
+      config: {
+        bundle: appCfg.bundle === true,
+        swrDoc: appCfg.swrDoc !== false,
+        prerender: appCfg.prerender !== false,
+        bundleMaxSizeKB: appCfg.bundleMaxSizeKB || 5120,
+        bundleExtraUrls: Array.isArray(appCfg.bundleExtraUrls) ? appCfg.bundleExtraUrls : [],
+        bundleExcludeUrls: Array.isArray(appCfg.bundleExcludeUrls) ? appCfg.bundleExcludeUrls : [],
+        staticCache: appCfg.staticCache || null
+      },
+      compression: { compressibleKB: 0, gzipKB: 0, brKB: 0, brSavingKB: 0, enabled: false, storedKB: 0, rawKB: 0, savingKB: 0 },
+      resources: []
+    });
+  }
   for (const id of fs.readdirSync(BUNDLES_DIR)) {
-    const mf = path.join(BUNDLES_DIR, id, 'manifest.json');
-    if (fs.existsSync(mf)) {
-      const stat = fs.statSync(mf);
-      let count = 0;
-      try { count = JSON.parse(fs.readFileSync(mf, 'utf8')).length; } catch {}
-      const size = fs.readdirSync(path.join(BUNDLES_DIR, id))
-        .reduce((s, f) => s + fs.statSync(path.join(BUNDLES_DIR, id, f)).size, 0);
-      out.push({ id, count, sizeKB: Math.round(size / 1024), builtAt: stat.mtime, manifestUrl: `/bundles/${id}/manifest.json` });
-    }
+    if (seen.has(id) || id.startsWith('.')) continue;
+    const appCfg = (cfg.apps || []).find((a) => a.id === id);
+    const info = bundleInfo(id, appCfg);
+    if (info) out.push(info);
   }
   res.json(out);
+});
+
+// 单个离线包资源开关:关闭=加入该站 bundleExcludeUrls,然后重生成 manifest;开启=从排除列表移除。
+app.put('/api/admin/bundles/:id/resource', async (req, res) => {
+  const c = loadConfig();
+  const appCfg = (c.apps || []).find((a) => a.id === req.params.id);
+  if (!appCfg) return res.status(404).json({ error: 'app not found' });
+  const url = String(req.body && req.body.url || '').trim();
+  const enabled = req.body && req.body.enabled === true;
+  if (!/^https?:\/\//.test(url)) return res.status(400).json({ error: 'bad url' });
+  const list = Array.isArray(appCfg.bundleExcludeUrls) ? appCfg.bundleExcludeUrls.slice() : [];
+  const next = enabled ? list.filter((x) => x !== url) : (list.includes(url) ? list : list.concat(url));
+  appCfg.bundleExcludeUrls = next;
+  saveConfig(c);
+  try {
+    await runCacheBuilder('manifest', appCfg.id);
+  } catch (e) {
+    return res.status(500).json({ error: String(e && e.message || e) });
+  }
+  res.json({ ok: true, bundle: bundleInfo(appCfg.id, appCfg), bundleExcludeUrls: next });
 });
 
 // 检查源站是否有新资源:访问目标站并对比当前 manifest,不写缓存文件。

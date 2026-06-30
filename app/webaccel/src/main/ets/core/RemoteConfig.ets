@@ -9,6 +9,16 @@ import BuildProfile from '../../../../BuildProfile'; // SDK 自己的生成文�
 const TAG: string = 'RemoteConfig';
 const DOMAIN: number = 0x0001;
 
+/** 静态资源缓存策略:控制哪些运行时静态资源值得写入沙箱 */
+export interface StaticCachePolicy {
+  enabled?: boolean;       // false=不写运行时静态资源缓存(离线包资源仍按 manifest 处理)
+  minSizeKB?: number;      // 大于等于该体积才缓存;0/不填=不按体积过滤
+  minDurationMs?: number;  // 下载耗时大于等于该值才缓存;0/不填=不按耗时过滤
+  maxSizeKB?: number;      // 大于该体积不缓存;0/不填=不设上限
+  include?: string[];      // 命中即缓存(子串匹配;支持 * 通配)
+  exclude?: string[];      // 命中即不缓存(子串匹配;支持 * 通配)
+}
+
 /** 一个网页应用(对应后台「应用管理」一条) */
 export interface RemoteApp {
   id: string;
@@ -21,6 +31,10 @@ export interface RemoteApp {
   bundle?: boolean;
   manifestUrl?: string;  // 后台下发:启用离线包且已打包时才有,App 据此去服务器下载
   bundleVersion?: string; // 离线包清单指纹:后台下发,设备据此判断"要不要更新本地离线包"
+  compressedManifestUrl?: string; // 新端优先使用:可压缩资源以 zlib 存沙箱,旧端忽略
+  compressedBundleVersion?: string; // 压缩清单指纹:避免与旧端原始清单版本互相污染
+  bundleExtraUrls?: string[]; // 后台构建离线包时手动纳入的固定静态资源 URL(如跨域固定背景图)
+  bundleExcludeUrls?: string[]; // 后台构建离线包时排除的静态资源 URL(用于控制沙箱占用)
   extraBlockHosts?: string[]; // 每应用额外黑名单:只对本应用生效,叠加在全局 blockHosts 之上
   prefetchChunks?: boolean;   // 每应用 chunk 预取开关:覆盖全局 settings.prefetchChunks(不下发=用全局)
   preconnectHosts?: string[]; // 每应用额外预连接域:开机提前对这些CDN/接口域做DNS+TLS握手,点进去时资源直连不等握手。
@@ -28,6 +42,7 @@ export interface RemoteApp {
   userAgent?: string;         // 每应用自定义 UA:覆盖该应用 origin 下的 UA。某些站(如 bilibili.tv 国际版)按 UA 判断
                               // 手机/桌面分支,默认追加 Mobile 反而触发不适配/白屏 → 给它单独下发桌面 UA。
                               // 不下发=维持 SDK 默认"不含 Mobile 则追加 Mobile"的手机化逻辑。后台按站配置,不硬编码。
+  staticCache?: StaticCachePolicy; // 每应用运行时静态资源缓存策略:优先缓存大资源/慢资源,排除低价值资源。
 }
 
 export interface RemoteSettings {
@@ -36,6 +51,7 @@ export interface RemoteSettings {
   bundleConcurrency?: number;
   prefetchChunks?: boolean;  // 是否预取全站 chunk(Next.js 系站点有效;非 Next 站自动无操作)。默认 true
   bytecodeCache?: boolean;
+  staticCache?: StaticCachePolicy; // 全局默认静态资源缓存策略;每应用 staticCache 可覆盖/叠加。
 }
 
 /** 任务派发:后台下发的待探索清单 + 共识阈值 K + 采样率 */
@@ -69,7 +85,7 @@ function fallbackConfig(): RemoteConfigData {
     version: '',
     apps: [],
     blockHosts: [],
-    settings: { diskCapMB: 64, docCheckSec: 60, bundleConcurrency: 3, bytecodeCache: true }
+    settings: { diskCapMB: 160, docCheckSec: 60, bundleConcurrency: 3, bytecodeCache: true }
   };
 }
 

@@ -28,14 +28,27 @@ onMounted(loadBundles);
 
 function emptyForm() {
   return { id: '', name: '', url: '', routesText: '/', swrDoc: true, prerender: true, codeCache: true, bundle: true,
-    prefetchChunks: true, extraBlockHostsText: '', preconnectHostsText: '', userAgent: '' };
+    prefetchChunks: true, extraBlockHostsText: '', preconnectHostsText: '', userAgent: '',
+    bundleExtraUrlsText: '', bundleExcludeUrlsText: '', bundleMaxSizeKB: 5120,
+    staticCacheEnabled: true, staticCacheMinSizeKB: 64, staticCacheMinDurationMs: 800, staticCacheMaxSizeKB: 5120,
+    staticCacheIncludeText: '', staticCacheExcludeText: '' };
 }
 function openAdd() { editing.value = null; form.value = emptyForm(); dialog.value = true; }
 function openEdit(row) {
+  const staticCache = row.staticCache || {};
   editing.value = row.id;
   form.value = { ...emptyForm(), ...row, routesText: (row.routes || []).join('\n'),
     extraBlockHostsText: (row.extraBlockHosts || []).join('\n'),
-    preconnectHostsText: (row.preconnectHosts || []).join('\n') };
+    preconnectHostsText: (row.preconnectHosts || []).join('\n'),
+    bundleExtraUrlsText: (row.bundleExtraUrls || []).join('\n'),
+    bundleExcludeUrlsText: (row.bundleExcludeUrls || []).join('\n'),
+    bundleMaxSizeKB: row.bundleMaxSizeKB ?? 5120,
+    staticCacheEnabled: staticCache.enabled !== false,
+    staticCacheMinSizeKB: staticCache.minSizeKB ?? 64,
+    staticCacheMinDurationMs: staticCache.minDurationMs ?? 800,
+    staticCacheMaxSizeKB: staticCache.maxSizeKB ?? 5120,
+    staticCacheIncludeText: (staticCache.include || []).join('\n'),
+    staticCacheExcludeText: (staticCache.exclude || []).join('\n') };
   dialog.value = true;
 }
 
@@ -72,9 +85,20 @@ async function submit() {
     routes: form.value.routesText.split('\n').map((s) => s.trim()).filter(Boolean),
     swrDoc: form.value.swrDoc, prerender: form.value.prerender, codeCache: form.value.codeCache, bundle: form.value.bundle,
     prefetchChunks: form.value.prefetchChunks,
+    bundleMaxSizeKB: Number(form.value.bundleMaxSizeKB || 0),
     extraBlockHosts: (form.value.extraBlockHostsText || '').split('\n').map((s) => s.trim()).filter(Boolean),
     preconnectHosts: (form.value.preconnectHostsText || '').split('\n').map((s) => s.trim()).filter(Boolean),
-    userAgent: (form.value.userAgent || '').trim()  // 自定义UA:空=用默认(不含Mobile则自动追加Mobile);填了=整体替换该站UA
+    bundleExtraUrls: (form.value.bundleExtraUrlsText || '').split('\n').map((s) => s.trim()).filter(Boolean),
+    bundleExcludeUrls: (form.value.bundleExcludeUrlsText || '').split('\n').map((s) => s.trim()).filter(Boolean),
+    userAgent: (form.value.userAgent || '').trim(),  // 自定义UA:空=用默认(不含Mobile则自动追加Mobile);填了=整体替换该站UA
+    staticCache: {
+      enabled: form.value.staticCacheEnabled,
+      minSizeKB: Number(form.value.staticCacheMinSizeKB || 0),
+      minDurationMs: Number(form.value.staticCacheMinDurationMs || 0),
+      maxSizeKB: Number(form.value.staticCacheMaxSizeKB || 0),
+      include: (form.value.staticCacheIncludeText || '').split('\n').map((s) => s.trim()).filter(Boolean),
+      exclude: (form.value.staticCacheExcludeText || '').split('\n').map((s) => s.trim()).filter(Boolean)
+    }
   };
   const list = [...apps.value];
   const idx = list.findIndex((a) => a.id === editing.value);
@@ -230,6 +254,42 @@ async function generateManifest(row) {
         <el-form-item label="预连接域">
           <el-input v-model="form.preconnectHostsText" type="textarea" :rows="2"
             placeholder="该站资源/接口所在的跨域CDN域(每行一个),开机提前做DNS+TLS握手,点进去时资源直连不等握手。如视频/JS渲染站(主文档空、资源在跨域CDN)填其CDN域,能压短白屏。例:s1.hdslb.com" />
+        </el-form-item>
+        <el-form-item label="固定资源">
+          <el-input v-model="form.bundleExtraUrlsText" type="textarea" :rows="3"
+            placeholder="每行一个确认固定的静态资源 URL。用于把跨域大背景图/主图纳入离线包;小图和频繁变化的运营图不要放。" />
+        </el-form-item>
+        <el-form-item label="排除资源">
+          <el-input v-model="form.bundleExcludeUrlsText" type="textarea" :rows="3"
+            placeholder="每行一个不进离线包的静态资源 URL。也可以在「离线包」页明细里直接关闭某个资源。" />
+        </el-form-item>
+        <el-form-item label="离线包上限">
+          <el-input-number v-model="form.bundleMaxSizeKB" :min="0" :max="204800" :step="512" controls-position="right" />
+          <div class="muted" style="font-size:12px; margin-top:4px">
+            单个应用离线包资源总量上限,单位 KB。0 表示不限制;建议按 200MB 沙箱预留空间,每站单独控制。
+          </div>
+        </el-form-item>
+        <el-form-item label="静态缓存">
+          <el-switch v-model="form.staticCacheEnabled" active-text="启用" inactive-text="关闭" />
+          <div class="muted" style="font-size:12px; margin-top:4px">
+            控制运行时缓存和离线包构建时哪些静态资源进沙箱。建议只保留大资源/慢资源,避免 200MB 沙箱被小碎片占满。
+          </div>
+        </el-form-item>
+        <el-form-item label="缓存阈值">
+          <div style="display:grid; grid-template-columns:1fr 1fr 1fr; gap:8px; width:100%">
+            <el-input-number v-model="form.staticCacheMinSizeKB" :min="0" :max="20480" :step="16" controls-position="right" />
+            <el-input-number v-model="form.staticCacheMinDurationMs" :min="0" :max="30000" :step="100" controls-position="right" />
+            <el-input-number v-model="form.staticCacheMaxSizeKB" :min="0" :max="51200" :step="256" controls-position="right" />
+          </div>
+          <div class="muted" style="font-size:12px">依次为:最小体积KB / 最小耗时ms / 单资源最大KB。命中体积或耗时任一条件即缓存。</div>
+        </el-form-item>
+        <el-form-item label="强制缓存">
+          <el-input v-model="form.staticCacheIncludeText" type="textarea" :rows="2"
+            placeholder="每行一个 URL 子串或 * 通配。命中即缓存,不受阈值限制。如 /files/art/js/bundle.min.js" />
+        </el-form-item>
+        <el-form-item label="禁止缓存">
+          <el-input v-model="form.staticCacheExcludeText" type="textarea" :rows="2"
+            placeholder="每行一个 URL 子串或 * 通配。命中即不缓存,优先级最高。如 analytics、/ga.js、*.map" />
         </el-form-item>
         <el-form-item label="自定义UA">
           <el-input v-model="form.userAgent" type="textarea" :rows="2"

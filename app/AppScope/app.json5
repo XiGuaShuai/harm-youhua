@@ -1,8 +1,8 @@
 {
   "app": {
-    // 整个包是元服务(Atomic Service,免安装)。配合 entry/module.json5 的 installationFree:true。
+    // 整个包是元服�?Atomic Service,免安�?。配�?entry/module.json5 �?installationFree:true�?
     "bundleType": "atomicService",
-    "bundleName": "com.atomicservice.6917607803528486696",
+    "bundleName": "com.atomicservice.6917596829912522753",
     "vendor": "example",
     "versionCode": 1000000,
     "versionName": "1.0.0",

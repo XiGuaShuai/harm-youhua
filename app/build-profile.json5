@@ -5,13 +5,13 @@
         "name": "default",
         "type": "HarmonyOS",
         "material": {
-          "certpath": "C:\\Users\\pzx\\.ohos\\config\\default_app_oS2iV_eFMcf8exyjFlIthIJ23O9gz-sveJtzy1yKSjk=.cer",
+          "certpath": "C:\\Users\\admin\\.ohos\\config\\default_pin2atm_yasifPaGMNePFt6v8COKQw5Bvm20KJ2ps4ReeGKCoas=.cer",
           "keyAlias": "debugKey",
-          "keyPassword": "0000001BF53AE35072317EE19F2E2A5CFBA957F9AA3C250CF0871B9C07AE489560C3BDAF0CD8FC99D42B64",
-          "profile": "C:\\Users\\pzx\\.ohos\\config\\default_app_oS2iV_eFMcf8exyjFlIthIJ23O9gz-sveJtzy1yKSjk=.p7b",
+          "keyPassword": "0000001BF91D3BA17BE2FBC088367FA1F937D32ABAC7086B2B3F3DA945214991A99AABFA7740DF713930CD",
+          "profile": "C:\\Users\\admin\\.ohos\\config\\default_pin2atm_yasifPaGMNePFt6v8COKQw5Bvm20KJ2ps4ReeGKCoas=.p7b",
           "signAlg": "SHA256withECDSA",
-          "storeFile": "C:\\Users\\pzx\\.ohos\\config\\default_app_oS2iV_eFMcf8exyjFlIthIJ23O9gz-sveJtzy1yKSjk=.p12",
-          "storePassword": "0000001BDE59822F6F6359342DDA61B176FC0059B298E4832E4AA4FDC0487E2C49A9E2158CB4599EB28CAF"
+          "storeFile": "C:\\Users\\admin\\.ohos\\config\\default_pin2atm_yasifPaGMNePFt6v8COKQw5Bvm20KJ2ps4ReeGKCoas=.p12",
+          "storePassword": "0000001BDB96A8067984ABCE33D907334B7E974773751F5266AC0E680AB5D2AD8CE14B250B984D6C973EEB"
         }
       }
     ],

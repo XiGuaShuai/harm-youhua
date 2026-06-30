@@ -264,13 +264,17 @@ export class WebPool {
       const a: RemoteApp = apps[i];
       if (a.url === url && a.bundle === true) {
         // manifestUrl 可能是后台下发的全地址,也可能是相对路径;为空则按 id 兜底拼
-        let murl: string = (a.manifestUrl !== undefined && a.manifestUrl.length > 0)
-          ? a.manifestUrl
-          : ('/bundles/' + a.id + '/manifest.json');
+        const useCompressed: boolean = a.compressedManifestUrl !== undefined && a.compressedManifestUrl.length > 0;
+        let murl: string = useCompressed
+          ? (a.compressedManifestUrl as string)
+          : ((a.manifestUrl !== undefined && a.manifestUrl.length > 0) ? a.manifestUrl : ('/bundles/' + a.id + '/manifest.json'));
+        const version: string = useCompressed && a.compressedBundleVersion !== undefined && a.compressedBundleVersion.length > 0
+          ? a.compressedBundleVersion
+          : (a.bundleVersion !== undefined ? a.bundleVersion : '');
         if (murl.indexOf('http://') !== 0 && murl.indexOf('https://') !== 0) {
           murl = server + (murl.charAt(0) === '/' ? murl : ('/' + murl));
         }
-        webCache.loadRemoteBundle(a.url, murl, a.bundleVersion !== undefined ? a.bundleVersion : '');
+        webCache.loadRemoteBundle(a.url, murl, version);
         break;
       }
     }

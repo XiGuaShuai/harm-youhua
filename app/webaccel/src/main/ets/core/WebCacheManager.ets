@@ -4,14 +4,14 @@ import { common } from '@kit.AbilityKit';
 import { util } from '@kit.ArkTS';
 import { resourceManager } from '@kit.LocalizationKit';
 import { webview } from '@kit.ArkWeb';
-import { BusinessError } from '@kit.BasicServicesKit';
+import { BusinessError, zlib } from '@kit.BasicServicesKit';
 import { hilog } from '@kit.PerformanceAnalysisKit';
-import { RemoteSettings, RemoteApp } from './RemoteConfig';
+import { RemoteSettings, RemoteApp, StaticCachePolicy } from './RemoteConfig';
 
 const TAG: string = 'WebCache';
 const DOMAIN: number = 0x0001;
 const RAW_DIR: string = 'webcache';                 // rawfile 下的目录
-const DISK_CAP_BYTES: number = 64 * 1024 * 1024;    // 沙箱运行时缓存总量上限 64MB
+const DISK_CAP_BYTES: number = 160 * 1024 * 1024;   // 沙箱运行时缓存总量上限:按 200MB 沙箱预留余量
 const DOC_CHECK_MS: number = 60 * 1000;             // 主文档版本校验节流:60 秒内不重复校验
 const BUNDLE_CONCURRENCY: number = 8;               // 远程离线包后台下载并发上限(可远程下发覆盖,上限 8)
 
@@ -41,6 +41,9 @@ interface RawEntry {
   url: string;
   file: string;
   mime: string;
+  size?: number;
+  encoding?: string; // zlib: local file is compressed; decode before serving to WebView
+  rawSize?: number;  // 原始大小,仅用于统计/排查
 }
 
 /** 沙箱运行时缓存索引,可写,带 LRU 字段 */
@@ -52,6 +55,10 @@ interface DiskEntry {
   atime: number;    // 最近访问时间,用于 LRU
   storedAt: number; // 最近写入时间,用于主文档版本校验节流
   version: string;  // 内容指纹,用于检测主文档(版本)是否变化
+  costMs?: number;  // 本次写入时的下载耗时,用于评估"慢资源是否值得缓存"
+  source?: string;  // runtime / bundle / doc
+  encoding?: string; // zlib: local file is compressed; decode before serving to WebView
+  rawSize?: number;  // 原始大小,统计用
 }
 
 /** 调试用统计 */
@@ -132,10 +139,12 @@ class WebCacheManager {
   private docCheckMs: number = DOC_CHECK_MS;        // 主文档校验节流(可远程下发)
   private bundleConcurrency: number = BUNDLE_CONCURRENCY; // 远程离线包下载并发(可远程下发)
   private prefetchEnabled: boolean = true;          // 是否预取全站 chunk(可远程下发)
+  private staticCachePolicy: StaticCachePolicy = {}; // 全局运行时静态资源缓存策略
   // 每应用精细配置:按 origin 索引。mergedBlockByOrigin = 全局黑名单 + 该应用 extraBlockHosts(预算好,intercept 热路径直接查)
   private mergedBlockByOrigin: Map<string, string[]> = new Map();
   private prefetchByOrigin: Map<string, boolean> = new Map(); // 该应用的 prefetchChunks 覆盖值
   private uaByOrigin: Map<string, string> = new Map();        // 该应用的自定义 UA(覆盖默认手机化 UA;按 origin 索引)
+  private staticPolicyByOrigin: Map<string, StaticCachePolicy> = new Map(); // 每应用静态资源缓存策略
   private bundleAppByOrigin: Map<string, string> = new Map(); // origin → appId(仅 bundle:true 的站):离线包资源丢失自愈上报用
   private reportedSelfHeal: Set<string> = new Set();          // 已上报过自愈的 appId(本次会话只报一次,防刷)
   private serverBase: string = '';                            // 后端地址(applyApps 时由 remoteConfig.getServer() 注入,自愈上报用)
@@ -158,9 +167,12 @@ class WebCacheManager {
   private docUpdateHandler: ((url: string) => void) | null = null; // 检测到主文档新版本时回调(页面刷新)
   private prefetchedOrigins: Set<string> = new Set();             // 已预取过全部 chunk 的站点
   private loadedBundles: Set<string> = new Set();                 // 本次会话已拉过远程离线包的站点(按 origin)
+  private pendingBundleVersionByOrigin: Map<string, string> = new Map(); // 兜底配置先拉包、远程配置后到时暂存版本号
   private bundleProgress: Map<string, BundleProgressEntry> = new Map(); // 各站离线包下载进度(按 origin)
   private bundleState: Map<string, BundleState> = new Map();      // 各站离线包已应用状态(版本+URL清单,持久化,用于更新检查)
   private bundleStatePath: string = '';                           // bundle-state.json 路径
+  private decodedMemory: Map<string, ArrayBuffer> = new Map();     // decoded compressed bundle bytes; memory only
+  private decoding: Set<string> = new Set();                       // URLs currently being decoded
   private anonId: string = '';                                    // 匿名上报 id(持久化,无个人信息)
   private lastCachedUrl: string = '';                             // 最近被后台缓存的资源 URL(调试浮窗用)
   private recentCached: string[] = [];                            // 最近若干条后台缓存(新→旧,调试浮窗列表用)
@@ -179,6 +191,7 @@ class WebCacheManager {
       this.loadRawManifest();
       this.loadDiskIndex();
       this.loadBundleState();
+      this.warmCompressedDiskEntries();
       this.ready = true;
       hilog.info(DOMAIN, TAG, 'ready, raw=%{public}d disk=%{public}d bytes=%{public}d',
         this.rawIndex.size, this.diskIndex.size, this.totalBytes);
@@ -318,6 +331,7 @@ class WebCacheManager {
     this.mergedBlockByOrigin.clear();
     this.prefetchByOrigin.clear();
     this.uaByOrigin.clear();
+    this.staticPolicyByOrigin.clear();
     this.bundleAppByOrigin.clear();
     if (server && server.length > 0) {
       this.serverBase = server.replace(/\/+$/, '');
@@ -353,6 +367,20 @@ class WebCacheManager {
       // 每应用自定义 UA(非空才记录;覆盖默认手机化逻辑)
       if (app.userAgent && app.userAgent.length > 0) {
         this.uaByOrigin.set(origin, app.userAgent);
+      }
+      // 每应用运行时静态资源缓存策略(按 origin 生效)
+      if (app.staticCache) {
+        this.staticPolicyByOrigin.set(origin, app.staticCache);
+        if (app.bundleExtraUrls && app.bundleExtraUrls.length > 0) {
+          for (let j = 0; j < app.bundleExtraUrls.length; j++) {
+            const ref: string = app.bundleExtraUrls[j];
+            const rm: RegExpMatchArray | null = ref ? ref.match(/^https?:\/\/[^\/]+/) : null;
+            const resourceOrigin: string = rm ? rm[0] : '';
+            if (resourceOrigin.length > 0) {
+              this.staticPolicyByOrigin.set(resourceOrigin, app.staticCache);
+            }
+          }
+        }
       }
       // 仅 bundle:true 的站记 origin→appId,用于"离线包资源实际读不出→上报后台自愈"
       if (app.bundle === true && app.id && app.id.length > 0) {
@@ -391,6 +419,124 @@ class WebCacheManager {
     return '';
   }
 
+  /** 合并全局 + 每应用静态资源缓存策略。数组类规则叠加,数值/开关由每应用覆盖全局 */
+  private staticPolicyFor(url: string): StaticCachePolicy {
+    const out: StaticCachePolicy = {};
+    this.mergeStaticPolicy(out, this.staticCachePolicy);
+    const om = url.match(/^https?:\/\/[^\/]+/);
+    const origin: string = om ? om[0] : '';
+    if (origin.length > 0) {
+      const appPolicy: StaticCachePolicy | undefined = this.staticPolicyByOrigin.get(origin);
+      if (appPolicy) {
+        this.mergeStaticPolicy(out, appPolicy);
+      }
+    }
+    return out;
+  }
+
+  private mergeStaticPolicy(dst: StaticCachePolicy, src: StaticCachePolicy): void {
+    if (!src) {
+      return;
+    }
+    if (typeof src.enabled === 'boolean') {
+      dst.enabled = src.enabled;
+    }
+    if (typeof src.minSizeKB === 'number') {
+      dst.minSizeKB = src.minSizeKB;
+    }
+    if (typeof src.minDurationMs === 'number') {
+      dst.minDurationMs = src.minDurationMs;
+    }
+    if (typeof src.maxSizeKB === 'number') {
+      dst.maxSizeKB = src.maxSizeKB;
+    }
+    if (src.include && src.include.length > 0) {
+      const arr: string[] = dst.include ? dst.include.slice() : [];
+      for (let i = 0; i < src.include.length; i++) {
+        arr.push(src.include[i]);
+      }
+      dst.include = arr;
+    }
+    if (src.exclude && src.exclude.length > 0) {
+      const arr: string[] = dst.exclude ? dst.exclude.slice() : [];
+      for (let i = 0; i < src.exclude.length; i++) {
+        arr.push(src.exclude[i]);
+      }
+      dst.exclude = arr;
+    }
+  }
+
+  private matchesAnyPattern(url: string, patterns: string[] | undefined): boolean {
+    if (!patterns || patterns.length === 0) {
+      return false;
+    }
+    for (let i = 0; i < patterns.length; i++) {
+      if (this.matchesPattern(url, patterns[i])) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /** 子串匹配;带 * 时按通配分段匹配,便于后台填 *.cdn.com/*.js 这类规则 */
+  private matchesPattern(url: string, pattern: string): boolean {
+    if (!pattern || pattern.length === 0) {
+      return false;
+    }
+    const u: string = url.toLowerCase();
+    const p: string = pattern.toLowerCase();
+    if (p.indexOf('*') < 0) {
+      return u.indexOf(p) >= 0;
+    }
+    const parts: string[] = p.split('*').filter((x: string) => x.length > 0);
+    if (parts.length === 0) {
+      return true;
+    }
+    if (p.charAt(0) !== '*' && u.indexOf(parts[0]) !== 0) {
+      return false;
+    }
+    let pos: number = 0;
+    for (let i = 0; i < parts.length; i++) {
+      const idx: number = u.indexOf(parts[i], pos);
+      if (idx < 0) {
+        return false;
+      }
+      pos = idx + parts[i].length;
+    }
+    const last: string = parts[parts.length - 1];
+    if (p.charAt(p.length - 1) !== '*' && !u.endsWith(last)) {
+      return false;
+    }
+    return true;
+  }
+
+  /**
+   * 运行时静态资源是否值得写入沙箱。默认无阈值=沿用旧逻辑全部缓存;
+   * 配了阈值后,只保留"大资源"或"慢资源",避免 200MB 沙箱被低价值小资源吃掉。
+   */
+  private shouldStoreRuntimeStatic(url: string, sizeBytes: number, costMs: number): boolean {
+    const p: StaticCachePolicy = this.staticPolicyFor(url);
+    if (p.enabled === false) {
+      return false;
+    }
+    if (this.matchesAnyPattern(url, p.exclude)) {
+      return false;
+    }
+    if (this.matchesAnyPattern(url, p.include)) {
+      return true;
+    }
+    const maxKB: number = p.maxSizeKB && p.maxSizeKB > 0 ? p.maxSizeKB : 0;
+    if (maxKB > 0 && sizeBytes > maxKB * 1024) {
+      return false;
+    }
+    const minKB: number = p.minSizeKB && p.minSizeKB > 0 ? p.minSizeKB : 0;
+    const minMs: number = p.minDurationMs && p.minDurationMs > 0 ? p.minDurationMs : 0;
+    if (minKB <= 0 && minMs <= 0) {
+      return true;
+    }
+    return (minKB > 0 && sizeBytes >= minKB * 1024) || (minMs > 0 && costMs >= minMs);
+  }
+
   /** 远程下发全局设置(缓存上限 / 文档校验节流)。bytecodeCache 在元服务不支持,已忽略 */
   applySettings(s: RemoteSettings): void {
     if (!s) {
@@ -408,8 +554,13 @@ class WebCacheManager {
     if (typeof s.prefetchChunks === 'boolean') {
       this.prefetchEnabled = s.prefetchChunks;
     }
-    hilog.info(DOMAIN, TAG, 'settings applied cap=%{public}dB docCheck=%{public}dms bundleConcurrency=%{public}d prefetch=%{public}s',
-      this.diskCapBytes, this.docCheckMs, this.bundleConcurrency, this.prefetchEnabled ? 'on' : 'off');
+    if (s.staticCache) {
+      this.staticCachePolicy = s.staticCache;
+    }
+    hilog.info(DOMAIN, TAG, 'settings applied cap=%{public}dB docCheck=%{public}dms bundleConcurrency=%{public}d prefetch=%{public}s staticMin=%{public}dKB/%{public}dms',
+      this.diskCapBytes, this.docCheckMs, this.bundleConcurrency, this.prefetchEnabled ? 'on' : 'off',
+      this.staticCachePolicy.minSizeKB ? this.staticCachePolicy.minSizeKB : 0,
+      this.staticCachePolicy.minDurationMs ? this.staticCachePolicy.minDurationMs : 0);
   }
 
   /** 查询某站离线包下载进度(无则返回 null) */
@@ -647,6 +798,26 @@ class WebCacheManager {
     // ① 沙箱运行时缓存(最新)
     const disk: DiskEntry | undefined = this.diskIndex.get(url);
     if (disk) {
+      if (disk.encoding && disk.encoding.length > 0) {
+        const decoded: ArrayBuffer | undefined = this.decodedMemory.get(url);
+        if (decoded !== undefined) {
+          disk.atime = Date.now();
+          this.hitDisk++;
+          return this.buildResponse(decoded, disk.mime, true);
+        }
+        const packedPath: string = this.cacheDir + '/' + disk.file;
+        if (fs.accessSync(packedPath)) {
+          disk.atime = Date.now();
+          this.warmDecodedEntry(url, disk);
+          this.miss++;
+          return null;
+        }
+        this.totalBytes -= disk.size;
+        this.diskIndex.delete(url);
+        this.decodedMemory.delete(url);
+        this.decoding.delete(url);
+        this.reportBundleCorruptIfNeeded(url);
+      }
       const buf: ArrayBuffer | null = this.readFile(this.cacheDir + '/' + disk.file);
       if (buf) {
         disk.atime = Date.now();
@@ -796,6 +967,9 @@ class WebCacheManager {
     try {
       const u8: Uint8Array = this.resMgr.getRawFileContentSync(RAW_DIR + '/' + raw.file);
       const buf: ArrayBuffer = u8.buffer.slice(u8.byteOffset, u8.byteOffset + u8.byteLength);
+      if (raw.encoding && raw.encoding.length > 0) {
+        return null;
+      }
       return this.buildResponse(buf, raw.mime, true);
     } catch (e) {
       const er = e as BusinessError;
@@ -816,7 +990,8 @@ class WebCacheManager {
    * @param overwrite 为 true 时即使已缓存也重新抓(SWR revalidate);否则已缓存则跳过
    */
   private fetchAndStore(cacheKey: string, sourceUrl: string, forceMime: string, overwrite: boolean,
-    onDone?: (ok: boolean) => void): void {
+    onDone?: (ok: boolean) => void, sourceKind: string = 'runtime',
+    contentEncoding: string = '', rawSize: number = 0): void {
     const src: string = sourceUrl && sourceUrl.length > 0 ? sourceUrl : cacheKey;
     if (this.inflight.has(cacheKey)) {
       if (onDone) {
@@ -840,6 +1015,7 @@ class WebCacheManager {
       }
     }
     const client = http.createHttp();
+    const startedAt: number = Date.now();
     const reqHeader: Record<string, string> = {
       'Accept': 'text/html,image/avif,image/webp,application/javascript,text/css,*/*',
       'Accept-Encoding': 'identity' // 关键:拿未压缩的真实字节,直接可服务,避免 gzip 误存
@@ -857,35 +1033,52 @@ class WebCacheManager {
       try {
         if (!err && data && data.responseCode === 200 && data.result instanceof ArrayBuffer) {
           const body: ArrayBuffer = data.result as ArrayBuffer;
+          const costMs: number = Date.now() - startedAt;
           const mime: string = forceMime && forceMime.length > 0 ? forceMime : this.pickMime(cacheKey, data.header);
           const newVersion: string = this.fingerprint(body);
           const old: DiskEntry | undefined = this.diskIndex.get(cacheKey);
           const isDoc: boolean = this.docUrls.has(cacheKey);
+          const isBundle: boolean = sourceKind === 'bundle';
           const changed: boolean = old !== undefined && old.version.length > 0 && old.version !== newVersion;
 
-          const file: string = this.fileNameFor(cacheKey);
-          this.writeBinary(this.cacheDir + '/' + file, body);
-          if (old) {
-            this.totalBytes -= old.size; // 覆盖:先扣旧体积
-          }
-          const now: number = Date.now();
-          const entry: DiskEntry = {
-            url: cacheKey, file: file, mime: mime, size: body.byteLength, atime: now, storedAt: now, version: newVersion
-          };
-          this.diskIndex.set(cacheKey, entry);
-          this.totalBytes += body.byteLength;
-          this.evictIfNeeded();
-          this.saveDiskIndex();
-          this.markBundleResource(cacheKey); // 若属于某站离线包,推进其下载进度
-          ok = true;
-          this.lastCacheAt = Date.now();     // 记"真的缓存成功"的时刻
-          hilog.info(DOMAIN, TAG, 'cached %{public}s %{public}d B', mime, body.byteLength);
+          if (!isDoc && !isBundle && !this.shouldStoreRuntimeStatic(cacheKey, body.byteLength, costMs)) {
+            ok = true; // 请求成功,只是按策略不落盘
+            hilog.info(DOMAIN, TAG, 'cache SKIP %{public}d B %{public}d ms %{public}s', body.byteLength, costMs, cacheKey);
+          } else {
+            const file: string = this.fileNameFor(cacheKey);
+            this.writeBinary(this.cacheDir + '/' + file, body);
+            if (old) {
+              this.totalBytes -= old.size; // 覆盖:先扣旧体积
+              this.decodedMemory.delete(cacheKey);
+              this.decoding.delete(cacheKey);
+            }
+            const now: number = Date.now();
+            const entry: DiskEntry = {
+              url: cacheKey, file: file, mime: mime, size: body.byteLength, atime: now, storedAt: now,
+              version: newVersion, costMs: costMs, source: sourceKind,
+              encoding: contentEncoding && contentEncoding.length > 0 ? contentEncoding : undefined,
+              rawSize: rawSize > 0 ? rawSize : undefined
+            };
+            this.diskIndex.set(cacheKey, entry);
+            this.totalBytes += body.byteLength;
+            this.evictIfNeeded();
+            this.saveDiskIndex();
+            if (entry.encoding && entry.encoding.length > 0) {
+              this.warmDecodedEntry(cacheKey, entry);
+            }
+            this.markBundleResource(cacheKey); // 若属于某站离线包,推进其下载进度
+            ok = true;
+            this.lastCacheAt = Date.now();     // 记"真的缓存成功"的时刻
+            hilog.info(DOMAIN, TAG, 'cache STORE %{public}s %{public}d B %{public}d ms %{public}s %{public}s %{public}s',
+              mime, body.byteLength, costMs, sourceKind,
+              contentEncoding && contentEncoding.length > 0 ? contentEncoding : '-', cacheKey);
 
-          // 主文档版本变了 = 站点更新 → 通知(池)刷新对应节点,立即用上新版
-          if (isDoc && changed) {
-            hilog.info(DOMAIN, TAG, 'doc VERSION CHANGED %{public}s', cacheKey);
-            if (this.docUpdateHandler) {
-              this.docUpdateHandler(cacheKey);
+            // 主文档版本变了 = 站点更新 → 通知(池)刷新对应节点,立即用上新版
+            if (isDoc && changed) {
+              hilog.info(DOMAIN, TAG, 'doc VERSION CHANGED %{public}s', cacheKey);
+              if (this.docUpdateHandler) {
+                this.docUpdateHandler(cacheKey);
+              }
             }
           }
         }
@@ -927,10 +1120,11 @@ class WebCacheManager {
         continue;
       }
       this.activeBundleDownloads++;
+      const rawSize: number = entry.rawSize && entry.rawSize > 0 ? entry.rawSize : 0;
       this.fetchAndStore(entry.url, src, entry.mime, false, (_ok: boolean) => {
         this.activeBundleDownloads--;
         this.pumpBundleQueue();
-      });
+      }, 'bundle', entry.encoding ? entry.encoding : '', rawSize);
     }
   }
 
@@ -952,10 +1146,21 @@ class WebCacheManager {
       return;
     }
     if (this.loadedBundles.has(origin)) {
+      if (bundleVersion.length > 0) {
+        const current: BundleState | undefined = this.bundleState.get(origin);
+        if (current !== undefined && current.version !== bundleVersion) {
+          this.bundleState.set(origin, { origin: origin, version: bundleVersion, urls: current.urls });
+          this.saveBundleState();
+          hilog.info(DOMAIN, TAG, 'bundle version recorded after refresh: %{public}s', bundleVersion);
+        } else if (current === undefined) {
+          this.pendingBundleVersionByOrigin.set(origin, bundleVersion);
+          hilog.info(DOMAIN, TAG, 'bundle version pending until current download completes: %{public}s', bundleVersion);
+        }
+      }
       return; // 本次会话已处理过该站
     }
     this.loadedBundles.add(origin);
-    const base: string = manifestUrl.replace(/\/manifest\.json.*$/, ''); // 后台资源目录
+    const base: string = manifestUrl.replace(/\/manifest(?:\.[A-Za-z0-9_-]+)?\.json.*$/, ''); // 后台资源目录
     const txt: string = await this.httpGetText(manifestUrl);
     if (txt.length === 0) {
       hilog.warn(DOMAIN, TAG, 'remote bundle manifest unreachable: %{public}s', manifestUrl);
@@ -975,15 +1180,45 @@ class WebCacheManager {
     let done: number = 0;
     const expected: Set<string> = new Set();
     const newUrls: string[] = [];
+    const appPolicy: StaticCachePolicy | undefined = this.staticPolicyByOrigin.get(origin);
     for (let i = 0; i < arr.length; i++) {
       const e: RawEntry = arr[i];
       if (!e || !e.url || !e.file) {
         continue;
       }
+      if (appPolicy !== undefined) {
+        const rm: RegExpMatchArray | null = e.url.match(/^https?:\/\/[^\/]+/);
+        const resourceOrigin: string = rm ? rm[0] : '';
+        if (resourceOrigin.length > 0 && !this.staticPolicyByOrigin.has(resourceOrigin)) {
+          this.staticPolicyByOrigin.set(resourceOrigin, appPolicy);
+        }
+      }
+      // 主文档只有启用 SWR 时才会被 intercept 使用。未启用时跳过 HTML,避免无效占用沙箱。
+      if (e.mime === 'text/html' && !this.docUrls.has(e.url)) {
+        continue;
+      }
       total++;
       newUrls.push(e.url);
-      if (this.diskIndex.has(e.url) || this.rawIndex.has(e.url)) {
-        done++; // 已在缓存里(hash 命名:内容变=URL变,故同 URL 即同内容,无需重下)
+      const diskExisting: DiskEntry | undefined = this.diskIndex.get(e.url);
+      if (diskExisting !== undefined) {
+        const wantEncoding: string = e.encoding && e.encoding.length > 0 ? e.encoding : '';
+        const haveEncoding: string = diskExisting.encoding && diskExisting.encoding.length > 0 ? diskExisting.encoding : '';
+        const wantRawSize: number = e.rawSize && e.rawSize > 0 ? e.rawSize : 0;
+        const wantSize: number = e.size && e.size > 0 ? e.size : 0;
+        if (wantEncoding !== haveEncoding ||
+          (wantRawSize > 0 && diskExisting.rawSize !== wantRawSize) ||
+          (wantSize > 0 && diskExisting.size !== wantSize)) {
+          this.removeCached(e.url);
+        } else {
+          if (haveEncoding.length > 0) {
+            this.warmDecodedEntry(e.url, diskExisting);
+          }
+          done++;
+          continue;
+        }
+      }
+      if (this.rawIndex.has(e.url)) {
+        done++;
       } else {
         expected.add(e.url);
         this.enqueueBundleDownload(e, base + '/' + e.file); // 来源=后台文件,缓存 key=原站 URL
@@ -1006,12 +1241,15 @@ class WebCacheManager {
       }
     }
     // 记录已应用版本 + URL 清单(下次开机版本门据此判断要不要更新)
-    this.bundleState.set(origin, { origin: origin, version: bundleVersion, urls: newUrls });
+    const pendingVersion: string | undefined = this.pendingBundleVersionByOrigin.get(origin);
+    const effectiveVersion: string = bundleVersion.length > 0 ? bundleVersion : (pendingVersion !== undefined ? pendingVersion : '');
+    this.pendingBundleVersionByOrigin.delete(origin);
+    this.bundleState.set(origin, { origin: origin, version: effectiveVersion, urls: newUrls });
     this.saveBundleState();
     const prog: BundleProgressEntry = { total: total, done: done, expected: expected };
     this.bundleProgress.set(origin, prog);
     hilog.info(DOMAIN, TAG, 'remote bundle: total %{public}d, to download %{public}d, ver %{public}s',
-      total, total - done, bundleVersion.length > 0 ? bundleVersion : '(none)');
+      total, total - done, effectiveVersion.length > 0 ? effectiveVersion : '(none)');
   }
 
   private httpGetText(url: string): Promise<string> {
@@ -1055,6 +1293,8 @@ class WebCacheManager {
         this.removeFile(this.cacheDir + '/' + victim.file);
         this.totalBytes -= victim.size;
         this.diskIndex.delete(oldestUrl);
+        this.decodedMemory.delete(oldestUrl);
+        this.decoding.delete(oldestUrl);
         hilog.info(DOMAIN, TAG, 'evict %{public}s', victim.file);
       }
     }
@@ -1166,6 +1406,52 @@ class WebCacheManager {
     }
   }
 
+  private warmCompressedDiskEntries(): void {
+    this.diskIndex.forEach((entry: DiskEntry, url: string) => {
+      if (entry.encoding && entry.encoding.length > 0) {
+        this.warmDecodedEntry(url, entry);
+      }
+    });
+  }
+
+  private warmDecodedEntry(url: string, entry: DiskEntry): void {
+    if (!entry.encoding || entry.encoding.length === 0) {
+      return;
+    }
+    if (entry.encoding !== 'zlib') {
+      hilog.warn(DOMAIN, TAG, 'unsupported compressed cache %{public}s %{public}s', entry.encoding, url);
+      return;
+    }
+    if (this.decodedMemory.has(url) || this.decoding.has(url)) {
+      return;
+    }
+    const rawSize: number = entry.rawSize && entry.rawSize > 0 ? entry.rawSize : 0;
+    if (rawSize <= 0) {
+      hilog.warn(DOMAIN, TAG, 'compressed cache missing rawSize %{public}s', url);
+      return;
+    }
+    const packed: ArrayBuffer | null = this.readFile(this.cacheDir + '/' + entry.file);
+    if (!packed) {
+      return;
+    }
+    this.decoding.add(url);
+    const out: ArrayBuffer = new ArrayBuffer(rawSize);
+    const zip: zlib.Zip = zlib.createZipSync();
+    zip.uncompress(out, packed, packed.byteLength)
+      .then((info: zlib.ZipOutputInfo) => {
+        const len: number = info.destLen > 0 && info.destLen <= out.byteLength ? info.destLen : out.byteLength;
+        const decoded: ArrayBuffer = len === out.byteLength ? out : out.slice(0, len);
+        this.decodedMemory.set(url, decoded);
+        this.decoding.delete(url);
+        hilog.info(DOMAIN, TAG, 'cache DECODE %{public}s %{public}d -> %{public}d B %{public}s',
+          entry.encoding as string, packed.byteLength, decoded.byteLength, url);
+      })
+      .catch((e: BusinessError) => {
+        this.decoding.delete(url);
+        hilog.warn(DOMAIN, TAG, 'cache DECODE failed %{public}s: %{public}s', url, e.message);
+      });
+  }
+
   private removeFile(path: string): void {
     try {
       if (fs.accessSync(path)) {
@@ -1247,6 +1533,8 @@ class WebCacheManager {
       this.removeFile(this.cacheDir + '/' + e.file);
       this.totalBytes -= e.size;
       this.diskIndex.delete(url);
+      this.decodedMemory.delete(url);
+      this.decoding.delete(url);
     }
   }
 

@@ -44,3 +44,7 @@ cd admin/server && npm install && npm start
 # 管理界面(端口 5174,开发时代理到 8787)
 cd admin/web && npm install && npm run dev
 ```
+
+## SDK 离线包说明
+
+SDK 作为接入方能力时,离线包会由接入方 App 端侧自动下载并存入接入方自己的沙箱。多站点 `bundle:true` 会逐站预下载,用于页面秒开。详细边界、压缩策略、K11 实测体积和后台配置要求见 [SDK_OFFLINE_BUNDLE.md](SDK_OFFLINE_BUNDLE.md)。

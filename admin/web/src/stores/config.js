@@ -6,7 +6,7 @@ import api from '../api';
 export const useConfigStore = defineStore('config', () => {
   const apps = ref([]);
   const blockHosts = ref([]);
-  const settings = ref({ diskCapMB: 64, docCheckSec: 60, bundleConcurrency: 3, bytecodeCache: true });
+  const settings = ref({ diskCapMB: 160, docCheckSec: 60, bundleConcurrency: 3, bytecodeCache: true });
   const version = ref('');
   const loading = ref(false);
 

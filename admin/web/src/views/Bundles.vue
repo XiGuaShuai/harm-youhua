@@ -1,12 +1,14 @@
 <script setup>
-import { ref, onMounted } from 'vue';
+import { ref, onMounted, computed } from 'vue';
 import { ElMessage } from 'element-plus';
 import api from '../api';
 
 const bundles = ref([]);
 const loading = ref(false);
+const selectedId = ref('');
+const resourceFilter = ref('all');
+const togglingKey = ref('');
 
-// 自动更新状态
 const autoLog = ref(null);
 const autoRunning = ref(false);
 const triggering = ref(false);
@@ -15,7 +17,10 @@ async function load() {
   loading.value = true;
   try {
     const { data } = await api.get('/api/admin/bundles');
-    bundles.value = data;
+    bundles.value = Array.isArray(data) ? data : [];
+    if (!selectedId.value || !bundles.value.some((b) => b.id === selectedId.value)) {
+      selectedId.value = bundles.value[0]?.id || '';
+    }
   } finally {
     loading.value = false;
   }
@@ -28,17 +33,15 @@ async function loadAutoLog() {
     const { data } = await api.get('/api/admin/auto-update/log');
     autoLog.value = data.log;
     autoRunning.value = data.running;
-  } catch (e) { /* 忽略 */ }
+  } catch (e) { /* ignore */ }
 }
 
-// 立即检查全部站的更新(手动触发自动更新)
 async function runAutoUpdate() {
   triggering.value = true;
   try {
     await api.post('/api/admin/auto-update/run');
-    ElMessage.success('已触发,后台检查中。稍等几秒点"刷新"看结果');
+    ElMessage.success('已触发后台检查');
     autoRunning.value = true;
-    // 5秒后自动刷新一次结果
     setTimeout(() => { loadAutoLog(); load(); }, 6000);
   } catch (e) {
     ElMessage.error('触发失败:' + (e.response?.data?.error || e.message));
@@ -47,57 +50,366 @@ async function runAutoUpdate() {
   }
 }
 
-function manifestLink(row) {
-  return location.origin + row.manifestUrl; // 开发下经 vite 代理;生产填服务器地址
+const selected = computed(() => bundles.value.find((b) => b.id === selectedId.value) || null);
+
+const resources = computed(() => {
+  const list = selected.value?.resources || [];
+  return list
+    .filter((r) => {
+      if (resourceFilter.value === 'enabled') return r.enabled !== false && r.inManifest !== false;
+      if (resourceFilter.value === 'disabled') return r.enabled === false;
+      if (resourceFilter.value === 'large') return Number(r.size || 0) >= 64 * 1024;
+      if (resourceFilter.value === 'slow') return Number(r.costMs || 0) >= 800;
+      return true;
+    })
+    .slice()
+    .sort((a, b) => {
+      const ea = a.enabled === false ? 1 : 0;
+      const eb = b.enabled === false ? 1 : 0;
+      if (ea !== eb) return ea - eb;
+      return Number(b.size || 0) - Number(a.size || 0);
+    });
+});
+
+function selectSite(row) {
+  selectedId.value = row.id;
 }
-function copy(row) {
+
+function manifestLink(row) {
+  return location.origin + row.manifestUrl;
+}
+
+function copyManifest(row) {
   navigator.clipboard.writeText(manifestLink(row));
   ElMessage.success('已复制 manifest 地址');
+}
+
+function formatSize(bytes) {
+  const n = Number(bytes || 0);
+  if (n >= 1024 * 1024) return `${(n / 1024 / 1024).toFixed(2)} MB`;
+  if (n > 0) return `${(n / 1024).toFixed(1)} KB`;
+  return '-';
+}
+
+function formatMs(ms) {
+  const n = Number(ms || 0);
+  return n > 0 ? `${n} ms` : '-';
+}
+
+function builtAtText(row) {
+  return row?.builtAt ? new Date(row.builtAt).toLocaleString() : '未构建';
+}
+
+function bundlePercent(row) {
+  const cap = Number(row?.bundleMaxSizeKB || row?.config?.bundleMaxSizeKB || 0) * 1024;
+  if (cap <= 0) return 0;
+  return Math.min(100, Math.round(Number(row.compressedSizeBytes || row.sizeBytes || 0) * 100 / cap));
+}
+
+function compressionText(row) {
+  const c = row?.compression || {};
+  if (c.enabled) return `端侧压缩后 ${c.storedKB} KB / 省 ${c.savingKB} KB`;
+  if (!c.compressibleKB) return '图片/字体为主';
+  return `文本 ${c.compressibleKB} KB / Brotli ${c.brKB} KB`;
+}
+
+function staticCacheText(row) {
+  const p = row?.config?.staticCache || {};
+  if (p.enabled === false) return '运行时缓存关闭';
+  return `运行时: >=${Number(p.minSizeKB || 0)}KB 或 >=${Number(p.minDurationMs || 0)}ms`;
+}
+
+function statusType(res) {
+  if (res.enabled === false) return 'info';
+  if (res.inManifest === false) return 'warning';
+  return 'success';
+}
+
+function statusText(res) {
+  if (res.enabled === false) return '已关闭';
+  if (res.inManifest === false) return '未生成';
+  return '已入包';
+}
+
+async function setResourceEnabled(site, res, enabled) {
+  if (!site || !res?.url) return;
+  const key = `${site.id}|${res.url}`;
+  togglingKey.value = key;
+  try {
+    const { data } = await api.put(`/api/admin/bundles/${site.id}/resource`, { url: res.url, enabled });
+    if (data?.bundle) {
+      const idx = bundles.value.findIndex((x) => x.id === site.id);
+      if (idx >= 0) bundles.value[idx] = data.bundle;
+    } else {
+      await load();
+    }
+    ElMessage.success(enabled ? '已加入离线包' : '已从离线包移除');
+  } catch (e) {
+    ElMessage.error('更新失败:' + (e.response?.data?.error || e.message));
+  } finally {
+    togglingKey.value = '';
+  }
 }
 </script>
 
 <template>
   <div class="page-card">
-    <el-alert type="info" :closable="false" show-icon style="margin-bottom:12px">
-      「构建缓存」会访问目标站并刷新服务器缓存文件;「生成清单」只扫描已有缓存文件生成 manifest。
-      鸿蒙 App 用 manifest 从你的服务器拉取缓存文件,再注入到端侧沙箱缓存。
-    </el-alert>
-    <!-- 自动更新:每天自动检查所有站源站更新并重建离线包 -->
-    <el-card shadow="never" style="margin-bottom:12px; border:1px solid #ebeef5">
-      <div style="display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:8px">
-        <div>
-          <b>🔄 离线包自动更新</b>
-          <span style="color:#888; margin-left:8px">每天自动检查所有站源站更新,有更新自动重建,失败自动重试</span>
-        </div>
-        <div>
-          <el-tag v-if="autoRunning" type="warning" size="small">检查中…</el-tag>
-          <el-button type="primary" :loading="triggering" @click="runAutoUpdate" size="small">立即检查全部更新</el-button>
-        </div>
+    <div class="bundle-head">
+      <div>
+        <div class="page-title">离线包资源面板</div>
+        <div class="muted">按网站查看离线包配置、文件名、大小、耗时和沙箱占用</div>
       </div>
-      <div v-if="autoLog" style="margin-top:10px; font-size:13px; color:#666">
-        上次检查:{{ new Date(autoLog.finishedAt || autoLog.startedAt).toLocaleString() }}({{ autoLog.trigger === 'manual' ? '手动' : autoLog.trigger === 'startup' ? '启动' : '定时' }})
-        <div style="margin-top:6px">
-          <el-tag v-for="r in autoLog.results" :key="r.id" :type="r.ok ? (r.action==='no-change'?'info':'success') : 'danger'" size="small" style="margin:2px 6px 2px 0">
-            {{ r.name || r.id }}: {{ r.detail }}
-          </el-tag>
-        </div>
+      <div class="head-actions">
+        <el-tag v-if="autoRunning" type="warning" size="small">检查中</el-tag>
+        <el-button :loading="loading" @click="load">刷新</el-button>
+        <el-button type="primary" :loading="triggering" @click="runAutoUpdate">检查更新</el-button>
       </div>
-    </el-card>
+    </div>
 
-    <el-button :loading="loading" @click="load">刷新</el-button>
-    <el-table :data="bundles" border style="margin-top:12px">
-      <el-table-column prop="id" label="应用 ID" width="140" />
-      <el-table-column prop="count" label="资源数" width="100" />
-      <el-table-column prop="sizeKB" label="大小 (KB)" width="120" />
-      <el-table-column label="清单时间" width="200">
-        <template #default="{ row }">{{ new Date(row.builtAt).toLocaleString() }}</template>
-      </el-table-column>
-      <el-table-column label="manifest 地址">
-        <template #default="{ row }">
-          <el-link type="primary" :href="manifestLink(row)" target="_blank">{{ row.manifestUrl }}</el-link>
-          <el-button link type="primary" @click="copy(row)">复制</el-button>
-        </template>
-      </el-table-column>
-    </el-table>
+    <div v-if="autoLog" class="auto-line">
+      <span class="muted">上次检查 {{ new Date(autoLog.finishedAt || autoLog.startedAt).toLocaleString() }}</span>
+      <el-tag v-for="r in autoLog.results" :key="r.id" :type="r.ok ? (r.action === 'no-change' ? 'info' : 'success') : 'danger'" size="small">
+        {{ r.name || r.id }}: {{ r.detail }}
+      </el-tag>
+    </div>
+
+    <div class="bundle-layout">
+      <aside class="site-pane">
+        <div class="pane-title">网站</div>
+        <el-table :data="bundles" size="small" highlight-current-row :current-row-key="selectedId" row-key="id" @row-click="selectSite">
+          <el-table-column label="名称" min-width="150" show-overflow-tooltip>
+            <template #default="{ row }">
+              <div class="site-name">{{ row.name || row.id }}</div>
+              <div class="site-id">{{ row.id }}</div>
+            </template>
+          </el-table-column>
+          <el-table-column label="资源" width="86" align="right">
+            <template #default="{ row }">
+              <div>{{ row.count || 0 }}</div>
+              <div class="site-id">{{ formatSize(row.compressedSizeBytes || row.sizeBytes) }}</div>
+            </template>
+          </el-table-column>
+        </el-table>
+      </aside>
+
+      <section v-if="selected" class="resource-pane">
+        <div class="resource-top">
+          <div>
+            <div class="resource-title">{{ selected.name || selected.id }}</div>
+            <div class="resource-url">{{ selected.url }}</div>
+          </div>
+          <div class="resource-actions">
+            <el-button link type="primary" @click="copyManifest(selected)">复制 manifest</el-button>
+            <el-link type="primary" :href="manifestLink(selected)" target="_blank">打开 manifest</el-link>
+          </div>
+        </div>
+
+        <div class="metric-row">
+          <div class="metric">
+            <span>端侧占用</span>
+            <b>{{ formatSize(selected.compressedSizeBytes || selected.sizeBytes) }}</b>
+          </div>
+          <div class="metric">
+            <span>原始大小</span>
+            <b>{{ formatSize(selected.sizeBytes) }}</b>
+          </div>
+          <div class="metric">
+            <span>容量上限</span>
+            <b>{{ selected.bundleMaxSizeKB || selected.config?.bundleMaxSizeKB || 0 }} KB</b>
+          </div>
+          <div class="metric">
+            <span>资源数</span>
+            <b>{{ selected.count || 0 }}</b>
+          </div>
+          <div class="metric">
+            <span>更新时间</span>
+            <b>{{ builtAtText(selected) }}</b>
+          </div>
+        </div>
+
+        <div class="capacity-line">
+          <el-progress :percentage="bundlePercent(selected)" :stroke-width="8" :show-text="false" />
+          <span class="muted">{{ compressionText(selected) }}</span>
+        </div>
+
+        <div class="config-strip">
+          <el-tag size="small" :type="selected.config?.bundle ? 'success' : 'info'">{{ selected.config?.bundle ? '离线包开启' : '离线包关闭' }}</el-tag>
+          <el-tag size="small" type="info">固定 {{ selected.config?.bundleExtraUrls?.length || 0 }}</el-tag>
+          <el-tag size="small" type="info">关闭 {{ selected.config?.bundleExcludeUrls?.length || 0 }}</el-tag>
+          <span class="muted">{{ staticCacheText(selected) }}</span>
+        </div>
+
+        <div class="table-tools">
+          <el-radio-group v-model="resourceFilter" size="small">
+            <el-radio-button label="all">全部</el-radio-button>
+            <el-radio-button label="enabled">已入包</el-radio-button>
+            <el-radio-button label="disabled">已关闭</el-radio-button>
+            <el-radio-button label="large">大资源</el-radio-button>
+            <el-radio-button label="slow">慢资源</el-radio-button>
+          </el-radio-group>
+          <span class="muted">{{ resources.length }} 条</span>
+        </div>
+
+        <el-table :data="resources" border size="small" height="520">
+          <el-table-column label="缓存" width="78" align="center">
+            <template #default="{ row }">
+              <el-switch :model-value="row.enabled !== false"
+                :loading="togglingKey === `${selected.id}|${row.url}`"
+                @change="(v) => setResourceEnabled(selected, row, v)" />
+            </template>
+          </el-table-column>
+          <el-table-column label="文件名" min-width="260" show-overflow-tooltip>
+            <template #default="{ row }">
+              <span class="file-name">{{ row.file || '-' }}</span>
+              <el-tag v-if="row.encoding" class="encoding-tag" size="small" type="success">{{ row.encoding }}</el-tag>
+            </template>
+          </el-table-column>
+          <el-table-column label="端侧大小" width="110" align="right">
+            <template #default="{ row }">{{ formatSize(row.storedSize || row.size) }}</template>
+          </el-table-column>
+          <el-table-column label="原始大小" width="110" align="right">
+            <template #default="{ row }">{{ formatSize(row.size) }}</template>
+          </el-table-column>
+          <el-table-column label="耗时" width="100" align="right">
+            <template #default="{ row }">{{ formatMs(row.costMs) }}</template>
+          </el-table-column>
+          <el-table-column label="状态" width="90">
+            <template #default="{ row }">
+              <el-tag size="small" :type="statusType(row)">{{ statusText(row) }}</el-tag>
+            </template>
+          </el-table-column>
+          <el-table-column prop="mime" label="类型" width="150" show-overflow-tooltip />
+          <el-table-column prop="url" label="原站 URL" min-width="320" show-overflow-tooltip />
+        </el-table>
+      </section>
+    </div>
   </div>
 </template>
+
+<style scoped>
+.bundle-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+}
+.page-title {
+  font-size: 20px;
+  font-weight: 700;
+  margin-bottom: 4px;
+}
+.head-actions,
+.auto-line,
+.config-strip,
+.table-tools,
+.resource-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.auto-line {
+  margin-top: 14px;
+  padding: 10px 0;
+  border-top: 1px solid #edf0f6;
+  border-bottom: 1px solid #edf0f6;
+}
+.bundle-layout {
+  display: grid;
+  grid-template-columns: 280px minmax(0, 1fr);
+  gap: 16px;
+  margin-top: 16px;
+}
+.site-pane,
+.resource-pane {
+  border: 1px solid #edf0f6;
+  border-radius: 8px;
+  background: #fff;
+  min-width: 0;
+}
+.site-pane {
+  padding: 12px;
+}
+.resource-pane {
+  padding: 16px;
+}
+.pane-title {
+  font-size: 13px;
+  font-weight: 700;
+  color: #606266;
+  margin-bottom: 10px;
+}
+.site-name {
+  font-weight: 600;
+  color: #303133;
+}
+.site-id,
+.resource-url {
+  color: #8a90a2;
+  font-size: 12px;
+}
+.resource-top {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+  margin-bottom: 14px;
+}
+.resource-title {
+  font-size: 18px;
+  font-weight: 700;
+  margin-bottom: 4px;
+}
+.metric-row {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  gap: 10px;
+  margin-bottom: 12px;
+}
+.metric {
+  border: 1px solid #edf0f6;
+  border-radius: 8px;
+  padding: 10px 12px;
+  min-width: 0;
+}
+.metric span {
+  display: block;
+  color: #8a90a2;
+  font-size: 12px;
+  margin-bottom: 6px;
+}
+.metric b {
+  color: #303133;
+  font-size: 15px;
+  white-space: nowrap;
+}
+.capacity-line {
+  display: grid;
+  grid-template-columns: minmax(160px, 320px) 1fr;
+  gap: 12px;
+  align-items: center;
+  margin-bottom: 12px;
+}
+.config-strip {
+  margin-bottom: 12px;
+}
+.table-tools {
+  justify-content: space-between;
+  margin-bottom: 10px;
+}
+.file-name {
+  font-family: ui-monospace, SFMono-Regular, Consolas, 'Liberation Mono', monospace;
+  font-size: 12px;
+}
+.encoding-tag {
+  margin-left: 6px;
+}
+@media (max-width: 980px) {
+  .bundle-layout {
+    grid-template-columns: 1fr;
+  }
+  .metric-row {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+</style>
