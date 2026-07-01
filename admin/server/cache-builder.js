@@ -172,22 +172,34 @@ function bundleBudgetBytes(appCfg) {
   return kb * 1024;
 }
 
+function estimatedStoredSize(entry, outDir, rawSize) {
+  const target = path.join(outDir, entry.file);
+  if (!isCompressibleBundleEntry(entry) || !fs.existsSync(target)) return rawSize;
+  if (rawSize > 10 * 1024 * 1024) return rawSize;
+  const raw = fs.readFileSync(target);
+  const packed = zlib.deflateSync(raw, { level: 6 });
+  return packed.length < raw.length - 1024 ? packed.length : rawSize;
+}
+
 function fitManifestToBudget(manifest, outDir, appCfg) {
   const budget = bundleBudgetBytes(appCfg);
   let total = 0;
+  let storedTotal = 0;
   const kept = [];
   const skipped = [];
   for (const entry of manifest) {
     const target = path.join(outDir, entry.file);
     const size = Number(entry.size || (fs.existsSync(target) ? fs.statSync(target).size : 0));
-    if (entry.file !== 'home.html' && total + size > budget) {
+    const storedSize = estimatedStoredSize(entry, outDir, size);
+    if (entry.file !== 'home.html' && storedTotal + storedSize > budget) {
       skipped.push(entry.file);
       continue;
     }
     kept.push(Object.assign({}, entry, { size }));
     total += size;
+    storedTotal += storedSize;
   }
-  return { manifest: kept, total, skipped };
+  return { manifest: kept, total, storedTotal, skipped };
 }
 
 function isCompressibleBundleEntry(entry) {

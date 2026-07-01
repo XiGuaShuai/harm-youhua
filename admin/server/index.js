@@ -583,7 +583,9 @@ function headerMime(res, url) {
   return ct || mimeOfPath(url);
 }
 
-async function downloadImportResource(url, appCfg, dir, maxResourceBytes) {
+async function downloadImportResource(input, appCfg, dir, maxResourceBytes) {
+  const url = typeof input === 'string' ? input : String(input && input.url || '');
+  const measuredSize = Number(input && input.size || 0);
   const started = Date.now();
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), IMPORT_TIMEOUT_MS);
@@ -604,6 +606,9 @@ async function downloadImportResource(url, appCfg, dir, maxResourceBytes) {
     }
     const buf = Buffer.from(await res.arrayBuffer());
     if (!buf.length) throw new Error('empty response');
+    if (measuredSize >= 64 * 1024 && buf.length < measuredSize * 0.5) {
+      throw new Error(`downloaded size ${buf.length}B is much smaller than device measured ${measuredSize}B`);
+    }
     if (maxResourceBytes > 0 && buf.length > maxResourceBytes) {
       throw new Error(`文件超过导入上限 ${Math.round(maxResourceBytes / 1024)}KB`);
     }
@@ -877,7 +882,7 @@ app.post('/api/admin/bundles/:id/import', async (req, res) => {
   for (const item of imports) importByUrl.set(item.url, item);
   for (const item of imports.slice(0, 200)) {
     try {
-      results.push(await downloadImportResource(item.url, appCfg, dir, maxResourceBytes));
+      results.push(await downloadImportResource(item, appCfg, dir, maxResourceBytes));
     } catch (e) {
       results.push({ ok: false, url: item.url, error: String(e && e.message || e) });
     }
