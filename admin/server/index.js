@@ -133,6 +133,7 @@ function defaultConfig() {
       bundleConcurrency: 8,  // 远程离线包后台下载并发(上限 8)
       prefetchChunks: true,  // 是否预取全站 chunk(Next.js 系有效)
       bytecodeCache: true,
+      autoUpdate: true,
       exploreK: 3,           // 众包共识阈值:≥K 个用户 hash 一致才采纳为可缓存
       exploreSample: 0.1     // 探索采样率:命中待探索名单的 app,每次打开按此概率上报(0.1=10%,减负)
     }
@@ -1028,6 +1029,13 @@ async function buildWithRetry(appId, maxRetries = 3) {
 }
 
 async function runAutoUpdateOnce(trigger = 'scheduled') {
+  const cfg = loadConfig();
+  if (trigger !== 'manual' && cfg.settings && cfg.settings.autoUpdate === false) {
+    console.log(`[AutoUpdate] disabled, skip ${trigger}`);
+    const log = { startedAt: new Date().toISOString(), finishedAt: new Date().toISOString(), trigger, skipped: true, reason: 'disabled', results: [] };
+    try { fs.writeFileSync(AUTO_UPDATE_LOG, JSON.stringify(log, null, 2), 'utf8'); } catch {}
+    return log;
+  }
   if (autoUpdateRunning) {
     console.log('[AutoUpdate] 上一轮还在进行,跳过本轮');
     return;
@@ -1035,7 +1043,6 @@ async function runAutoUpdateOnce(trigger = 'scheduled') {
   autoUpdateRunning = true;
   const startedAt = new Date().toISOString();
   console.log(`[AutoUpdate] 开始自动检查更新 (${trigger}) ...`);
-  const cfg = loadConfig();
   const apps = (cfg.apps || []).filter((a) => a.bundle === true);
   const results = [];
   for (const app of apps) {
