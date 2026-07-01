@@ -1,6 +1,7 @@
 <script setup>
 import { ref, onMounted, computed } from 'vue';
 import { ElMessage } from 'element-plus';
+import { Upload } from '@element-plus/icons-vue';
 import api from '../api';
 
 const bundles = ref([]);
@@ -8,6 +9,10 @@ const loading = ref(false);
 const selectedId = ref('');
 const resourceFilter = ref('all');
 const togglingKey = ref('');
+const importDialog = ref(false);
+const importText = ref('');
+const importing = ref(false);
+const importResults = ref([]);
 
 const autoLog = ref(null);
 const autoRunning = ref(false);
@@ -150,6 +155,49 @@ async function setResourceEnabled(site, res, enabled) {
     togglingKey.value = '';
   }
 }
+
+function openImportDialog() {
+  if (!selected.value) return;
+  importText.value = '';
+  importResults.value = [];
+  importDialog.value = true;
+}
+
+async function importResources() {
+  if (!selected.value) return;
+  if (!importText.value.trim()) {
+    ElMessage.warning('请填写静态资源 URL');
+    return;
+  }
+  importing.value = true;
+  try {
+    const { data } = await api.post(`/api/admin/bundles/${selected.value.id}/import`, { text: importText.value });
+    importResults.value = data.results || [];
+    if (data?.bundle) {
+      const idx = bundles.value.findIndex((x) => x.id === selected.value.id);
+      if (idx >= 0) bundles.value[idx] = data.bundle;
+    } else {
+      await load();
+    }
+    const failed = Number(data.failed || 0);
+    if (failed > 0) ElMessage.warning(`已导入 ${data.imported || 0} 个,失败 ${failed} 个`);
+    else ElMessage.success(`已导入 ${data.imported || 0} 个资源`);
+  } catch (e) {
+    const data = e.response?.data;
+    importResults.value = data?.results || [];
+    ElMessage.error('导入失败:' + (data?.error || e.message));
+  } finally {
+    importing.value = false;
+  }
+}
+
+function importStatusType(row) {
+  return row.ok ? 'success' : 'danger';
+}
+
+function importStatusText(row) {
+  return row.ok ? '成功' : '失败';
+}
 </script>
 
 <template>
@@ -199,6 +247,7 @@ async function setResourceEnabled(site, res, enabled) {
             <div class="resource-url">{{ selected.url }}</div>
           </div>
           <div class="resource-actions">
+            <el-button type="primary" :icon="Upload" @click="openImportDialog">导入资源</el-button>
             <el-button link type="primary" @click="copyManifest(selected)">复制 manifest</el-button>
             <el-link type="primary" :href="manifestLink(selected)" target="_blank">打开 manifest</el-link>
           </div>
@@ -283,6 +332,37 @@ async function setResourceEnabled(site, res, enabled) {
         </el-table>
       </section>
     </div>
+
+    <el-dialog v-model="importDialog" title="导入指定静态资源" width="760px">
+      <el-form label-position="top">
+        <el-form-item label="目标网站">
+          <el-input :model-value="selected ? `${selected.name || selected.id} (${selected.id})` : ''" disabled />
+        </el-form-item>
+        <el-form-item label="静态资源 URL">
+          <el-input v-model="importText" type="textarea" :rows="8"
+            placeholder="每行一个完整 URL,例如 https://cdn.example.com/app.bundle.js" />
+        </el-form-item>
+      </el-form>
+      <el-table v-if="importResults.length" :data="importResults" border size="small" max-height="260">
+        <el-table-column label="状态" width="76">
+          <template #default="{ row }">
+            <el-tag size="small" :type="importStatusType(row)">{{ importStatusText(row) }}</el-tag>
+          </template>
+        </el-table-column>
+        <el-table-column prop="url" label="URL" min-width="300" show-overflow-tooltip />
+        <el-table-column label="大小" width="96" align="right">
+          <template #default="{ row }">{{ row.ok ? formatSize(row.size) : '-' }}</template>
+        </el-table-column>
+        <el-table-column label="耗时" width="96" align="right">
+          <template #default="{ row }">{{ row.ok ? formatMs(row.costMs) : '-' }}</template>
+        </el-table-column>
+        <el-table-column prop="error" label="错误" min-width="180" show-overflow-tooltip />
+      </el-table>
+      <template #footer>
+        <el-button @click="importDialog = false">关闭</el-button>
+        <el-button type="primary" :loading="importing" @click="importResources">导入</el-button>
+      </template>
+    </el-dialog>
   </div>
 </template>
 

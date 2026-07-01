@@ -91,7 +91,7 @@ hvigorw --mode module -p module=entry@default -p product=default -p buildMode=re
 | `bundles/<id>/` | 离线包托管 |
 
 **关键 API**：`GET /api/config`(端侧拉) · `/bundles/<id>/...` · `POST /api/login` · `POST /api/report`(众包)。
-后台管理(需 X-Admin-Token)：`PUT /api/admin/{apps,blockhosts,settings}` · `POST /api/admin/apps/detect`(一键探测) · `POST /api/admin/bundles/:id/{check,update,build,manifest}` · `POST /api/admin/auto-update/run`(手动触发自动更新) · `GET /api/admin/auto-update/log`(查结果)。
+后台管理(需 X-Admin-Token)：`PUT /api/admin/{apps,blockhosts,settings}` · `POST /api/admin/apps/detect`(一键探测) · `POST /api/admin/bundles/:id/{check,update,build,manifest,import}` · `PUT /api/admin/bundles/:id/resource`(资源开关) · `POST /api/admin/auto-update/run`(手动触发自动更新) · `GET /api/admin/auto-update/log`(查结果)。
 
 **web/ 视图**：Dashboard / Apps(应用增删改+探测+离线包状态列+每应用黑名单/预取) / Blocklist / Bundles(离线包操作+自动更新UI) / Settings。
 

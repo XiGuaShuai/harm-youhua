@@ -336,7 +336,7 @@ async function discoverResources(appCfg) {
   for (const ref of (Array.isArray(appCfg.bundleExtraUrls) ? appCfg.bundleExtraUrls : [])) {
     try {
       const abs = new URL(ref, entryUrl).href;
-      if (isHashedAsset(abs)) extraSet.add(abs);
+      extraSet.add(abs);
     } catch {}
   }
 

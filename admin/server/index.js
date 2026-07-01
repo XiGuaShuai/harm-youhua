@@ -28,6 +28,8 @@ const CACHE_BUILDER = path.join(__dirname, 'cache-builder.js');
 // 管理界面构建产物(admin/web/dist);容器内由 Dockerfile 置于 /app/web/dist 并用 WEB_DIST 指定
 const WEB_DIST = process.env.WEB_DIST || path.join(__dirname, '..', 'web', 'dist');
 const PORT = process.env.PORT || 8787;
+const FETCH_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36';
+const IMPORT_TIMEOUT_MS = 60 * 1000;
 // 可选「主令牌」:仅当显式设置 ADMIN_TOKEN 时生效(给脚本/CI 用),默认不开,走账号密码登录
 const MASTER_TOKEN = process.env.ADMIN_TOKEN || '';
 const DEFAULT_USER = process.env.ADMIN_USER || 'admin';
@@ -537,6 +539,82 @@ function fileNameForUrl(u) {
   return p.replace(/^\//, '').replace(/[^A-Za-z0-9._-]+/g, '_');
 }
 
+function parseImportUrls(body, appCfg) {
+  const raw = [];
+  if (Array.isArray(body && body.urls)) raw.push(...body.urls);
+  if (Array.isArray(body && body.resources)) {
+    raw.push(...body.resources.map((r) => typeof r === 'string' ? r : r && r.url));
+  }
+  const text = String(body && body.text || '');
+  if (text) raw.push(...text.split(/[\r\n\t ]+/));
+
+  const out = [];
+  const seen = new Set();
+  for (let item of raw) {
+    item = String(item || '').trim().replace(/^[<"'`]+|[>"'`,;]+$/g, '');
+    if (!item) continue;
+    try {
+      const u = new URL(item, appCfg.url);
+      if (u.protocol !== 'http:' && u.protocol !== 'https:') continue;
+      const href = u.href;
+      if (!seen.has(href)) {
+        seen.add(href);
+        out.push(href);
+      }
+    } catch {}
+  }
+  return out;
+}
+
+function headerMime(res, url) {
+  const ct = String(res.headers.get('content-type') || '').split(';')[0].trim().toLowerCase();
+  return ct || mimeOfPath(url);
+}
+
+async function downloadImportResource(url, appCfg, dir, maxResourceBytes) {
+  const started = Date.now();
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), IMPORT_TIMEOUT_MS);
+  try {
+    const res = await fetch(url, {
+      redirect: 'follow',
+      signal: ctrl.signal,
+      headers: {
+        'User-Agent': appCfg.userAgent || FETCH_UA,
+        'Accept': '*/*'
+      }
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const len = parseInt(res.headers.get('content-length') || '0', 10);
+    if (maxResourceBytes > 0 && len > maxResourceBytes) {
+      try { await res.body?.cancel(); } catch {}
+      throw new Error(`文件超过导入上限 ${Math.round(maxResourceBytes / 1024)}KB`);
+    }
+    const buf = Buffer.from(await res.arrayBuffer());
+    if (!buf.length) throw new Error('empty response');
+    if (maxResourceBytes > 0 && buf.length > maxResourceBytes) {
+      throw new Error(`文件超过导入上限 ${Math.round(maxResourceBytes / 1024)}KB`);
+    }
+    const file = fileNameForUrl(url);
+    const target = safeBundlePath(dir, file);
+    if (!target) throw new Error('bad target file');
+    fs.writeFileSync(target, buf);
+    const mime = headerMime(res, url);
+    return {
+      ok: true,
+      url,
+      file,
+      mime,
+      size: buf.length,
+      sizeKB: Math.round(buf.length / 102.4) / 10,
+      hash: crypto.createHash('sha256').update(buf).digest('hex'),
+      costMs: Date.now() - started
+    };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 function matchesPattern(url, pattern) {
   if (!pattern) return false;
   const u = String(url).toLowerCase();
@@ -767,6 +845,67 @@ app.put('/api/admin/bundles/:id/resource', async (req, res) => {
     return res.status(500).json({ error: String(e && e.message || e) });
   }
   res.json({ ok: true, bundle: bundleInfo(appCfg.id, appCfg), bundleExcludeUrls: next });
+});
+
+// 手动导入指定静态资源:适合真机发现的跨域大图/JS/CSS。
+// 成功导入的 URL 会加入 bundleExtraUrls,立即下载文件,并重生成 manifest + manifest.zz.json。
+app.post('/api/admin/bundles/:id/import', async (req, res) => {
+  const c = loadConfig();
+  const appCfg = (c.apps || []).find((a) => a.id === req.params.id);
+  if (!appCfg) return res.status(404).json({ error: 'app not found' });
+  const urls = parseImportUrls(req.body || {}, appCfg);
+  if (!urls.length) return res.status(400).json({ error: '请填写至少一个 http(s) 静态资源 URL' });
+
+  const dir = path.join(BUNDLES_DIR, appCfg.id);
+  fs.mkdirSync(dir, { recursive: true });
+  const maxResourceKB = Math.max(0, Number(req.body && req.body.maxResourceKB || 0));
+  const maxResourceBytes = maxResourceKB > 0 ? maxResourceKB * 1024 : 0;
+  const results = [];
+  for (const url of urls.slice(0, 200)) {
+    try {
+      results.push(await downloadImportResource(url, appCfg, dir, maxResourceBytes));
+    } catch (e) {
+      results.push({ ok: false, url, error: String(e && e.message || e) });
+    }
+  }
+
+  const imported = results.filter((r) => r.ok);
+  if (!imported.length) {
+    return res.status(400).json({ ok: false, imported: 0, failed: results.length, results });
+  }
+
+  const importedUrls = imported.map((r) => r.url);
+  const extra = new Set(Array.isArray(appCfg.bundleExtraUrls) ? appCfg.bundleExtraUrls : []);
+  for (const url of importedUrls) extra.add(url);
+  appCfg.bundleExtraUrls = Array.from(extra);
+  if (Array.isArray(appCfg.bundleExcludeUrls)) {
+    const importedSet = new Set(importedUrls);
+    appCfg.bundleExcludeUrls = appCfg.bundleExcludeUrls.filter((url) => !importedSet.has(url));
+  }
+  if (req.body && req.body.enableBundle !== false) appCfg.bundle = true;
+  saveConfig(c);
+
+  let manifest = null;
+  try {
+    manifest = await runCacheBuilder('manifest', appCfg.id);
+  } catch (e) {
+    return res.status(500).json({
+      ok: false,
+      imported: imported.length,
+      failed: results.length - imported.length,
+      results,
+      error: String(e && e.message || e)
+    });
+  }
+  res.json({
+    ok: true,
+    imported: imported.length,
+    failed: results.length - imported.length,
+    results,
+    manifest,
+    bundle: bundleInfo(appCfg.id, appCfg),
+    bundleExtraUrls: appCfg.bundleExtraUrls
+  });
 });
 
 // 检查源站是否有新资源:访问目标站并对比当前 manifest,不写缓存文件。
