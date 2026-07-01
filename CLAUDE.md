@@ -148,8 +148,8 @@ hvigorw.bat --mode module -p module=entry@default -p product=default [-p buildMo
 
 **线上后台当前只配 3 个测试应用**(`curl https://maidun.chujingservice.com/api/config` 为准)：
 - K11 香港: `bundle:true`,29资源,压缩后约5.8MB。
-- 印尼出境卡(beacukai): `bundle:true`,13资源,按 `>=64KB` 或 `>=3000ms` 选择关键静态资源,压缩后约608KB。
-- Booking.com: `bundle:false`,首页被 AWS WAF challenge 拦截,服务端无法构建可靠离线包;当前走运行时缓存 `bstatic.com/bstatic.cn` + Booking 遥测黑名单 + preconnect。
+- 印尼出境卡(beacukai): `bundle:true`,12资源,按 `>=64KB` 或 `>=3000ms` 选择关键静态资源,压缩后约594KB。
+- Booking.com: `bundle:true`,9资源,首页被 AWS WAF challenge 拦截,不能服务端自动构建;当前为真机采集 `static.booking.cn` 慢/大 JS/CSS 后手动导入,压缩后约1.8MB。
 - 当前三站均关闭 `prerender` / `swrDoc` / `codeCache` / `prefetchChunks`,全局关闭 `bytecodeCache`,本轮只验证离线包和静态资源缓存带来的资源获取速度。
 
 历史上曾临时加过 bilibili / michelin / translate / foodpanda / youtube / twitch / tiktok 等 7 个站点,当前线上配置已按本轮测试收敛,没有继续下发这些站点。

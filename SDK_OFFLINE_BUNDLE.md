@@ -68,12 +68,12 @@ K11 图片主要是 JPG/PNG/WebP,本身已压缩,继续压缩收益很低,所以
 当前线上后台启用三项测试配置:
 
 - K11 香港: `bundle:true`,原始 `6365.1 KB`,压缩落盘 `5794.4 KB`。
-- 印尼出境卡: `bundle:true`,按 `>=64 KB` 或 `>=3000 ms` 保留关键资源,原始 `1690.2 KB`,压缩落盘 `607.7 KB`,资源数 `13`。
-- Booking.com: `bundle:false`,服务端请求首页返回 AWS WAF challenge,拿不到可构建离线包的 HTML;当前使用运行时缓存 `bstatic.com` / `bstatic.cn` 大资源 + Booking 遥测黑名单 + preconnect。
+- 印尼出境卡: `bundle:true`,按 `>=64 KB` 或 `>=3000 ms` 保留关键资源,原始 `1579.0 KB`,压缩落盘 `593.5 KB`,资源数 `12`。
+- Booking.com: `bundle:true`,服务端请求首页返回 AWS WAF challenge,不能自动构建;当前使用真机采集后手动导入的 9 个 `static.booking.cn` 静态 JS/CSS,原始 `6819.1 KB`,压缩落盘 `1803.6 KB`。
 
 当前线上测试目标是验证资源获取速度,所以三个站点均关闭 `prerender` / `swrDoc` / `codeCache` / `prefetchChunks`,全局也关闭 `bytecodeCache`。页面渲染仍完全交给 WebView 内核,SDK 只负责提前把关键静态资源放进沙箱或运行时缓存。
 
-Booking 不应该伪造空离线包。若后续要做 Booking 离线包,必须先用真机 WebView 采集实际 `bstatic` 稳定静态资源,再把可直接下载且 URL 稳定的资源配置进 `bundleExtraUrls`,并验证端侧命中。
+Booking 不应该伪造空离线包。当前 Booking 离线包来自真机 WebView 日志采集,筛选 `>=64 KB` 且 `>=3000 ms` 的稳定静态资源后导入 `bundleExtraUrls`,并已验证端侧下载压缩离线包。
 
 ## 资源选择原则
 
