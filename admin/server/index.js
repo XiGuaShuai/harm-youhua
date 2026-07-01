@@ -540,26 +540,38 @@ function fileNameForUrl(u) {
 }
 
 function parseImportUrls(body, appCfg) {
+  return parseImportResources(body, appCfg).map((r) => r.url);
+}
+
+function parseImportResources(body, appCfg) {
   const raw = [];
-  if (Array.isArray(body && body.urls)) raw.push(...body.urls);
+  if (Array.isArray(body && body.urls)) raw.push(...body.urls.map((url) => ({ url })));
   if (Array.isArray(body && body.resources)) {
-    raw.push(...body.resources.map((r) => typeof r === 'string' ? r : r && r.url));
+    raw.push(...body.resources.map((r) => typeof r === 'string' ? { url: r } : r));
   }
   const text = String(body && body.text || '');
-  if (text) raw.push(...text.split(/[\r\n\t ]+/));
+  if (text) raw.push(...text.split(/[\r\n\t ]+/).map((url) => ({ url })));
 
   const out = [];
   const seen = new Set();
-  for (let item of raw) {
-    item = String(item || '').trim().replace(/^[<"'`]+|[>"'`,;]+$/g, '');
-    if (!item) continue;
+  for (const item of raw) {
+    const rawUrl = typeof item === 'string' ? item : item && item.url;
+    const cleaned = String(rawUrl || '').trim().replace(/^[<"'`]+|[>"'`,;]+$/g, '');
+    if (!cleaned) continue;
     try {
-      const u = new URL(item, appCfg.url);
+      const u = new URL(cleaned, appCfg.url);
       if (u.protocol !== 'http:' && u.protocol !== 'https:') continue;
       const href = u.href;
       if (!seen.has(href)) {
         seen.add(href);
-        out.push(href);
+        const size = Number(item && item.size);
+        const costMs = Number(item && item.costMs);
+        out.push({
+          url: href,
+          size: Number.isFinite(size) && size > 0 ? size : 0,
+          costMs: Number.isFinite(costMs) && costMs > 0 ? costMs : 0,
+          source: String(item && item.source || '').trim()
+        });
       }
     } catch {}
   }
@@ -853,19 +865,21 @@ app.post('/api/admin/bundles/:id/import', async (req, res) => {
   const c = loadConfig();
   const appCfg = (c.apps || []).find((a) => a.id === req.params.id);
   if (!appCfg) return res.status(404).json({ error: 'app not found' });
-  const urls = parseImportUrls(req.body || {}, appCfg);
-  if (!urls.length) return res.status(400).json({ error: '请填写至少一个 http(s) 静态资源 URL' });
+  const imports = parseImportResources(req.body || {}, appCfg);
+  if (!imports.length) return res.status(400).json({ error: '请填写至少一个 http(s) 静态资源 URL' });
 
   const dir = path.join(BUNDLES_DIR, appCfg.id);
   fs.mkdirSync(dir, { recursive: true });
   const maxResourceKB = Math.max(0, Number(req.body && req.body.maxResourceKB || 0));
   const maxResourceBytes = maxResourceKB > 0 ? maxResourceKB * 1024 : 0;
   const results = [];
-  for (const url of urls.slice(0, 200)) {
+  const importByUrl = new Map();
+  for (const item of imports) importByUrl.set(item.url, item);
+  for (const item of imports.slice(0, 200)) {
     try {
-      results.push(await downloadImportResource(url, appCfg, dir, maxResourceBytes));
+      results.push(await downloadImportResource(item.url, appCfg, dir, maxResourceBytes));
     } catch (e) {
-      results.push({ ok: false, url, error: String(e && e.message || e) });
+      results.push({ ok: false, url: item.url, error: String(e && e.message || e) });
     }
   }
 
@@ -882,6 +896,20 @@ app.post('/api/admin/bundles/:id/import', async (req, res) => {
     const importedSet = new Set(importedUrls);
     appCfg.bundleExcludeUrls = appCfg.bundleExcludeUrls.filter((url) => !importedSet.has(url));
   }
+  const metrics = appCfg.bundleResourceMetrics && typeof appCfg.bundleResourceMetrics === 'object'
+    ? Object.assign({}, appCfg.bundleResourceMetrics)
+    : {};
+  for (const item of imported) {
+    const input = importByUrl.get(item.url) || {};
+    metrics[item.url] = {
+      size: item.size,
+      measuredSize: input.size || item.size,
+      costMs: input.costMs || item.costMs || 0,
+      source: input.source || (input.costMs ? 'device' : 'server-import'),
+      measuredAt: new Date().toISOString()
+    };
+  }
+  appCfg.bundleResourceMetrics = metrics;
   if (req.body && req.body.enableBundle !== false) appCfg.bundle = true;
   saveConfig(c);
 

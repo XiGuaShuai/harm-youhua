@@ -120,6 +120,20 @@ function configuredBundleUrls(appCfg) {
   return out;
 }
 
+function configuredResourceMetric(appCfg, url) {
+  const metrics = appCfg && appCfg.bundleResourceMetrics && typeof appCfg.bundleResourceMetrics === 'object'
+    ? appCfg.bundleResourceMetrics
+    : {};
+  const m = metrics[url];
+  return m && typeof m === 'object' ? m : null;
+}
+
+function metricCostMs(appCfg, url, fallback = 0) {
+  const m = configuredResourceMetric(appCfg, url);
+  const n = Number(m && m.costMs);
+  return Number.isFinite(n) && n > 0 ? n : fallback;
+}
+
 // 与端侧 staticCache 语义一致:exclude 优先,include 强制保留;否则按大资源/慢资源阈值保留。
 function shouldKeepStaticByPolicy(appCfg, url, sizeBytes, costMs) {
   const p = appCfg.staticCache || {};
@@ -465,7 +479,7 @@ async function updateServerCache(appCfg) {
     if (fs.existsSync(target)) {
       const old = previous.get(entry.file);
       const size = fs.statSync(target).size;
-      const oldCostMs = old && typeof old.costMs === 'number' ? old.costMs : 0;
+      const oldCostMs = metricCostMs(appCfg, entry.url, old && typeof old.costMs === 'number' ? old.costMs : 0);
       if (!requiredUrls.has(entry.url) && !shouldKeepStaticByPolicy(appCfg, entry.url, size, oldCostMs)) {
         skippedByPolicy.push(entry.file);
         continue;
@@ -474,19 +488,20 @@ async function updateServerCache(appCfg) {
       manifest.push(manifestEntry(entry, outDir, old ? {
         size: old.size,
         hash: old.hash,
-        costMs: old.costMs
+        costMs: oldCostMs
       } : {}));
       continue;
     }
     try {
       const got = await downloadResource(entry, outDir);
-      if (!requiredUrls.has(entry.url) && !shouldKeepStaticByPolicy(appCfg, entry.url, got.size, got.costMs)) {
+      const costMs = metricCostMs(appCfg, entry.url, got.costMs);
+      if (!requiredUrls.has(entry.url) && !shouldKeepStaticByPolicy(appCfg, entry.url, got.size, costMs)) {
         fs.rmSync(target, { force: true });
         skippedByPolicy.push(entry.file);
         continue;
       }
       downloaded.push(entry.file);
-      manifest.push(manifestEntry(entry, outDir, got));
+      manifest.push(manifestEntry(entry, outDir, Object.assign({}, got, { costMs })));
     } catch (e) {
       failed.push({ file: entry.file, error: String(e && e.message || e) });
     }
@@ -577,7 +592,7 @@ async function buildServerCache(appCfg) {
         continue;
       }
       validateDownloaded(e, res, buf);
-      const costMs = Date.now() - started;
+      const costMs = metricCostMs(appCfg, e.url, Date.now() - started);
       if (!requiredUrls.has(e.url) && !shouldKeepStaticByPolicy(appCfg, e.url, buf.length, costMs)) { skippedByPolicy++; continue; }
       if (total + buf.length > BUDGET) { skipped++; continue; }
       total += buf.length;
@@ -633,11 +648,12 @@ function buildCacheManifest(appCfg) {
     const url = old && old.url ? old.url : (configuredByFile.get(file) || inferCachedUrl(appCfg, file));
     if (!url) continue;
     if (isBundleExcluded(appCfg, url)) continue;
-    manifest.push(manifestEntry({ url, file, mime: old && old.mime ? old.mime : mimeOf(file) }, outDir, old ? {
-      size: old.size,
-      hash: old.hash,
-      costMs: old.costMs
-    } : {}));
+    const costMs = metricCostMs(appCfg, url, old && typeof old.costMs === 'number' ? old.costMs : 0);
+    manifest.push(manifestEntry({ url, file, mime: old && old.mime ? old.mime : mimeOf(file) }, outDir, {
+      size: old && typeof old.size === 'number' ? old.size : 0,
+      hash: old && old.hash ? old.hash : '',
+      costMs
+    }));
   }
   if (!manifest.length) {
     throw new Error('未能从缓存文件推导出任何原站 URL,请保留旧 manifest 或使用 chunks_/css_/media_/home.html 命名');
