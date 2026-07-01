@@ -53,27 +53,36 @@ SDK 在 `WebPreRender.prewarmConfiguredApps()` 中遍历所有 `apps`。只要�
 
 线上 K11 当前离线包:
 
-- 原始 manifest: `6365.1 KB`
-- 压缩后端侧落盘: `5794.4 KB`
-- 节省: `570.7 KB`
-- 资源数: `29`
-- 压缩资源: `hk.k11.com_files_art_js_bundle.min.js.zz`
-- JS 原始大小: `793.8 KB`
-- JS zlib 后大小: `223.2 KB`
+- 原始 manifest: `4962.9 KB`
+- 压缩后端侧落盘: `4962.9 KB`
+- 资源数: `11`
+- 当前主要是首页、店铺、美食路径中可稳定下载的大图资源。
 
-K11 图片主要是 JPG/PNG/WebP,本身已压缩,继续压缩收益很低,所以仍按原始图片文件缓存。真正有效的压缩对象主要是 JS/CSS/HTML/JSON/SVG 等文本类资源。
+K11 的主 CSS/JS 在手机 WebView 中能拿到真实 800KB 级文件,但线上后台服务器直接下载时拿到的是 WAF/拦截 HTML,与端侧实测大小差异过大。因此这两个资源已被导入校验拒绝,避免把错误内容缓存进离线包。K11 当前资源主要是 JPG/PNG,本身已压缩,所以端侧占用基本等于原始大小。
 
 ## 2026-07-01 线上站点状态
 
 当前线上后台启用三项测试配置:
 
-- K11 香港: `bundle:true`,原始 `6365.1 KB`,压缩落盘 `5794.4 KB`。
-- 印尼出境卡: `bundle:true`,按 `>=64 KB` 或 `>=3000 ms` 保留关键资源,原始 `1579.0 KB`,压缩落盘 `593.5 KB`,资源数 `12`。
-- Booking.com: `bundle:true`,服务端请求首页返回 AWS WAF challenge,不能自动构建;当前使用真机采集后手动导入的 9 个 `static.booking.cn` 静态 JS/CSS,原始 `6819.1 KB`,压缩落盘 `1803.6 KB`。
+- K11 香港: `bundle:true`,真机采集后保留 11 个可稳定下载的大图资源,原始 `4962.9 KB`,压缩落盘 `4962.9 KB`。
+- 印尼出境卡: `bundle:true`,首页 + BC32/BC34 表单页真机采集后保留 36 个关键资源,原始 `1566.5 KB`,压缩落盘 `606.7 KB`。
+- Booking.com: `bundle:true`,服务端请求首页返回 AWS WAF challenge,不能自动构建;当前使用真机采集后手动导入的 24 个 `static.booking.cn` / `ac-a.static.booking.cn` 静态 JS/CSS,原始 `10251.2 KB`,压缩落盘 `2631.9 KB`。
 
 当前线上测试目标是验证资源获取速度,所以三个站点均关闭 `prerender` / `swrDoc` / `codeCache` / `prefetchChunks`,全局也关闭 `bytecodeCache`。页面渲染仍完全交给 WebView 内核,SDK 只负责提前把关键静态资源放进沙箱或运行时缓存。
 
-Booking 不应该伪造空离线包。当前 Booking 离线包来自真机 WebView 日志采集,筛选 `>=64 KB` 且 `>=3000 ms` 的稳定静态资源后导入 `bundleExtraUrls`,并已验证端侧下载压缩离线包。
+Booking 不应该伪造空离线包。当前 Booking 离线包来自真机 WebView 日志采集,筛选 `>=64 KB` 或 `>=3000 ms` 的稳定静态资源后导入 `bundleExtraUrls`,并已验证端侧下载压缩离线包。
+
+## 首装首次进入的表现
+
+重新安装 App 后,接入方沙箱是空的。SDK 启动后会按配置下载所有 `bundle:true` 站点的离线包。当前三站会同时或依次进入下载队列:
+
+- K11: 11 个资源。
+- 印尼出境卡: 36 个资源。
+- Booking.com: 24 个资源。
+
+如果用户刚启动就立刻进入某个站点页面,该站离线包可能还没下载完成。此时未落盘的 chunk 仍会走网络,页面可能卡住或加载很慢。等调试浮窗中对应站点显示 `包 total/total` 后,再次进入页面才是离线包命中的速度。
+
+Booking 的资源大多在 `ac-a.static.booking.cn`,不是 Booking 主站 origin。如果调试面板只按主站 origin 统计缓存条数,可能看到 `Booking 缓存 0 条`;应以 `包 24/24`、总沙箱条数以及 `WebCache` 日志中的 `cache STORE ... bundle zlib` 为准。
 
 ## 资源选择原则
 
@@ -83,6 +92,7 @@ Booking 不应该伪造空离线包。当前 Booking 离线包来自真机 WebVi
 - 加载耗时超过阈值的静态资源,例如 K11 当前按 `>=3000ms`。
 - 体积大且稳定、URL 带版本号或内容 hash 的静态资源。
 - 首页、店铺页、美食页这类关键路径反复出现的固定背景图或固定运营图。
+- 表单页、二级页进入必须依赖的路由 chunk。即使没有达到 3 秒阈值,只要缺它会导致页面进不去,也可以手动导入。
 
 不应该缓存:
 

@@ -50,3 +50,5 @@ cd admin/web && npm install && npm run dev
 SDK 作为接入方能力时,离线包会由接入方 App 端侧自动下载并存入接入方自己的沙箱。多站点 `bundle:true` 会逐站预下载,用于页面秒开。详细边界、压缩策略、K11 实测体积和后台配置要求见 [SDK_OFFLINE_BUNDLE.md](SDK_OFFLINE_BUNDLE.md)。
 
 当前后台、端侧、压缩离线包、手动导入和运行时缓存的完整架构图见 [OFFLINE_BUNDLE_ARCHITECTURE.md](OFFLINE_BUNDLE_ARCHITECTURE.md)。
+
+重装或首次安装后沙箱为空,SDK 需要先把后台开启的站点离线包下载完成;在对应站点显示 `包 total/total` 前立即进入页面,仍可能因为缺少 chunk 走网络而卡顿。
