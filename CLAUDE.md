@@ -150,10 +150,11 @@ hvigorw.bat --mode module -p module=entry@default -p product=default [-p buildMo
 - K11 香港: `bundle:true`,29资源,压缩后约5.8MB。
 - 印尼出境卡(beacukai): `bundle:true`,13资源,按 `>=64KB` 或 `>=3000ms` 选择关键静态资源,压缩后约608KB。
 - Booking.com: `bundle:false`,首页被 AWS WAF challenge 拦截,服务端无法构建可靠离线包;当前走运行时缓存 `bstatic.com/bstatic.cn` + Booking 遥测黑名单 + preconnect。
+- 当前三站均关闭 `prerender` / `swrDoc` / `codeCache` / `prefetchChunks`,全局关闭 `bytecodeCache`,本轮只验证离线包和静态资源缓存带来的资源获取速度。
 
 历史上曾临时加过 bilibili / michelin / translate / foodpanda / youtube / twitch / tiktok 等 7 个站点,当前线上配置已按本轮测试收敛,没有继续下发这些站点。
 
-**已实测达成**:冷启动 ~430ms、点进应用/翻页预渲染秒开、印尼首屏136ms(离线包)。装机包 release 258KB。**用户确认"确实快"。**
+**历史实测达成**:冷启动 ~430ms、点进应用/翻页预渲染秒开、印尼首屏136ms(离线包)。装机包 release 258KB。**用户确认"确实快"。** 当前线上配置为排除预渲染/SWR/字节码变量,只测资源缓存链路。
 
 **已做的功能（都真机验证、已部署线上）**：
 - 端侧秒开：离屏预渲染+优先级、离线包、主文档SWR、路由预取(只下静态资源)、占位绑FCP、黑名单拦遥测。
