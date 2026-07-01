@@ -529,14 +529,26 @@ function mimeOfPath(u) {
   return 'application/octet-stream';
 }
 
+function appendUrlHash(name, u) {
+  if (!String(u || '').includes('?')) return name;
+  const hash = crypto.createHash('sha1').update(String(u || '')).digest('hex').slice(0, 8);
+  const ext = path.extname(name);
+  if (!ext) return `${name}_${hash}`;
+  return `${name.slice(0, -ext.length)}_${hash}${ext}`;
+}
+
 function fileNameForUrl(u) {
   let p = String(u || '').split('?')[0];
+  let hasQuery = String(u || '').includes('?');
   try {
     const parsed = new URL(u);
     p = parsed.host + parsed.pathname;
+    hasQuery = !!parsed.search;
   } catch {}
-  if (p.startsWith('/_next/static/')) return p.slice('/_next/static/'.length).replace(/\//g, '_');
-  return p.replace(/^\//, '').replace(/[^A-Za-z0-9._-]+/g, '_');
+  const name = p.startsWith('/_next/static/')
+    ? p.slice('/_next/static/'.length).replace(/\//g, '_')
+    : p.replace(/^\//, '').replace(/[^A-Za-z0-9._-]+/g, '_');
+  return hasQuery ? appendUrlHash(name, u) : name;
 }
 
 function parseImportUrls(body, appCfg) {
