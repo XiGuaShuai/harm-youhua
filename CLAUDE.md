@@ -5,12 +5,35 @@
 
 ---
 
+## 2026-07-02 当前定版口径
+
+最新交接先读 [`新会话快速上下文.md`](新会话快速上下文.md)。如本文后面仍出现“运行时缓存自愈、SWR、预渲染、chunk 预取”等旧描述,以本节和新会话上下文为准。
+
+当前端侧 SDK 只保留:
+
+1. `WebAccel.init()` 拉后台 `/api/config`。
+2. 对 `bundle:true` 站点下载后台离线包到接入方应用沙箱。
+3. `onInterceptRequest` 按原站 URL 命中本地离线包资源。
+4. 未命中资源直接放行网络,不做运行时自动缓存。
+
+当前不做:
+
+1. 端侧运行时静态资源自动缓存。
+2. 主文档 SWR。
+3. 离屏预渲染。
+4. chunk 预取。
+5. 后台实时强推更新。
+
+调试浮窗显示 `包准备中` / `包下载 x/y` / `包完成 x/y`。后台更新离线包后,端侧需要重新打开应用或调用 `WebAccel.refreshConfig()` 才会拉新版本。
+
+---
+
 ## 一、这是什么
 
-`youhua-mono` —— 「网页应用集合」**鸿蒙加速方案**单仓库。目标：把一批网页应用（K11、印尼入境卡、Booking 等）包进**鸿蒙元服务(免安装)**，靠多层加速做到「点开秒显」；配一个**后台**让应用列表/加速参数/离线包**远程下发、改东西不用重新发版**。
+`youhua-mono` —— 「网页应用集合」**鸿蒙加速方案**单仓库。目标：把一批网页应用（K11、印尼入境卡、Booking、新加坡环球影城等）接入**鸿蒙元服务/SDK**，靠后台离线包让关键静态资源本地命中；配一个**后台**让应用列表/离线包**远程下发、改东西不用重新发版**。
 
 ```
-用户点图标 → 元服务(免安装, 装机包~260KB) → 多层加速的 ArkWeb 网页 → 秒开
+用户点图标 → 元服务/接入方 App → SDK 拉后台配置和离线包 → ArkWeb 请求本地命中
                     ↑ 开机拉 /api/config、按需下离线包
                后台(配置 + 离线包托管 + 定时自动更新)
 ```
@@ -37,7 +60,7 @@ youhua-mono/
 └── TROUBLESHOOTING.md  联调踩坑(改加速前必读)
 ```
 
-**端↔后台**：元服务开机拉 `/api/config`(应用/黑名单/设置)，打开网页按需下离线包进沙箱(自愈缓存)；后台改配置/打包，端侧下次启动即生效，**不重新发版**。
+**端↔后台**：元服务开机拉 `/api/config`(应用/黑名单/设置)，对 `bundle:true` 站点下载后台离线包进沙箱；后台改配置/打包后，端侧重新打开应用或调用 `WebAccel.refreshConfig()` 才会拉新版本，**不需要重新发版**。
 
 ---
 
@@ -53,15 +76,15 @@ youhua-mono/
 | **`webaccel/.../WebAccel.ets`** | ★门面 API(init/prewarm/refreshConfig/setDebug 等) |
 | `webaccel/.../WebAccelLauncher.ets` | 开箱即用整页组件(列表+导航+网页+调试浮窗) |
 | `webaccel/.../WebAccelView.ets` | 网页展示组件(占位 + 离线进度条,进度条有超时收起) |
-| **`webaccel/.../core/WebCacheManager.ets`** | ★核心:onInterceptRequest 拦截 + LRU缓存 + 主文档SWR + 黑名单(全局+每应用) + 离线包增量 + 路由预取 + 众包 |
-| `webaccel/.../core/WebPreRender.ets` | 离屏预渲染池(BuilderNode,只热预前2个) + 路由预取触发 |
+| **`webaccel/.../core/WebCacheManager.ets`** | ★核心:onInterceptRequest 拦截 + 后台离线包下载/命中 + 黑名单(全局+每应用) + 沙箱容量控制 |
+| `webaccel/.../core/WebPreRender.ets` | 当前主要负责监听远程配置并触发 `loadBundleFor()`;历史预渲染能力当前不作为交付能力使用 |
 | `webaccel/.../core/WebShared.ets` | Web 统一配置 buildWeb(含 onGeolocationShow 定位授权) + ViewModel(占位绑FCP/进度85%) |
-| `webaccel/.../core/RemoteConfig.ets` | 远程配置:拉 /api/config、RemoteApp 接口(含 extraBlockHosts/prefetchChunks) |
+| `webaccel/.../core/RemoteConfig.ets` | 远程配置:拉 /api/config、RemoteApp 接口(应用列表、离线包地址、版本号、UA、黑名单) |
 | `webaccel/build-profile.json5` | ★`CONFIG_SERVER` 后端地址(debug段/release段各一) |
 
 ### SDK 门面 API
-`init(ctx,options?)` · `prewarm(url,swrDoc?)` · `refreshConfig()` · `setDebug(on)` · `stats()`；组件 `WebAccelLauncher()` / `WebAccelView({url})` / `WebAccelDebugBadge`。
-**RemoteApp 每应用开关**：`swrDoc`/`prerender`/`bundle`/`routes`/`codeCache`/`extraBlockHosts`(每应用额外黑名单)/`prefetchChunks`(每应用预取开关)/`manifestUrl`/`bundleVersion`。
+`init(ctx,options?)` · `refreshConfig()` · `setDebug(on)` · `stats()` · `bundleProgress(origin)`；组件 `WebAccelLauncher()` / `WebAccelView({url})` / `WebAccelDebugBadge`。
+**RemoteApp 重点字段**：`bundle` / `manifestUrl` / `compressedManifestUrl` / `bundleVersion` / `compressedBundleVersion` / `extraBlockHosts` / `userAgent`。`swrDoc` / `prerender` / `prefetchChunks` 当前按 false 处理,不作为交付能力使用。
 
 ### 构建（在本机命令行，见下方"本机编译"节）
 ```
@@ -144,27 +167,33 @@ hvigorw.bat --mode module -p module=entry@default -p product=default [-p buildMo
 
 ---
 
-## 六、当前状态（截至 2026-07-01）
+## 六、当前状态（截至 2026-07-02）
 
-**线上后台当前只配 3 个测试应用**(`curl https://maidun.chujingservice.com/api/config` 为准)：
-- K11 香港: `bundle:true`,29资源,压缩后约5.8MB。
-- 印尼出境卡(beacukai): `bundle:true`,12资源,按 `>=64KB` 或 `>=3000ms` 选择关键静态资源,压缩后约594KB。
-- Booking.com: `bundle:true`,9资源,首页被 AWS WAF challenge 拦截,不能服务端自动构建;当前为真机采集 `static.booking.cn` 慢/大 JS/CSS 后手动导入,压缩后约1.8MB。
-- 当前三站均关闭 `prerender` / `swrDoc` / `codeCache` / `prefetchChunks`,全局关闭 `bytecodeCache`,本轮只验证离线包和静态资源缓存带来的资源获取速度。
+当前线上与端侧以 [`新会话快速上下文.md`](新会话快速上下文.md) 为准。
 
-历史上曾临时加过 bilibili / michelin / translate / foodpanda / youtube / twitch / tiktok 等 7 个站点,当前线上配置已按本轮测试收敛,没有继续下发这些站点。
+**当前交付口径**:
+- 只保留后台离线包链路。
+- 端侧不做运行时静态资源自动缓存。
+- 端侧不做主文档 SWR、离屏预渲染、chunk 预取。
+- 调试浮窗显示 `包准备中` / `包下载 x/y` / `包完成 x/y`。
 
-**历史实测达成**:冷启动 ~430ms、点进应用/翻页预渲染秒开、印尼首屏136ms(离线包)。装机包 release 258KB。**用户确认"确实快"。** 当前线上配置为排除预渲染/SWR/字节码变量,只测资源缓存链路。
+**新加坡环球影城当前状态**:
+- ID: `rwsentosa`
+- URL: `https://www.rwsentosa.com/zh-cn/play/universal-studios-singapore`
+- `bundle:true`
+- `staticCache.enabled:false`
+- `swrDoc:false` / `prerender:false` / `prefetchChunks:false`
+- 离线包 27 条,原始约 `11265.9 KB`,端侧压缩落盘约 `7116.3 KB`
+- 已缓存 JS/CSS/字体,不缓存 MP4 视频和动态接口。
 
-**已做的功能（都真机验证、已部署线上）**：
-- 端侧秒开：离屏预渲染+优先级、离线包、主文档SWR、路由预取(只下静态资源)、占位绑FCP、黑名单拦遥测。
-- 版本号query资源可缓存(端云一致)——让 K11 这种 `?2025121805` 命名的资源也能离线。
-- 每应用精细配置：额外黑名单(如Booking遥测域只对Booking) + 预取开关，按 origin 生效。
-- 定位权限：网页"当前位置搜索"能用(module.json5 加权限 + EntryAbility 申请 + WebShared onGeolocationShow)。
-- 后台：一键探测detect、Apps离线包状态列、Bundles自动更新UI。
-- **离线包定时自动更新(一天一次)**：遍历 bundle:true 站 check→有更新update→失败fallback build重试3次，结果写 data/auto-update-log.json。
+**真机验证重点**:
+- `cache STORE ... bundle` 表示来自后台离线包,正确。
+- `cache STORE ... runtime` 当前不应再出现。
+- 首装/重装后沙箱为空,要等 `包完成 x/y` 后再判断离线包命中效果。
 
-**交付物**：`webaccel-SDK-api15.har`(58.6KB, API15, 连线上后台, 无签名无外部依赖, 给别人集成)。
+**交付物**:
+- `D:\Work\KCP\harm-youhua\_产物交付\webaccel-SDK交付包.zip`
+- 内容包含 `webaccel.har`、`接入指南.md`、`离线包说明.md`、`导出API清单.ets`、`项目简化时序图.md`。
 
 ---
 
@@ -174,7 +203,7 @@ hvigorw.bat --mode module -p module=entry@default -p product=default [-p buildMo
 1. **离线包 gzip 压缩** = 已评估搁置。HarmonyOS @ohos.zlib 无 gzip 内存解压API，端侧走临时文件笨路可能反拖慢。要做优先**传输层 gzip**(后端对 /bundles 开 gzip，端侧零改动)。
 2. **多租户配置**：当前所有接 SDK 的 App 共享一份后台配置。若要不同 App 显示不同站，需按 App 区分配置(新功能)。
 3. **后台规模化**(上架几十个应用时)：配置内存缓存、cache-builder 并发下载、Apps 批量操作/搜索、删应用清理 bundles。
-4. **端侧"更快/更小"已到位**——工作流分析结论：继续抠端侧代码收益小且有风险，剩余空间在后台配置层。LRU优化/预渲染节点上限等只在几十应用时才值得做。
+4. **端侧当前不再扩运行时缓存能力**——继续提升首屏体验优先从后台离线包资源选择、体积控制、黑名单和源站动态资源治理入手。
 
 **改代码的正确姿势**：
 - 改加速行为/缓存 → 先读 TROUBLESHOOTING.md。
@@ -186,9 +215,9 @@ hvigorw.bat --mode module -p module=entry@default -p product=default [-p buildMo
 
 ## 八、踩坑铁律（血泪教训，务必遵守）
 
-1. **永不缓存动态页的 HTML 主文档**——曾让路由预取缓 Next.js 表单页主文档(带会话状态)，导致印尼 BC32 直接 error。**预取/缓存只针对静态资源(JS/CSS/图片)，动态页 HTML 交给正常加载。** 主文档 SWR 只对入口首页。
+1. **不缓存 HTML 主文档**——曾让路由预取缓 Next.js 表单页主文档(带会话状态)，导致印尼 BC32 直接 error。当前定版不做主文档 SWR,HTML 交给正常加载。
 2. **不用脚本改页面 DOM/隐藏元素**——曾注入脚本用 `[class*=loading]` 模糊匹配隐藏元素，误伤正常轮播/banner 导致三站排版错乱。治 loading 滞后只控制"框架占位何时消失"(绑FCP/进度85%)，不碰页面。
-3. **不激进改缓存模式**——cacheMode 改 PREFER_CACHE 会破坏 SWR/动态内容，已否决，保持 Default。
+3. **不激进改缓存模式**——cacheMode 改 PREFER_CACHE 会破坏动态内容，已否决，保持 Default。
 4. **PowerShell 传中文会乱码**——curl PUT 中文到线上曾整批乱码。传中文配置用 base64 编码经 SSH，或直接写文件，别走 PowerShell+curl。
 5. **源站/网络问题不是框架的锅，别瞎改**——印尼 BC32 表单 error = 源站接口返回401(curl 绕过框架也401)；Booking 同意页顿一秒 = 网站自身加载脚本。这些是天花板，框架碰不了，如实标注。
 6. **本机适配文件不提交 git**——签名/bundleName/CONFIG_SERVER/hvigor版本是本机编译临时改，git 里保持原值，否则别人 clone 编译不了。

@@ -1,41 +1,56 @@
 # 更新维护指南(元服务 + SDK 版)
 
-本工程现在是**鸿蒙元服务(Atomic Service)**:`entry` 通过 `webaccel` HAR SDK 接入「网页应用集合」的多层加速。
+本工程现在是**鸿蒙元服务(Atomic Service)**:`entry` 通过 `webaccel` HAR SDK 接入「网页应用集合」的后台离线包方案。
 本文说明**网站更新、增删应用、改配置时该做什么**,以及**什么时候才真的需要重新发版**。
+
+---
+
+## 2026-07-02 当前口径
+
+当前 SDK 定版为“后台离线包 + 端侧拉包 + WebView 本地命中”:
+
+- 不做端侧运行时静态资源自动缓存。
+- 不做主文档 SWR。
+- 不做离屏预渲染。
+- 不做 chunk 预取。
+- 后台更新离线包后,端侧需要重新打开应用或调用 `WebAccel.refreshConfig()` 才会拉新版本。
+
+如果本文后面仍出现运行时缓存自愈、SWR、预渲染等历史描述,以本节、根目录 `新会话快速上下文.md` 和 `SDK_OFFLINE_BUNDLE.md` 为准。
 
 ---
 
 ## 一、现在的架构(读这一段就够)
 
-- `app/webaccel/` 是加速能力 **HAR SDK**;`app/entry/` 是**元服务本体**(`bundleType: atomicService` + `installationFree: true`),几行代码接入 SDK。
-- **纯远程模式**:不打 rawfile 内置包(元服务单包 ≤2MB),离线缓存全部运行时下载进沙箱(`filesDir`),不计包体。
-- 字节码注入层(`injectOfflineResources`)被元服务平台禁用,**已移除**;其余加速层照常工作:
-  - **离线缓存拦截**(内容 hash 不可变资源)—— 自愈,越用越快;
-  - **主文档 SWR**(陈旧即用 + 启动校验指纹)—— 站点更新自动换新版;
-  - **离屏预渲染**(BuilderNode)—— 点开秒显;
-  - **全量 chunk 预取** —— 二级页面 JS 提前到本地;
-  - **黑名单短路** —— 拦掉国内不可达的统计/广告/翻译,避免卡 load。
-- **配置(应用列表 / 黑名单 / 设置)和离线包都来自 `admin` 后台**:开机拉配置;打开某网页应用时按需下载该站离线包进沙箱(同一 app 本次运行只拉一次)。
+- `app/webaccel/` 是 **HAR SDK**;`app/entry/` 是**元服务本体**(`bundleType: atomicService` + `installationFree: true`),几行代码接入 SDK。
+- **纯远程离线包模式**:不打 rawfile 内置包(元服务单包 ≤2MB),离线包由后台托管,端侧下载进沙箱(`filesDir/webcache`),不计包体。
+- 字节码注入层(`injectOfflineResources`)被元服务平台禁用,已移除。
+- 当前只保留:
+  - 后台 `/api/config` 下发应用列表、黑名单、离线包地址和版本号。
+  - SDK 对 `bundle:true` 站点下载后台离线包。
+  - WebView 请求原站 URL 时由 SDK 拦截并命中本地离线包。
+  - 黑名单短路,拦掉国内不可达或低价值第三方请求。
+- 当前不保留:运行时静态资源自动缓存、主文档 SWR、离屏预渲染、chunk 预取。
 
 ---
 
-## 二、网站(如 ecd.beacukai.go.id)更新后 → 不用做任何事
+## 二、网站资源更新后 → 后台重建离线包
 
-- **运行时缓存**:新版本 JS 是新 hash → 新 URL → 本地没有 → 自动拉新并缓存(自愈)。
-- **主文档校验**:每次启动(节流)重拉首页比指纹,变了 = 站点更新 → 覆盖缓存并刷新 WebView,用户**下次启动自动拿到新版**。
+如果源站 JS/CSS/字体 URL 变化,需要后台重新构建或手动导入新的静态资源。端侧不会自己把用户访问过的新资源写入缓存。
 
-「能用」「拿到新版」都是自动的。
+后台离线包更新后,端侧需要重新打开应用或调用 `WebAccel.refreshConfig()` 才会发现新版本并下载。
 
 ---
 
-## 三、离线包要更新得更快 → 在 admin 后台点「服务端打包」
+## 三、离线包更新 → 在 admin 后台构建或导入
 
-离线包(首页 + 各路由 chunk)由后台托管。网站大改后想让二级页面更快:
+离线包由后台托管。网站大改后:
 
-1. 进 `admin` 后台 → 应用管理 → 对目标 app 点一次**服务端打包**(重抓最新 chunk)。
-2. 完事。App **下次打开该网页应用时自动下最新离线包进沙箱**,无需重新发版。
+1. 进 `admin` 后台。
+2. 对目标 app 重新构建离线包,或在离线包资源面板手动导入关键静态资源 URL。
+3. 后台重新生成 `manifest.json` / `manifest.zz.json` 和版本号。
+4. 端侧重新打开应用或调用 `WebAccel.refreshConfig()` 后下载新离线包。
 
-> 没点也能用:运行时缓存会在用户点进去时自愈,只是首次稍慢一次。
+未进入离线包的资源仍会走网络,但不会被端侧运行时自动缓存。
 
 ---
 
@@ -45,9 +60,9 @@
 
 - 新增/删除应用、改名改 URL、是否启用离线包;
 - 过滤黑名单(被墙第三方);
-- 缓存上限 / 主文档校验节流。
+- 沙箱上限 / 离线包下载并发。
 
-> 不依赖后台也行:`WebAccel.init(ctx, { apps: [...] })` 直供列表(纯本地模式,不下离线包,靠运行时缓存自愈)。
+> 不依赖后台也行:`WebAccel.init(ctx, { apps: [...] })` 直供列表。但纯本地模式没有后台 manifest,不会下载离线包。
 
 ---
 
@@ -70,10 +85,10 @@ hvigorw --mode module -p module=entry@default -p product=default assembleHap
 
 ## 六、改 SDK 代码时务必守住的两条红线
 
-1. **不增包体**:不要打 rawfile 内置包;缓存只走运行时沙箱。当前签名 HAP ≈ 308KB,元服务单包上限 2MB、总计 10MB。
+1. **不增包体**:不要打 rawfile 内置包;后台离线包只在运行时落到接入方应用沙箱。当前签名 HAP ≈ 308KB,元服务单包上限 2MB、总计 10MB。
 2. **不碰元服务禁用 API**:`injectOfflineResources` / `webview.OfflineResourceType` / `OfflineResourceMap`(字节码注入整层)在元服务编译期就报错,别加回来。
 
-接入代码就三处:`WebAccel.init` → `WebAccel.attach` + `WebAccel.prewarm` → `WebAccelView`。详见 `webaccel/README.md`。
+推荐接入只需要 `WebAccel.init` + `WebAccelLauncher`。自定义壳再使用 `WebAccelView`。详见 `webaccel/README.md`。
 
 ---
 

@@ -140,6 +140,7 @@ class WebCacheManager {
   private bundleConcurrency: number = BUNDLE_CONCURRENCY; // 远程离线包下载并发(可远程下发)
   private prefetchEnabled: boolean = true;          // 是否预取全站 chunk(可远程下发)
   private staticCachePolicy: StaticCachePolicy = {}; // 全局运行时静态资源缓存策略
+  private runtimePrefetchAllowed: boolean = false;  // 端侧运行时预取/自动缓存固定关闭，只允许后台离线包落盘
   // 每应用精细配置:按 origin 索引。mergedBlockByOrigin = 全局黑名单 + 该应用 extraBlockHosts(预算好,intercept 热路径直接查)
   private mergedBlockByOrigin: Map<string, string[]> = new Map();
   private prefetchByOrigin: Map<string, boolean> = new Map(); // 该应用的 prefetchChunks 覆盖值
@@ -191,7 +192,6 @@ class WebCacheManager {
       this.loadRawManifest();
       this.loadDiskIndex();
       this.loadBundleState();
-      this.warmCompressedDiskEntries();
       this.ready = true;
       hilog.info(DOMAIN, TAG, 'ready, raw=%{public}d disk=%{public}d bytes=%{public}d',
         this.rawIndex.size, this.diskIndex.size, this.totalBytes);
@@ -203,9 +203,10 @@ class WebCacheManager {
 
   /** 开启主文档的 SWR(陈旧即用)缓存。传入要缓存的文档 URL(通常是首页) */
   enableDocCache(urls: string[]): void {
-    for (let i = 0; i < urls.length; i++) {
-      this.docUrls.add(urls[i]);
+    if (!urls || urls.length === 0) {
+      return;
     }
+    // 当前 SDK 只保留后台离线包能力，不再启用端侧主文档 SWR 缓存。
   }
 
   private prefetchedRouteOrigins: Set<string> = new Set();
@@ -219,6 +220,9 @@ class WebCacheManager {
    */
   prefetchRoutes(origin: string, routes: string[]): void {
     if (!origin || origin.length === 0 || !routes || routes.length === 0) {
+      return;
+    }
+    if (!this.runtimePrefetchAllowed) {
       return;
     }
     if (this.prefetchedRouteOrigins.has(origin)) {
@@ -360,6 +364,19 @@ class WebCacheManager {
         }
       }
       this.mergedBlockByOrigin.set(origin, merged);
+      if (app.extraBlockHosts && app.extraBlockHosts.length > 0) {
+        for (let j = 0; j < app.extraBlockHosts.length; j++) {
+          const h: string = app.extraBlockHosts[j];
+          const hm = h.match(/^https?:\/\/[^\/]+/);
+          let blockOrigin: string = hm ? hm[0] : '';
+          if (blockOrigin.length === 0 && h.indexOf('.') > 0 && h.indexOf('/') < 0) {
+            blockOrigin = 'https://' + h;
+          }
+          if (blockOrigin.length > 0 && !this.mergedBlockByOrigin.has(blockOrigin)) {
+            this.mergedBlockByOrigin.set(blockOrigin, merged);
+          }
+        }
+      }
       // 每应用 prefetchChunks 覆盖(只在显式下发布尔值时记录)
       if (typeof app.prefetchChunks === 'boolean') {
         this.prefetchByOrigin.set(origin, app.prefetchChunks);
@@ -368,20 +385,7 @@ class WebCacheManager {
       if (app.userAgent && app.userAgent.length > 0) {
         this.uaByOrigin.set(origin, app.userAgent);
       }
-      // 每应用运行时静态资源缓存策略(按 origin 生效)
-      if (app.staticCache) {
-        this.staticPolicyByOrigin.set(origin, app.staticCache);
-        if (app.bundleExtraUrls && app.bundleExtraUrls.length > 0) {
-          for (let j = 0; j < app.bundleExtraUrls.length; j++) {
-            const ref: string = app.bundleExtraUrls[j];
-            const rm: RegExpMatchArray | null = ref ? ref.match(/^https?:\/\/[^\/]+/) : null;
-            const resourceOrigin: string = rm ? rm[0] : '';
-            if (resourceOrigin.length > 0) {
-              this.staticPolicyByOrigin.set(resourceOrigin, app.staticCache);
-            }
-          }
-        }
-      }
+      // 运行时静态资源自动缓存已禁用。端侧只下载后台 manifest 中的离线包资源。
       // 仅 bundle:true 的站记 origin→appId,用于"离线包资源实际读不出→上报后台自愈"
       if (app.bundle === true && app.id && app.id.length > 0) {
         this.bundleAppByOrigin.set(origin, app.id);
@@ -510,6 +514,58 @@ class WebCacheManager {
     return true;
   }
 
+  private wordpressStableStaticKey(url: string): string {
+    const q: number = url.indexOf('?');
+    if (q < 0) {
+      return '';
+    }
+    const path: string = url.substring(0, q);
+    const query: string = url.substring(q + 1);
+    if (query.indexOf('&') >= 0 || query.indexOf('=') < 0) {
+      return '';
+    }
+    const eq: number = query.indexOf('=');
+    const key: string = query.substring(0, eq).toLowerCase();
+    const value: string = query.substring(eq + 1);
+    if (key !== 'ver' || value.length === 0 || !/^[0-9.]+$/.test(value)) {
+      return '';
+    }
+    const lower: string = path.toLowerCase();
+    const isWpStatic: boolean =
+      lower.indexOf('/wp-content/') >= 0 || lower.indexOf('/wp-includes/') >= 0;
+    if (!isWpStatic) {
+      return '';
+    }
+    if (!(lower.endsWith('.js') || lower.endsWith('.css') ||
+      lower.endsWith('.woff') || lower.endsWith('.woff2') ||
+      lower.endsWith('.ttf') || lower.endsWith('.otf'))) {
+      return '';
+    }
+    return path;
+  }
+
+  private matchingWordpressStaticKey(url: string): string {
+    const stableKey: string = this.wordpressStableStaticKey(url);
+    if (stableKey.length === 0) {
+      return '';
+    }
+    let found: string = '';
+    this.diskIndex.forEach((_entry: DiskEntry, key: string) => {
+      if (found.length === 0 && this.wordpressStableStaticKey(key) === stableKey) {
+        found = key;
+      }
+    });
+    if (found.length > 0) {
+      return found;
+    }
+    this.rawIndex.forEach((_entry: RawEntry, key: string) => {
+      if (found.length === 0 && this.wordpressStableStaticKey(key) === stableKey) {
+        found = key;
+      }
+    });
+    return found;
+  }
+
   /**
    * 运行时静态资源是否值得写入沙箱。默认无阈值=沿用旧逻辑全部缓存;
    * 配了阈值后,只保留"大资源"或"慢资源",避免 200MB 沙箱被低价值小资源吃掉。
@@ -554,9 +610,7 @@ class WebCacheManager {
     if (typeof s.prefetchChunks === 'boolean') {
       this.prefetchEnabled = s.prefetchChunks;
     }
-    if (s.staticCache) {
-      this.staticCachePolicy = s.staticCache;
-    }
+    this.staticCachePolicy = { enabled: false };
     hilog.info(DOMAIN, TAG, 'settings applied cap=%{public}dB docCheck=%{public}dms bundleConcurrency=%{public}d prefetch=%{public}s staticMin=%{public}dKB/%{public}dms',
       this.diskCapBytes, this.docCheckMs, this.bundleConcurrency, this.prefetchEnabled ? 'on' : 'off',
       this.staticCachePolicy.minSizeKB ? this.staticCachePolicy.minSizeKB : 0,
@@ -566,10 +620,21 @@ class WebCacheManager {
   /** 查询某站离线包下载进度(无则返回 null) */
   getBundleProgress(origin: string): BundleProgress | null {
     const p: BundleProgressEntry | undefined = this.bundleProgress.get(origin);
-    if (!p) {
-      return null;
+    if (p) {
+      return { total: p.total, done: p.done };
     }
-    return { total: p.total, done: p.done };
+    const state: BundleState | undefined = this.bundleState.get(origin);
+    if (state && state.urls && state.urls.length > 0) {
+      let done: number = 0;
+      for (let i = 0; i < state.urls.length; i++) {
+        const u: string = state.urls[i];
+        if (this.diskIndex.has(u) || this.rawIndex.has(u)) {
+          done++;
+        }
+      }
+      return { total: state.urls.length, done: done };
+    }
+    return null;
   }
 
   /** 某资源下完后:若属于某站离线包,推进其完成计数 */
@@ -591,6 +656,12 @@ class WebCacheManager {
   prefetchSiteChunks(originUrl: string): void {
     const om = originUrl.match(/^https?:\/\/[^\/]+/);
     const origin: string = om ? om[0] : '';
+    if (origin.length === 0) {
+      return;
+    }
+    if (!this.runtimePrefetchAllowed) {
+      return;
+    }
     // 每应用 prefetchChunks 覆盖优先;未下发则用全局 prefetchEnabled
     const appOverride: boolean | undefined = origin.length > 0 ? this.prefetchByOrigin.get(origin) : undefined;
     const enabled: boolean = typeof appOverride === 'boolean' ? appOverride : this.prefetchEnabled;
@@ -641,11 +712,23 @@ class WebCacheManager {
    * 通用可缓存判断:只收"内容 hash 命名的不可变静态资源"(任何打包器都适用),
    * 以及 Next.js 图片优化端点。hash 一变 URL 就变 → 永不发旧,无视 No-Store 也安全。
    */
+  private shouldTraceStaticMiss(url: string): boolean {
+    const q: number = url.indexOf('?');
+    const path: string = (q >= 0 ? url.substring(0, q) : url).toLowerCase();
+    return path.endsWith('.js') || path.endsWith('.mjs') || path.endsWith('.css') ||
+      path.endsWith('.woff') || path.endsWith('.woff2') || path.endsWith('.ttf') ||
+      path.endsWith('.otf') || path.endsWith('.eot');
+  }
+
   shouldCache(url: string): boolean {
     if (url.indexOf('/_next/image?') >= 0) {
       return true; // 参数固定→输出确定,已验证可缓存
     }
-    return this.isHashedAsset(url);
+    const ok: boolean = this.isHashedAsset(url);
+    if (ok && this.shouldTraceStaticMiss(url)) {
+      hilog.info(DOMAIN, TAG, 'static REQ %{public}s', url);
+    }
+    return ok;
   }
 
   /**
@@ -791,32 +874,54 @@ class WebCacheManager {
       return null;
     }
 
-    if (!this.shouldCache(url)) {
+    let cacheKey: string = url;
+    let disk: DiskEntry | undefined = this.diskIndex.get(cacheKey);
+    let raw: RawEntry | undefined = this.rawIndex.get(cacheKey);
+    if (disk === undefined && raw === undefined) {
+      const matchingKey: string = this.matchingWordpressStaticKey(url);
+      if (matchingKey.length > 0) {
+        cacheKey = matchingKey;
+        disk = this.diskIndex.get(cacheKey);
+        raw = this.rawIndex.get(cacheKey);
+      }
+    }
+    const explicitBundle: boolean = (disk !== undefined && disk.source === 'bundle') || raw !== undefined;
+    if (!explicitBundle && !this.shouldCache(url)) {
       return null;
     }
 
     // ① 沙箱运行时缓存(最新)
-    const disk: DiskEntry | undefined = this.diskIndex.get(url);
     if (disk) {
+      if (disk.source !== 'bundle') {
+        this.removeCached(cacheKey);
+        this.saveDiskIndex();
+        return null;
+      }
       if (disk.encoding && disk.encoding.length > 0) {
-        const decoded: ArrayBuffer | undefined = this.decodedMemory.get(url);
+        const decoded: ArrayBuffer | undefined = this.decodedMemory.get(cacheKey);
         if (decoded !== undefined) {
           disk.atime = Date.now();
           this.hitDisk++;
           return this.buildResponse(decoded, disk.mime, true);
         }
         const packedPath: string = this.cacheDir + '/' + disk.file;
-        if (fs.accessSync(packedPath)) {
+        let packedExists: boolean = false;
+        try {
+          packedExists = fs.accessSync(packedPath);
+        } catch (e) {
+          packedExists = false;
+        }
+        if (packedExists) {
           disk.atime = Date.now();
-          this.warmDecodedEntry(url, disk);
+          this.warmDecodedEntry(cacheKey, disk);
           this.miss++;
           return null;
         }
         this.totalBytes -= disk.size;
-        this.diskIndex.delete(url);
-        this.decodedMemory.delete(url);
-        this.decoding.delete(url);
-        this.reportBundleCorruptIfNeeded(url);
+        this.diskIndex.delete(cacheKey);
+        this.decodedMemory.delete(cacheKey);
+        this.decoding.delete(cacheKey);
+        this.reportBundleCorruptIfNeeded(cacheKey);
       }
       const buf: ArrayBuffer | null = this.readFile(this.cacheDir + '/' + disk.file);
       if (buf) {
@@ -825,14 +930,13 @@ class WebCacheManager {
         return this.buildResponse(buf, disk.mime, true);
       }
       this.totalBytes -= disk.size; // 文件丢了,清脏索引
-      this.diskIndex.delete(url);
+      this.diskIndex.delete(cacheKey);
       // 自愈:若这个读不出的文件属于某站离线包(不是普通运行时缓存被LRU清掉),上报后台重建该站离线包。
       // 端侧本身已"清脏索引→放行走网络"不会白屏;上报只为让服务端离线包恢复,下个用户首屏即快。
-      this.reportBundleCorruptIfNeeded(url);
+      this.reportBundleCorruptIfNeeded(cacheKey);
     }
 
     // ② rawfile 内置包
-    const raw: RawEntry | undefined = this.rawIndex.get(url);
     if (raw) {
       const resp: WebResourceResponse | null = this.serveRaw(raw);
       if (resp) {
@@ -841,37 +945,22 @@ class WebCacheManager {
       }
     }
 
-    // ③ 未命中:放行,记 pending,等页面加载完再回填(不抢首屏带宽)
+    // ③ 未命中:直接放行网络。运行时自动回填缓存已禁用。
     this.miss++;
-    if (!this.inflight.has(url) && !this.rawIndex.has(url)) {
-      this.pending.add(url);
-    }
     return null;
   }
 
   /** 页面加载完成后调用:把本次未命中的静态资源后台抓回,供下次秒开 */
   flushPending(): void {
-    if (this.pending.size === 0) {
-      return;
-    }
-    const urls: string[] = [];
-    this.pending.forEach((u: string) => {
-      urls.push(u);
-    });
     this.pending.clear();
-    for (let i = 0; i < urls.length; i++) {
-      this.download(urls[i]);
-    }
-    hilog.info(DOMAIN, TAG, 'flush %{public}d pending', urls.length);
   }
 
   /** 可选:用已知清单主动预热 */
   seed(urls: string[]): void {
-    for (let i = 0; i < urls.length; i++) {
-      if (this.shouldCache(urls[i]) && !this.diskIndex.has(urls[i]) && !this.rawIndex.has(urls[i])) {
-        this.download(urls[i]);
-      }
+    if (!urls || urls.length === 0) {
+      return;
     }
+    // 端侧不再主动抓取资源写入沙箱。请在后台离线包中配置需要缓存的 URL。
   }
 
   /** 调试统计快照 */
@@ -979,7 +1068,10 @@ class WebCacheManager {
   }
 
   private download(url: string): void {
-    this.fetchAndStore(url, '', '', false);
+    if (!url || url.length === 0) {
+      return;
+    }
+    // 运行时缓存、路由预取、chunk 预取统一禁用；离线包下载走 enqueueBundleDownload。
   }
 
   /**
@@ -992,6 +1084,12 @@ class WebCacheManager {
   private fetchAndStore(cacheKey: string, sourceUrl: string, forceMime: string, overwrite: boolean,
     onDone?: (ok: boolean) => void, sourceKind: string = 'runtime',
     contentEncoding: string = '', rawSize: number = 0): void {
+    if (sourceKind !== 'bundle') {
+      if (onDone) {
+        onDone(false);
+      }
+      return;
+    }
     const src: string = sourceUrl && sourceUrl.length > 0 ? sourceUrl : cacheKey;
     if (this.inflight.has(cacheKey)) {
       if (onDone) {
@@ -1143,9 +1241,13 @@ class WebCacheManager {
     // 版本门:已应用版本 == 当前下发版本 → 离线包无变化,直接用本地(连清单都不拉)
     const applied: BundleState | undefined = this.bundleState.get(origin);
     if (bundleVersion.length > 0 && applied !== undefined && applied.version === bundleVersion) {
+      this.warmCompressedDiskEntriesForUrls(applied.urls);
       return;
     }
     if (this.loadedBundles.has(origin)) {
+      if (applied !== undefined) {
+        this.warmCompressedDiskEntriesForUrls(applied.urls);
+      }
       if (bundleVersion.length > 0) {
         const current: BundleState | undefined = this.bundleState.get(origin);
         if (current !== undefined && current.version !== bundleVersion) {
@@ -1412,6 +1514,19 @@ class WebCacheManager {
         this.warmDecodedEntry(url, entry);
       }
     });
+  }
+
+  private warmCompressedDiskEntriesForUrls(urls: string[]): void {
+    if (!urls || urls.length === 0) {
+      return;
+    }
+    for (let i = 0; i < urls.length; i++) {
+      const url: string = urls[i];
+      const entry: DiskEntry | undefined = this.diskIndex.get(url);
+      if (entry && entry.encoding && entry.encoding.length > 0) {
+        this.warmDecodedEntry(url, entry);
+      }
+    }
   }
 
   private warmDecodedEntry(url: string, entry: DiskEntry): void {

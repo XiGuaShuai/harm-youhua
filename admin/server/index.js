@@ -922,6 +922,7 @@ app.post('/api/admin/bundles/:id/import', async (req, res) => {
     metrics[item.url] = {
       size: item.size,
       measuredSize: input.size || item.size,
+      mime: item.mime || '',
       costMs: input.costMs || item.costMs || 0,
       source: input.source || (input.costMs ? 'device' : 'server-import'),
       measuredAt: new Date().toISOString()

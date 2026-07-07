@@ -4,7 +4,7 @@
 
 ```
 youhua-mono/
-├── app/                鸿蒙元服务(Atomic Service)工程 —— 多层加速(离线缓存 / 离屏预渲染 / chunk 预取 / 远程配置)
+├── app/                鸿蒙元服务(Atomic Service)工程 —— 后台离线包 + WebView 拦截 + 远程配置
 │   ├── webaccel/       加速能力封装成的 HAR SDK(被 entry 依赖,也可被别的工程复用)
 │   └── entry/          元服务本体(installationFree,消费 webaccel)
 └── admin/              配套后台 —— server(Node+Express 配置 API + 离线包托管)+ web(Vue3 + Vite + Element Plus + Pinia 管理界面)
@@ -14,8 +14,10 @@ youhua-mono/
 
 ## 两者关系
 
-- **app** 是端侧元服务:加速能力抽成 `webaccel` HAR SDK,`entry` 是消费它的**元服务本体**(`bundleType: atomicService` + `installationFree: true`);**开机从服务器拉配置**(应用 / 黑名单 / 设置),打开网页应用时**按需下载离线包**进沙箱,带自愈式缓存。
-- **admin** 是后台:让端侧 **开机从服务器拉配置** 和 **离线包**,改东西不用重新发版。
+- **app** 是端侧元服务:加速能力抽成 `webaccel` HAR SDK,`entry` 是消费它的**元服务本体**(`bundleType: atomicService` + `installationFree: true`);**开机从服务器拉配置**(应用 / 黑名单 / 设置),按后台 manifest 下载离线包进沙箱,WebView 请求命中本地离线包。
+- **admin** 是后台:负责配置应用、筛选大资源/慢资源、生成并托管离线包。后台改配置不用重新发版,但端侧需要重新打开应用或主动 `WebAccel.refreshConfig()` 才会拉到新版本。
+
+> 新会话先读 [新会话快速上下文.md](新会话快速上下文.md)。当前定版口径:端侧不做运行时静态资源自动缓存,不做预渲染,不做 SWR 主文档缓存,不做 chunk 预取;只保留后台离线包链路。
 
 SDK API 与元服务注意事项见 `app/webaccel/README.md`;后台接入见 `admin/README.md`;更新/发版流程见 `app/UPDATE.md`。
 
@@ -47,8 +49,8 @@ cd admin/web && npm install && npm run dev
 
 ## SDK 离线包说明
 
-SDK 作为接入方能力时,离线包会由接入方 App 端侧自动下载并存入接入方自己的沙箱。多站点 `bundle:true` 会逐站预下载,用于页面秒开。详细边界、压缩策略、K11 实测体积和后台配置要求见 [SDK_OFFLINE_BUNDLE.md](SDK_OFFLINE_BUNDLE.md)。
+SDK 作为接入方能力时,离线包会由接入方 App 端侧下载并存入接入方自己的沙箱。服务端配置拉取成功后,多站点 `bundle:true` 会全部进入下载队列,用于后续 WebView 请求本地命中。详细边界、压缩策略、RWS 当前状态和后台配置要求见 [SDK_OFFLINE_BUNDLE.md](SDK_OFFLINE_BUNDLE.md)。
 
-当前后台、端侧、压缩离线包、手动导入和运行时缓存的完整架构图见 [OFFLINE_BUNDLE_ARCHITECTURE.md](OFFLINE_BUNDLE_ARCHITECTURE.md)。
+当前后台、端侧、压缩离线包、手动导入和命中流程见 [OFFLINE_BUNDLE_ARCHITECTURE.md](OFFLINE_BUNDLE_ARCHITECTURE.md)。
 
-重装或首次安装后沙箱为空,SDK 需要先把后台开启的站点离线包下载完成;在对应站点显示 `包 total/total` 前立即进入页面,仍可能因为缺少 chunk 走网络而卡顿。
+重装或首次安装后沙箱为空,SDK 需要先把后台开启的站点离线包下载完成;调试浮窗显示 `包下载 x/y` 时首次进入仍可能慢,显示 `包完成 x/y` 后才是离线包命中后的效果。

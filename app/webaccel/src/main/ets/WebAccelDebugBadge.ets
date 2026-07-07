@@ -79,9 +79,15 @@ export struct WebAccelDebugBadge {
     const origin: string = this.originOf(app.url);
     const bp: BundleProgress | null = webCache.getBundleProgress(origin);
     if (bp && bp.total > 0) {
-      return `包 ${bp.done}/${bp.total}`;
+      if (bp.done >= bp.total) {
+        return `包完成 ${bp.done}/${bp.total}`;
+      }
+      return `包下载 ${bp.done}/${bp.total}`;
     }
-    return `缓 ${webCache.cachedCountForOrigin(origin)} 条`;
+    if (app.bundle === true) {
+      return '包准备中';
+    }
+    return '未配置离线包';
   }
 
   build() {

@@ -10,6 +10,12 @@ const DATA_FILE = path.join(__dirname, 'data', 'config.json');
 const BUNDLES_DIR = path.join(__dirname, 'bundles');
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36';
 
+function uaOf(appCfg) {
+  return appCfg && typeof appCfg.userAgent === 'string' && appCfg.userAgent.trim()
+    ? appCfg.userAgent.trim()
+    : UA;
+}
+
 function mimeOf(u) {
   const p = u.split('?')[0].toLowerCase(); // 剥掉版本号 query 再判扩展名
   if (p.endsWith('.js') || p.endsWith('.mjs')) return 'application/javascript';
@@ -31,6 +37,11 @@ function mimeOf(u) {
 
 async function fetchText(url, headers = {}) {
   const r = await fetch(url, { headers: { 'User-Agent': UA, ...headers } });
+  return r.ok ? await r.text() : '';
+}
+
+async function fetchAppText(appCfg, url, headers = {}) {
+  const r = await fetch(url, { headers: { 'User-Agent': uaOf(appCfg), ...headers } });
   return r.ok ? await r.text() : '';
 }
 
@@ -134,6 +145,12 @@ function metricCostMs(appCfg, url, fallback = 0) {
   return Number.isFinite(n) && n > 0 ? n : fallback;
 }
 
+function metricMime(appCfg, url, fallback = '') {
+  const m = configuredResourceMetric(appCfg, url);
+  const mime = String(m && m.mime || '').trim();
+  return mime || fallback;
+}
+
 // 与端侧 staticCache 语义一致:exclude 优先,include 强制保留;否则按大资源/慢资源阈值保留。
 function shouldKeepStaticByPolicy(appCfg, url, sizeBytes, costMs) {
   const p = appCfg.staticCache || {};
@@ -161,7 +178,7 @@ function manifestEntry(entry, outDir, extra = {}) {
     size = buf.length;
     if (!hash) hash = sha256(buf);
   }
-  const out = { url: entry.url, file: entry.file, mime: entry.mime || mimeOf(entry.file), size, hash };
+  const out = { url: entry.url, file: entry.file, mime: extra.mime || entry.mime || mimeOf(entry.file), size, hash };
   if (typeof extra.costMs === 'number') out.costMs = extra.costMs;
   return out;
 }
@@ -335,7 +352,7 @@ async function discoverResources(appCfg) {
   const jsSet = new Set(), cssSet = new Set(), fontSet = new Set();
   const extraSet = new Set();
 
-  const html = await fetchText(entryUrl);
+  const html = await fetchAppText(appCfg, entryUrl);
   if (!html) throw new Error('抓取入口页失败');
 
   // ① Next.js 专用:/_next/static + webpack runtime + 各路由 RSC(对 Next 站抓得最全)
@@ -343,11 +360,11 @@ async function discoverResources(appCfg) {
   matchAll(html, /\/_next\/static\/css\/[A-Za-z0-9._-]+\.css/g).forEach((x) => cssSet.add(x));
   const wp = matchAll(html, /\/_next\/static\/chunks\/webpack-[a-f0-9]+\.js/g)[0];
   if (wp) {
-    const wpText = await fetchText(origin + wp);
+    const wpText = await fetchAppText(appCfg, origin + wp);
     matchAll(wpText, /static\/chunks\/[A-Za-z0-9/._-]+\.js/g).forEach((x) => jsSet.add('/_next/' + x));
   }
   for (const r of routes) {
-    const rsc = await fetchText(origin + r + '?_rsc=warm', { RSC: '1' });
+    const rsc = await fetchAppText(appCfg, origin + r + '?_rsc=warm', { RSC: '1' });
     matchAll(rsc, /static\/chunks\/[A-Za-z0-9/._-]+\.js/g).forEach((x) => jsSet.add('/_next/' + x));
   }
 
@@ -366,7 +383,7 @@ async function discoverResources(appCfg) {
 
   // ③ 从每个 CSS 里抓字体/媒体(Next 的 /_next/static/media + 通用 url() 同源 hash 资源)
   for (const c of cssSet) {
-    const css = await fetchText(origin + c);
+    const css = await fetchAppText(appCfg, origin + c);
     matchAll(css, /\/_next\/static\/media\/[A-Za-z0-9/._-]+\.(?:ttf|woff2|woff|otf)/g).forEach((x) => fontSet.add(x));
     for (const m of css.matchAll(/url\(\s*['"]?([^'")?#]+\.(?:woff2|woff|ttf|otf|eot))/gi)) {
       const p = sameOriginPath(m[1], origin, origin + c);
@@ -390,7 +407,7 @@ async function discoverResources(appCfg) {
     resources.push({ url: origin + u, sourceUrl: origin + u, file: fileNameForPath(u), mime: mimeOf(u) });
   }
   for (const u of extraSet) {
-    resources.push({ url: u, sourceUrl: u, file: fileNameForPath(u), mime: mimeOf(u) });
+    resources.push({ url: u, sourceUrl: u, file: fileNameForPath(u), mime: metricMime(appCfg, u, mimeOf(u)) });
   }
 
   const seen = new Set();
@@ -467,9 +484,9 @@ function validateDownloaded(entry, res, buf) {
   }
 }
 
-async function downloadResource(entry, outDir) {
+async function downloadResource(appCfg, entry, outDir) {
   const started = Date.now();
-  const res = await fetch(entry.sourceUrl, { headers: { 'User-Agent': UA } });
+  const res = await fetch(entry.sourceUrl, { headers: { 'User-Agent': uaOf(appCfg) } });
   if (!res.ok) throw new Error(`${res.status} ${entry.sourceUrl}`);
   const buf = Buffer.from(await res.arrayBuffer());
   if (!buf.length) throw new Error(`empty ${entry.sourceUrl}`);
@@ -521,7 +538,7 @@ async function updateServerCache(appCfg) {
       continue;
     }
     try {
-      const got = await downloadResource(entry, outDir);
+      const got = await downloadResource(appCfg, entry, outDir);
       const costMs = metricCostMs(appCfg, entry.url, got.costMs);
       if (!requiredUrls.has(entry.url) && !shouldKeepStaticByPolicy(appCfg, entry.url, got.size, costMs)) {
         fs.rmSync(target, { force: true });
@@ -605,7 +622,7 @@ async function buildServerCache(appCfg) {
     if (isBundleExcluded(appCfg, e.url)) { skippedByConfig++; continue; }
     try {
       const started = Date.now();
-      const res = await fetch(e.sourceUrl, { headers: { 'User-Agent': UA } });
+      const res = await fetch(e.sourceUrl, { headers: { 'User-Agent': uaOf(appCfg) } });
       if (!res.ok) {
         failed++;
         if (requiredUrls.has(e.url)) requiredFailed.push({ url: e.url, error: `${res.status}` });
@@ -677,7 +694,7 @@ function buildCacheManifest(appCfg) {
     if (!url) continue;
     if (isBundleExcluded(appCfg, url)) continue;
     const costMs = metricCostMs(appCfg, url, old && typeof old.costMs === 'number' ? old.costMs : 0);
-    manifest.push(manifestEntry({ url, file, mime: old && old.mime ? old.mime : mimeOf(file) }, outDir, {
+    manifest.push(manifestEntry({ url, file, mime: old && old.mime ? old.mime : metricMime(appCfg, url, mimeOf(file)) }, outDir, {
       size: old && typeof old.size === 'number' ? old.size : 0,
       hash: old && old.hash ? old.hash : '',
       costMs

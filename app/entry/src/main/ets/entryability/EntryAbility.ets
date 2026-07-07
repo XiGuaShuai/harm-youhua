@@ -10,20 +10,327 @@ const DOMAIN = 0x0000;
  * 兜底应用列表:后台拉不到/不可达(或首装沙箱无缓存)时先用它,列表不至于空白。
  * 后台可达时以 /api/config 为准覆盖。这是「接入方/demo 自己的数据」,不进 SDK。
  */
+const PREMIER_INN_UA: string =
+  'Mozilla/5.0 (iPhone; CPU iPhone OS 18_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.5 Mobile/15E148 Safari/604.1';
+
+const BRITISH_MUSEUM_UA: string =
+  'Mozilla/5.0 (Linux; Android 14; Pixel 8 Build/UQ1A.240205.002) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Mobile Safari/537.36';
+
+const BURJ_KHALIFA_UA: string =
+  'Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Mobile Safari/537.36';
+
+const GETYOURGUIDE_UA: string =
+  'Mozilla/5.0 (Phone; OpenHarmony 6.0) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36  ArkWeb/6.0.0.130 Mobile';
+
+const SURIA_KLCC_UA: string =
+  'Mozilla/5.0 (Phone; OpenHarmony 5.0) AppleWebKit/537.36 (KHTML,like Gecko) Chrome/114.0.0.0 Safari/537.36 ArkWeb/4.1.6.1 Mobile HuaweiBrowser/1.2.10.310';
+
+const TMB_UA: string =
+  'Mozilla/5.0 (Phone; OpenHarmony 6.0) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36  ArkWeb/6.0.0.130 Mobile';
+
+const VEXERE_UA: string =
+  'Mozilla/5.0 (iPhone; CPU iPhone OS 18_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.5 Mobile/15E148 Safari/604.1';
+
+const HANCHAO_SUBWAY_UA: string =
+  'Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1';
+
 const FALLBACK_APPS: RemoteApp[] = [
   {
-    id: 'k11', name: 'K11 香港', url: 'https://hk.k11.com/zh-cn', routes: [],
-    swrDoc: false, prerender: false, bundle: true, prefetchChunks: false,
-    compressedManifestUrl: '/bundles/k11/manifest.zz.json',
-    staticCache: {
-      enabled: true,
-      minSizeKB: 0,
-      minDurationMs: 3000,
-      maxSizeKB: 5120,
-      include: ['/files/art/js/bundle.min.js'],
-      exclude: ['/files/art/js/ga.js', 'googletagmanager', 'google-analytics',
-        'dlswbr.baidu.com/heicha', 'fingerprintjs2', 'abclite']
-    }
+    id: 'premierinn',
+    name: 'Premier Inn Hotels',
+    url: 'https://www.premierinn.com/gb/en/home.html?isFirst=1',
+    routes: ['/gb/en/home.html?isFirst=1', '/gb/en/home.html'],
+    swrDoc: false,
+    prerender: false,
+    codeCache: false,
+    bundle: true,
+    prefetchChunks: false,
+    userAgent: PREMIER_INN_UA,
+    manifestUrl: '/bundles/premierinn/manifest.json',
+    bundleVersion: '30a511b9d0cc4b25',
+    compressedManifestUrl: '/bundles/premierinn/manifest.zz.json',
+    compressedBundleVersion: '6dbd117d03c507a1',
+    extraBlockHosts: [
+      'https://api.whitbread.co.uk/content/cookiepolicies',
+      'https://assets.adobedtm.com',
+      'https://js-cdn.dynatrace.com',
+      'https://target.premierinn.com',
+      'https://gateway.foresee.com',
+      'https://d2oh4tlt9mrke9.cloudfront.net',
+      'https://p.typekit.net'
+    ],
+    preconnectHosts: ['https://www.premierinn.com', 'https://use.typekit.net']
+  },
+  {
+    id: 'britishmuseum',
+    name: 'British Museum',
+    url: 'https://www.britishmuseum.org/',
+    routes: ['/', '/visit', '/exhibitions-events'],
+    swrDoc: false,
+    prerender: false,
+    codeCache: false,
+    bundle: true,
+    prefetchChunks: false,
+    userAgent: BRITISH_MUSEUM_UA,
+    manifestUrl: '/bundles/britishmuseum/manifest.json',
+    bundleVersion: 'b53d91d03f3326a6',
+    compressedManifestUrl: '/bundles/britishmuseum/manifest.zz.json',
+    compressedBundleVersion: '59e9b9bc357850aa',
+    extraBlockHosts: [
+      'https://consent.cookiebot.com',
+      'https://consentcdn.cookiebot.com',
+      'https://www.googletagmanager.com',
+      'https://googletagmanager.com',
+      'https://www.google-analytics.com',
+      'https://google-analytics.com',
+      'https://googleads.g.doubleclick.net',
+      'https://www.googleadservices.com'
+    ],
+    preconnectHosts: ['https://www.britishmuseum.org', 'https://challenges.cloudflare.com']
+  },
+  {
+    id: 'burjkhalifa',
+    name: '\u54c8\u5229\u6cd5\u5854',
+    url: 'https://www.burjkhalifa.ae/zh-hans/',
+    routes: ['/zh-hans/'],
+    swrDoc: false,
+    prerender: false,
+    codeCache: false,
+    bundle: true,
+    prefetchChunks: false,
+    userAgent: BURJ_KHALIFA_UA,
+    manifestUrl: '/bundles/burjkhalifa/manifest.json',
+    bundleVersion: '5c25c79a05ec20de',
+    compressedManifestUrl: '/bundles/burjkhalifa/manifest.zz.json',
+    compressedBundleVersion: 'cc811315a8bee359',
+    extraBlockHosts: [
+      'https://www.googletagmanager.com',
+      'https://googletagmanager.com',
+      'https://www.google-analytics.com',
+      'https://google-analytics.com',
+      'https://connect.facebook.net',
+      'https://www.facebook.com/tr',
+      'https://snap.licdn.com',
+      'https://sc-static.net',
+      'https://analytics.tiktok.com',
+      'https://dev.visualwebsiteoptimizer.com'
+    ],
+    preconnectHosts: ['https://www.burjkhalifa.ae', 'https://ticket.atthetop.ae']
+  },
+  {
+    id: 'getyourguide_burj',
+    name: 'GetYourGuide',
+    url: 'https://www.getyourguide.com/zh-cn/?visitor-id=CX728L4F9H1IKHG7O6YFWTSGRD5JCVL7&locale_autoredirect_optout=true',
+    routes: ['/zh-cn/'],
+    swrDoc: false,
+    prerender: false,
+    codeCache: false,
+    bundle: true,
+    prefetchChunks: false,
+    userAgent: GETYOURGUIDE_UA,
+    manifestUrl: '/bundles/getyourguide_burj/manifest.json',
+    bundleVersion: '0d145826c536042a',
+    compressedManifestUrl: '/bundles/getyourguide_burj/manifest.zz.json',
+    compressedBundleVersion: '4d5f061c8a872398',
+    extraBlockHosts: [
+      'https://www.googletagmanager.com',
+      'https://googletagmanager.com',
+      'https://www.google-analytics.com',
+      'https://google-analytics.com',
+      'https://connect.facebook.net',
+      'https://www.facebook.com/tr',
+      'https://bat.bing.com',
+      'https://analytics.tiktok.com',
+      'https://static.ads-twitter.com'
+    ],
+    preconnectHosts: [
+      'https://www.getyourguide.com',
+      'https://cdn.getyourguide.com',
+      'https://challenges.cloudflare.com'
+    ]
+  },
+  {
+    id: 'suriaklcc',
+    name: 'Suria KLCC',
+    url: 'https://www.suriaklcc.com.my?isFirst=1',
+    routes: ['/', '/?isFirst=1'],
+    swrDoc: false,
+    prerender: false,
+    codeCache: false,
+    bundle: true,
+    prefetchChunks: false,
+    userAgent: SURIA_KLCC_UA,
+    manifestUrl: '/bundles/suriaklcc/manifest.json',
+    bundleVersion: '6be394908243d204',
+    compressedManifestUrl: '/bundles/suriaklcc/manifest.zz.json',
+    compressedBundleVersion: '2f8684f35d977bec',
+    bundleExcludeUrls: [
+      '*.png',
+      '*.jpg',
+      '*.jpeg',
+      '*.webp',
+      '*.gif',
+      '*.svg',
+      '*.ico',
+      '*.mp4',
+      '*.webm',
+      '*.m3u8',
+      '*.ts'
+    ],
+    extraBlockHosts: [
+      'https://www.googletagmanager.com',
+      'https://googletagmanager.com',
+      'https://www.google-analytics.com',
+      'https://google-analytics.com',
+      'https://connect.facebook.net',
+      'https://www.facebook.com/tr',
+      'https://googleads.g.doubleclick.net',
+      'https://www.googleadservices.com'
+    ],
+    preconnectHosts: [
+      'https://www.suriaklcc.com.my',
+      'https://addtocalendar.com'
+    ]
+  },
+  {
+    id: 'tmb',
+    name: 'TMB',
+    url: 'https://www.tmb.cat/en/home',
+    routes: ['/en/home'],
+    swrDoc: false,
+    prerender: false,
+    codeCache: false,
+    bundle: true,
+    prefetchChunks: false,
+    userAgent: TMB_UA,
+    manifestUrl: '/bundles/tmb/manifest.json',
+    bundleVersion: '13d7f3e1c686f53c',
+    compressedManifestUrl: '/bundles/tmb/manifest.zz.json',
+    compressedBundleVersion: '96ca10e087206e3f',
+    bundleExcludeUrls: [
+      '*.png',
+      '*.jpg',
+      '*.jpeg',
+      '*.webp',
+      '*.gif',
+      '*.svg',
+      '*.ico',
+      '*.mp4',
+      '*.webm',
+      '*.m3u8',
+      '*.ts'
+    ],
+    extraBlockHosts: [
+      'https://www.googletagmanager.com',
+      'https://googletagmanager.com',
+      'https://www.google-analytics.com',
+      'https://google-analytics.com',
+      'https://consent.cookiebot.com'
+    ],
+    preconnectHosts: [
+      'https://www.tmb.cat',
+      'https://static-web.tmb.cat',
+      'https://w4.tmb.cat'
+    ]
+  },
+  {
+    id: 'vexere',
+    name: 'Vexere',
+    url: 'https://vexere.com/en-US',
+    routes: ['/en-US'],
+    swrDoc: false,
+    prerender: false,
+    codeCache: false,
+    bundle: true,
+    prefetchChunks: false,
+    userAgent: VEXERE_UA,
+    manifestUrl: '/bundles/vexere/manifest.json',
+    bundleVersion: 'a5771cba481195e2',
+    compressedManifestUrl: '/bundles/vexere/manifest.zz.json',
+    compressedBundleVersion: '425fa6938f05d271',
+    bundleExcludeUrls: [
+      '*.png',
+      '*.jpg',
+      '*.jpeg',
+      '*.webp',
+      '*.gif',
+      '*.svg',
+      '*.ico',
+      '*.avif',
+      '*.mp4',
+      '*.webm',
+      '*.m3u8',
+      '*.ts',
+      '*.mov',
+      '*.woff',
+      '*.woff2',
+      '*.ttf',
+      '*.otf',
+      'https://fonts.googleapis.com/*',
+      'https://fonts.gstatic.com/*'
+    ],
+    extraBlockHosts: [
+      'https://www.googletagmanager.com',
+      'https://googletagmanager.com',
+      'https://www.google-analytics.com',
+      'https://google-analytics.com',
+      'https://connect.facebook.net',
+      'https://www.facebook.com/tr',
+      'https://analytics.tiktok.com',
+      'https://cdn.segment.com',
+      'https://cdnt.netcoresmartech.com',
+      'https://229a2c9fe669f7b.cmccloud.com.vn'
+    ],
+    preconnectHosts: [
+      'https://vexere.com',
+      'https://storage.googleapis.com',
+      'https://cdnjs.cloudflare.com',
+      'https://fonts.googleapis.com',
+      'https://fonts.gstatic.com'
+    ]
+  },
+  {
+    id: 'hanchao_subway',
+    name: '\u97e9\u5de2\u97e9\u56fd\u5730\u94c1',
+    url: 'https://map.hanchao.com/psubway',
+    routes: ['/psubway'],
+    swrDoc: false,
+    prerender: false,
+    codeCache: false,
+    bundle: true,
+    prefetchChunks: false,
+    userAgent: HANCHAO_SUBWAY_UA,
+    manifestUrl: '/bundles/hanchao_subway/manifest.json',
+    bundleVersion: '6c5c5b05bb86a077',
+    compressedManifestUrl: '/bundles/hanchao_subway/manifest.zz.json',
+    compressedBundleVersion: '799f6d761f5b9d7d',
+    bundleExcludeUrls: [
+      '*.png',
+      '*.jpg',
+      '*.jpeg',
+      '*.webp',
+      '*.gif',
+      '*.svg',
+      '*.ico',
+      '*.avif',
+      '*.mp4',
+      '*.webm',
+      '*.m3u8',
+      '*.ts',
+      '*.mov',
+      '*.woff',
+      '*.woff2',
+      '*.ttf',
+      '*.otf',
+      '*.eot'
+    ],
+    extraBlockHosts: [
+      'https://www.googletagmanager.com',
+      'https://googletagmanager.com',
+      'https://www.google-analytics.com',
+      'https://google-analytics.com'
+    ],
+    preconnectHosts: ['https://map.hanchao.com']
   }
 ];
 

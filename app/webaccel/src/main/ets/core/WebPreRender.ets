@@ -112,10 +112,14 @@ export class WebPool {
         continue;
       }
       const swr: boolean = app.swrDoc !== false;
-      const wantPrerender: boolean = app.prerender !== false && this.uiContext !== null;
+      const wantPrerender: boolean = false;
 
       // 轻量预热:所有应用都做(快、不占渲染线程)—— 预连接 + 离线包预下 + SWR
-      this.loadBundleFor(app.url);
+      // 服务端配置到达后，主动触发所有 bundle:true 站点下载离线包。
+      // 只在 source=server 时执行，避免用旧沙箱配置抢先拉过期版本。
+      if (remoteConfig.getSource() === 'server' && app.bundle === true) {
+        this.loadBundleFor(app.url);
+      }
       try {
         webview.WebviewController.prepareForPageLoad(app.url, true, 4);
       } catch (e) {
@@ -147,14 +151,24 @@ export class WebPool {
       }
       if (eager < WebPool.MAX_EAGER_PRERENDER) {
         // 前几个:立即离屏预渲染(集中首屏资源给最可能先点的应用)
-        this.prewarm(app.url, swr);
+        try {
+          webview.WebviewController.prepareForPageLoad(app.url, true, 4);
+        } catch (e) {
+          const er = e as BusinessError;
+          hilog.warn(DOMAIN, TAG, 'lazy preconnect failed %{public}s', er.message);
+        }
         eager++;
       } else {
         // 其余:延迟分批离屏预渲染,错开避免和首屏抢资源
         lazyDelay += WebPool.LAZY_PRERENDER_STEP_MS;
         const url: string = app.url;
         setTimeout(() => {
-          this.prewarm(url, swr);
+          try {
+            webview.WebviewController.prepareForPageLoad(url, true, 4);
+          } catch (e) {
+            const er = e as BusinessError;
+            hilog.warn(DOMAIN, TAG, 'lazy preconnect failed %{public}s', er.message);
+          }
         }, lazyDelay);
       }
     }
