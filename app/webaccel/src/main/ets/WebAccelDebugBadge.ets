@@ -78,6 +78,9 @@ export struct WebAccelDebugBadge {
   private progressText(app: RemoteApp): string {
     const origin: string = this.originOf(app.url);
     const bp: BundleProgress | null = webCache.getBundleProgress(origin);
+    if (bp && bp.total === 0) {
+      return '包空';
+    }
     if (bp && bp.total > 0) {
       if (bp.done >= bp.total) {
         return `包完成 ${bp.done}/${bp.total}`;
@@ -85,7 +88,24 @@ export struct WebAccelDebugBadge {
       return `包下载 ${bp.done}/${bp.total}`;
     }
     if (app.bundle === true) {
-      return '包准备中';
+      const err: string = webCache.getBundleError(origin);
+      if (err.length > 0) {
+        return `包失败:${err}`;
+      }
+      if (!this.configFromServer()) {
+        return '后台未连';
+      }
+      const scope: string = app.scope ? app.scope : '';
+      if (scope === 'region' || scope === 'app' || scope.length === 0) {
+        return '待点击下载';
+      }
+      return 'TOP准备中';
+    }
+    if (app.bundleConfigured === true) {
+      if (!this.configFromServer()) {
+        return '后台未连接';
+      }
+      return '包未就绪';
     }
     return '未配置离线包';
   }
@@ -120,7 +140,7 @@ export struct WebAccelDebugBadge {
           .width(196)
           .margin({ top: 1 })
           // 进度文本取自 @State progress(定时器每秒刷新);key 用稳定的 url,内容随 @State 实时重绘
-        }, (app: RemoteApp) => app.url)
+        }, (app: RemoteApp) => app.id && app.id.length > 0 ? app.id : app.url)
         Text(`沙箱 ${this.stats.disk} 条　${Math.round(this.stats.bytes / 1024)} KB`)
           .fontSize(10)
           .fontColor(Color.White)

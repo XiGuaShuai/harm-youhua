@@ -24,17 +24,25 @@ export interface RemoteApp {
   id: string;
   name: string;
   url: string;
+  scope?: string;            // top / region,用于入口页分组和端侧调度
+  region?: string;           // AtomicPlatform 地区 ID,例如 100004 / 2033730461761748994。未下发时入口页归入 global
+  appId?: string;            // 业务应用 ID,不下发时默认等于 id
+  appVersion?: string;       // 业务应用版本,用于版本一致性判断
+  priority?: number;         // 展示/下载优先级,数字越大越靠前
+  localOnly?: boolean;        // 接入方本地测试卡片:远程配置未下发时仍追加到端侧列表,不写回后台
   routes?: string[];
   swrDoc?: boolean;
   prerender?: boolean;
   codeCache?: boolean;
   bundle?: boolean;
+  bundleConfigured?: boolean; // true=后台配置了离线包但当前未 READY/未下发 manifest; bundle=true 才表示端侧可用
   manifestUrl?: string;  // 后台下发:启用离线包且已打包时才有,App 据此去服务器下载
   bundleVersion?: string; // 离线包清单指纹:后台下发,设备据此判断"要不要更新本地离线包"
   compressedManifestUrl?: string; // 新端优先使用:可压缩资源以 zlib 存沙箱,旧端忽略
   compressedBundleVersion?: string; // 压缩清单指纹:避免与旧端原始清单版本互相污染
   bundleExtraUrls?: string[]; // 后台构建离线包时手动纳入的固定静态资源 URL(如跨域固定背景图)
   bundleExcludeUrls?: string[]; // 后台构建离线包时排除的静态资源 URL(用于控制沙箱占用)
+  configJson?: string;       // 该网址对应的 H5 配置 JSON。可随离线包一起下发,供宿主离线兜底注入
   extraBlockHosts?: string[]; // 每应用额外黑名单:只对本应用生效,叠加在全局 blockHosts 之上
   prefetchChunks?: boolean;   // 每应用 chunk 预取开关:覆盖全局 settings.prefetchChunks(不下发=用全局)
   preconnectHosts?: string[]; // 每应用额外预连接域:开机提前对这些CDN/接口域做DNS+TLS握手,点进去时资源直连不等握手。
@@ -98,6 +106,7 @@ function fallbackConfig(): RemoteConfigData {
  */
 class RemoteConfigManager {
   private data: RemoteConfigData = fallbackConfig();
+  private directApps: RemoteApp[] = [];
   private cachePath: string = '';
   // 后台地址默认值 = SDK 自带(build-profile 按 debug/release 注入的 BuildProfile.CONFIG_SERVER);
   // 接入方通常无需再传,init({ configServer }) 可覆盖。为空字符串 = 不联网(纯直供/缓存/兜底)。
@@ -114,6 +123,7 @@ class RemoteConfigManager {
       this.server = opt.configServer.replace(/\/+$/, ''); // 去尾部斜杠,避免拼出 //api/config
     }
     if (opt.apps && opt.apps.length > 0) {
+      this.directApps = opt.apps;
       this.data.apps = opt.apps; // 直供列表(作为默认;后续缓存/服务器配置会覆盖)
     }
     if (opt.blockHosts && opt.blockHosts.length > 0) {
@@ -150,6 +160,7 @@ class RemoteConfigManager {
           const parsed = JSON.parse(txt) as RemoteConfigData;
           if (parsed && Array.isArray(parsed.apps)) {
             this.data = parsed;
+            this.mergeDirectAppMetadata();
             this.source = 'cache'; // 来自上次服务器写入的沙箱缓存
           }
         }
@@ -179,6 +190,7 @@ class RemoteConfigManager {
         return false;
       }
       this.data = next;
+      this.mergeDirectAppMetadata();
       this.source = 'server'; // 本次成功从后台拉到
       this.saveCache(txt);
       this.publishApps();
@@ -215,6 +227,52 @@ class RemoteConfigManager {
     for (let i = 0; i < this.appHandlers.length; i++) {
       this.appHandlers[i](apps);
     }
+  }
+
+  // 兼容旧缓存/旧后台:如果服务端配置缺少 region/scope 等新字段,从接入方直供兜底列表按 id/url 补齐。
+  private mergeDirectAppMetadata(): void {
+    if (!this.directApps || this.directApps.length === 0 || !this.data.apps || this.data.apps.length === 0) {
+      return;
+    }
+    for (let i = 0; i < this.data.apps.length; i++) {
+      const app: RemoteApp = this.data.apps[i];
+      const fallback: RemoteApp | undefined = this.findDirectApp(app);
+      if (!fallback) {
+        continue;
+      }
+      if ((!app.scope || app.scope.length === 0) && fallback.scope) app.scope = fallback.scope;
+      if ((!app.region || app.region.length === 0) && fallback.region) app.region = fallback.region;
+      if ((!app.appId || app.appId.length === 0) && fallback.appId) app.appId = fallback.appId;
+      if ((!app.appVersion || app.appVersion.length === 0) && fallback.appVersion) app.appVersion = fallback.appVersion;
+      if (app.priority === undefined && fallback.priority !== undefined) app.priority = fallback.priority;
+    }
+    for (let i = 0; i < this.directApps.length; i++) {
+      const pinned: RemoteApp = this.directApps[i];
+      if (!pinned || pinned.localOnly !== true) {
+        continue;
+      }
+      let exists: boolean = false;
+      for (let j = 0; j < this.data.apps.length; j++) {
+        const app: RemoteApp = this.data.apps[j];
+        if (app && (app.id === pinned.id || app.url === pinned.url)) {
+          exists = true;
+          break;
+        }
+      }
+      if (!exists) {
+        this.data.apps.push(pinned);
+      }
+    }
+  }
+
+  private findDirectApp(app: RemoteApp): RemoteApp | undefined {
+    for (let i = 0; i < this.directApps.length; i++) {
+      const candidate: RemoteApp = this.directApps[i];
+      if (candidate.id === app.id || candidate.url === app.url) {
+        return candidate;
+      }
+    }
+    return undefined;
   }
 
   private saveCache(txt: string): void {

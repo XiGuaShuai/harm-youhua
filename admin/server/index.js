@@ -96,20 +96,28 @@ function defaultConfig() {
         id: 'beacukai',
         name: '印尼海关 e-CD',
         url: 'https://ecd.beacukai.go.id/',
+        scope: 'region',
+        region: '1999320112476409857',
+        regionName: '印度尼西亚',
         routes: ['/', '/forms/bc22', '/forms/bc32', '/forms/bc34'],
         swrDoc: true,        // 主文档陈旧即用缓存
         prerender: true,     // 离屏预渲染
         codeCache: true,     // JS 字节码缓存
-        bundle: true         // 是否启用离线包(从本服务器拉)
+        bundle: true,        // 是否启用离线包(从本服务器拉)
+        configJson: ''
       },
       {
         id: 'rwsentosa',
         name: '圣淘沙名胜世界 RWS',
         url: 'https://www.rwsentosa.com/',
+        scope: 'region',
+        region: '100016',
+        regionName: '新加坡',
         swrDoc: true,        // 首页陈旧即用缓存
         prerender: true,     // 离屏预渲染→秒开(有离线包后从本地取资源,预渲染快、不再抢 beacukai 带宽)
         codeCache: false,    // 元服务不支持字节码注入
-        bundle: true         // 通用化 cache-builder 已能给非 Next 站(CRA/AEM)打离线包(5MB 上限,字体超量走运行时)
+        bundle: true,        // 通用化 cache-builder 已能给非 Next 站(CRA/AEM)打离线包(5MB 上限,字体超量走运行时)
+        configJson: ''
       }
     ],
     // 通用过滤黑名单:被墙/纯追踪的第三方,App 端命中即秒拒(屏蔽后不影响功能)
@@ -149,6 +157,79 @@ function saveConfig(c) {
   return c;
 }
 if (!fs.existsSync(DATA_FILE)) saveConfig(defaultConfig());
+
+function normalizeScope(scope) {
+  const s = String(scope || '').trim();
+  if (s === 'region') return 'region';
+  return 'top';
+}
+
+function normalizeAppConfig(appCfg) {
+  const a = Object.assign({}, appCfg || {});
+  a.id = String(a.id || '').trim();
+  a.name = String(a.name || a.id || '').trim();
+  a.url = String(a.url || '').trim();
+  a.scope = normalizeScope(a.scope);
+  a.region = a.scope === 'region' ? String(a.region || '').trim() : '';
+  a.regionName = a.scope === 'region' ? String(a.regionName || a.region || '').trim() : '';
+  if (typeof a.configJson !== 'string') a.configJson = '';
+  a.configJsonFileName = String(a.configJsonFileName || '').trim();
+  return a;
+}
+
+function originOf(input) {
+  try {
+    return new URL(String(input || '').trim()).origin;
+  } catch {
+    const m = String(input || '').match(/^https?:\/\/[^/]+/i);
+    return m ? m[0] : '';
+  }
+}
+
+function validateAppConfigForWebsdk(appCfg) {
+  const a = normalizeAppConfig(appCfg);
+  if (!/^[a-zA-Z0-9_-]+$/.test(a.id)) {
+    return `应用 ${a.name || a.id || '(未命名)'}: ID 只能包含英文、数字、下划线和短横线`;
+  }
+  const appOrigin = originOf(a.url);
+  if (!appOrigin) {
+    return `应用 ${a.id}: URL 必须是 http(s):// 开头的完整地址`;
+  }
+  if (a.scope === 'region' && !a.region) {
+    return `应用 ${a.id}: 地区应用必须填写地区 ID`;
+  }
+  if (a.configJson && a.configJson.trim()) {
+    let json;
+    try {
+      json = JSON.parse(a.configJson);
+    } catch {
+      return `应用 ${a.id}: 配置 JSON 格式错误`;
+    }
+    const configUrl = String(json && json.url || '').trim();
+    if (!configUrl) {
+      return `应用 ${a.id}: 配置 JSON 必须包含 url 字段`;
+    }
+    const configOrigin = originOf(configUrl);
+    if (!configOrigin) {
+      return `应用 ${a.id}: 配置 JSON 的 url 不是有效地址`;
+    }
+    if (configOrigin !== appOrigin) {
+      return `应用 ${a.id}: 配置 JSON 的 url 必须和应用 URL 同源`;
+    }
+  }
+  return '';
+}
+
+function configRegions(apps) {
+  const map = new Map();
+  for (const appCfg of apps || []) {
+    const a = normalizeAppConfig(appCfg);
+    if (a.scope === 'region' && a.region.length > 0 && !map.has(a.region)) {
+      map.set(a.region, { id: a.region, name: a.regionName || a.region });
+    }
+  }
+  return Array.from(map.values());
+}
 
 // ——————————————— 缓存构建程序触发 ———————————————
 function runCacheBuilder(mode, appId) {
@@ -197,27 +278,32 @@ if (fs.existsSync(WEB_DIST)) app.use(express.static(WEB_DIST));
 app.get('/api/config', (req, res) => {
   const c = loadConfig();
   const apps = (c.apps || []).map((a) => {
-    const mfPath = path.join(BUNDLES_DIR, a.id, 'manifest.json');
-    const compressedMfPath = path.join(BUNDLES_DIR, a.id, 'manifest.zz.json');
+    const appCfg = normalizeAppConfig(a);
+    const mfPath = path.join(BUNDLES_DIR, appCfg.id, 'manifest.json');
+    const compressedMfPath = path.join(BUNDLES_DIR, appCfg.id, 'manifest.zz.json');
     const hasBundle = fs.existsSync(mfPath);
-    if (a.bundle && hasBundle) {
+    const baseApp = Object.assign({}, appCfg, {
+      bundleConfigured: appCfg.bundle === true,
+      bundle: appCfg.bundle === true && hasBundle
+    });
+    if (appCfg.bundle && hasBundle) {
       // bundleVersion = 清单内容指纹:清单一变(资源增删改)它就变,设备据此判断"要不要更新离线包"
       let bundleVersion = '';
       let compressedBundleVersion = '';
       try { bundleVersion = crypto.createHash('sha256').update(fs.readFileSync(mfPath)).digest('hex').slice(0, 16); } catch {}
-      const extra = { manifestUrl: `/bundles/${a.id}/manifest.json`, bundleVersion };
+      const extra = { manifestUrl: `/bundles/${appCfg.id}/manifest.json`, bundleVersion };
       if (fs.existsSync(compressedMfPath)) {
         try {
           compressedBundleVersion = crypto.createHash('sha256').update(fs.readFileSync(compressedMfPath)).digest('hex').slice(0, 16);
         } catch {}
         Object.assign(extra, {
-          compressedManifestUrl: `/bundles/${a.id}/manifest.zz.json`,
+          compressedManifestUrl: `/bundles/${appCfg.id}/manifest.zz.json`,
           compressedBundleVersion
         });
       }
-      return Object.assign({}, a, extra);
+      return Object.assign({}, baseApp, extra);
     }
-    return a;
+    return baseApp;
   });
   // 任务派发:把"待探索清单 + 共识阈值 K + 采样率"下发给设备(设备只对名单内 app 按采样率上报)
   const s = c.settings || {};
@@ -226,7 +312,7 @@ app.get('/api/config', (req, res) => {
     k: s.exploreK || 3,
     sample: typeof s.exploreSample === 'number' ? s.exploreSample : 0.1
   };
-  res.json(Object.assign({}, c, { apps, explore }));
+  res.json(Object.assign({}, c, { apps, regions: configRegions(apps), explore }));
 });
 
 // 离线包静态托管:App 从 /bundles/<id>/manifest.json 拉取
@@ -408,10 +494,27 @@ app.post('/api/admin/password', (req, res) => {
   res.json({ ok: true });
 });
 
-app.get('/api/admin/config', (req, res) => res.json(loadConfig()));
+app.get('/api/admin/config', (req, res) => {
+  const c = loadConfig();
+  const apps = (c.apps || []).map((a) => normalizeAppConfig(a));
+  res.json(Object.assign({}, c, { apps, regions: configRegions(apps) }));
+});
 app.put('/api/admin/apps', (req, res) => {
   const c = loadConfig();
-  const nextApps = req.body.apps || [];
+  const nextApps = (req.body.apps || []).map((a) => normalizeAppConfig(a)).filter((a) => a.id && a.url);
+  const seenIds = new Set();
+  const errors = [];
+  for (const appCfg of nextApps) {
+    if (seenIds.has(appCfg.id)) {
+      errors.push(`应用 ${appCfg.id}: ID 重复`);
+    }
+    seenIds.add(appCfg.id);
+    const err = validateAppConfigForWebsdk(appCfg);
+    if (err) errors.push(err);
+  }
+  if (errors.length) {
+    return res.status(400).json({ error: errors[0], details: errors });
+  }
   // 保存前先算出"需要自动构建离线包"的站:bundle:true 且服务器上还没有离线包(manifest 不存在)。
   // 这样后台加一个新静态站(或把某站改成 bundle:true)保存后,离线包会自动在后台建好,
   // 用户第一次进入就能直接从离线包加载(首屏即快),不用再手动去 Bundles 页点构建。
@@ -472,11 +575,32 @@ app.put('/api/admin/settings', (req, res) => {
 
 function readJsonArray(file) {
   try {
-    const arr = JSON.parse(fs.readFileSync(file, 'utf8'));
-    return Array.isArray(arr) ? arr : [];
+    const parsed = JSON.parse(fs.readFileSync(file, 'utf8'));
+    if (Array.isArray(parsed)) return parsed;
+    if (Array.isArray(parsed && parsed.resources)) return parsed.resources;
+    if (Array.isArray(parsed && parsed.manifest)) return parsed.manifest;
+    return [];
   } catch {
     return [];
   }
+}
+
+function safeConfigJsonFileName(name, appId) {
+  const fallback = `${appId || 'webaccel'}.json`;
+  const raw = String(name || fallback).trim();
+  const base = path.basename(raw || fallback).replace(/[^A-Za-z0-9._-]+/g, '_') || fallback;
+  return base.toLowerCase().endsWith('.json') ? base : `${base}.json`;
+}
+
+function configJsonInfo(appCfg) {
+  const text = typeof appCfg.configJson === 'string' ? appCfg.configJson : '';
+  const bytes = Buffer.byteLength(text, 'utf8');
+  return {
+    hasConfigJson: text.length > 0,
+    configJsonFileName: safeConfigJsonFileName(appCfg.configJsonFileName, appCfg.id),
+    configJsonBytes: bytes,
+    configJsonSizeKB: Math.round(bytes / 102.4) / 10
+  };
 }
 
 function safeBundlePath(dir, file) {
@@ -775,10 +899,18 @@ function bundleInfo(id, appCfg) {
   }
   const serverBytes = fs.readdirSync(dir)
     .reduce((s, f) => s + fs.statSync(path.join(dir, f)).size, 0);
+  const cfgJson = appCfg ? configJsonInfo(appCfg) : configJsonInfo({ id });
   return {
     id,
     name: appCfg && appCfg.name ? appCfg.name : id,
     url: appCfg && appCfg.url ? appCfg.url : '',
+    scope: appCfg && appCfg.scope ? appCfg.scope : 'app',
+    region: appCfg && appCfg.region ? appCfg.region : '',
+    regionName: appCfg && appCfg.regionName ? appCfg.regionName : '',
+    hasConfigJson: cfgJson.hasConfigJson,
+    configJsonFileName: cfgJson.configJsonFileName,
+    configJsonBytes: cfgJson.configJsonBytes,
+    configJsonSizeKB: cfgJson.configJsonSizeKB,
     count: resources.length,
     sizeBytes: resourceBytes,
     sizeKB: Math.round(resourceBytes / 102.4) / 10,
@@ -791,6 +923,13 @@ function bundleInfo(id, appCfg) {
     manifestUrl: `/bundles/${id}/manifest.json`,
     config: {
       bundle: appCfg ? appCfg.bundle === true : false,
+      scope: appCfg && appCfg.scope ? appCfg.scope : 'app',
+      region: appCfg && appCfg.region ? appCfg.region : '',
+      regionName: appCfg && appCfg.regionName ? appCfg.regionName : '',
+      hasConfigJson: cfgJson.hasConfigJson,
+      configJsonFileName: cfgJson.configJsonFileName,
+      configJsonBytes: cfgJson.configJsonBytes,
+      configJsonSizeKB: cfgJson.configJsonSizeKB,
       swrDoc: appCfg ? appCfg.swrDoc !== false : false,
       prerender: appCfg ? appCfg.prerender !== false : false,
       bundleMaxSizeKB: appCfg && appCfg.bundleMaxSizeKB ? appCfg.bundleMaxSizeKB : 5120,
@@ -821,10 +960,18 @@ app.get('/api/admin/bundles', (req, res) => {
     if (!appCfg || !appCfg.id) continue;
     seen.add(appCfg.id);
     const info = bundleInfo(appCfg.id, appCfg);
+    const cfgJson = configJsonInfo(appCfg);
     out.push(info || {
       id: appCfg.id,
       name: appCfg.name || appCfg.id,
       url: appCfg.url || '',
+      scope: appCfg.scope || 'app',
+      region: appCfg.region || '',
+      regionName: appCfg.regionName || '',
+      hasConfigJson: cfgJson.hasConfigJson,
+      configJsonFileName: cfgJson.configJsonFileName,
+      configJsonBytes: cfgJson.configJsonBytes,
+      configJsonSizeKB: cfgJson.configJsonSizeKB,
       count: 0,
       sizeBytes: 0,
       sizeKB: 0,
@@ -837,6 +984,13 @@ app.get('/api/admin/bundles', (req, res) => {
       manifestUrl: `/bundles/${appCfg.id}/manifest.json`,
       config: {
         bundle: appCfg.bundle === true,
+        scope: appCfg.scope || 'app',
+        region: appCfg.region || '',
+        regionName: appCfg.regionName || '',
+        hasConfigJson: cfgJson.hasConfigJson,
+        configJsonFileName: cfgJson.configJsonFileName,
+        configJsonBytes: cfgJson.configJsonBytes,
+        configJsonSizeKB: cfgJson.configJsonSizeKB,
         swrDoc: appCfg.swrDoc !== false,
         prerender: appCfg.prerender !== false,
         bundleMaxSizeKB: appCfg.bundleMaxSizeKB || 5120,
@@ -855,6 +1009,53 @@ app.get('/api/admin/bundles', (req, res) => {
     if (info) out.push(info);
   }
   res.json(out);
+});
+
+app.put('/api/admin/bundles/:id/config-json', async (req, res) => {
+  const c = loadConfig();
+  const appCfg = (c.apps || []).find((a) => a.id === req.params.id);
+  if (!appCfg) return res.status(404).json({ error: 'app not found' });
+
+  const text = String((req.body && (req.body.configJson ?? req.body.text)) || '').trim();
+  const fileName = safeConfigJsonFileName(req.body && req.body.fileName, appCfg.id);
+  if (text.length > 0) {
+    try {
+      JSON.parse(text);
+    } catch (e) {
+      return res.status(400).json({ error: 'invalid json: ' + String(e && e.message || e) });
+    }
+  }
+
+  appCfg.configJson = text;
+  appCfg.configJsonFileName = fileName;
+  if (text.length > 0 && req.body && req.body.enableBundle !== false) appCfg.bundle = true;
+  saveConfig(c);
+
+  let manifest = null;
+  try {
+    const dir = path.join(BUNDLES_DIR, appCfg.id);
+    if (fs.existsSync(dir) && fs.readdirSync(dir).some((f) => f !== 'manifest.json' && f !== 'manifest.zz.json')) {
+      manifest = await runCacheBuilder('manifest', appCfg.id);
+    } else if (appCfg.bundle === true) {
+      manifest = await runCacheBuilder('build', appCfg.id);
+    }
+  } catch (e) {
+    return res.status(500).json({
+      ok: false,
+      saved: true,
+      error: String(e && e.message || e),
+      configJson: configJsonInfo(appCfg),
+      bundle: bundleInfo(appCfg.id, appCfg)
+    });
+  }
+
+  res.json({
+    ok: true,
+    saved: true,
+    manifest,
+    configJson: configJsonInfo(appCfg),
+    bundle: bundleInfo(appCfg.id, appCfg)
+  });
 });
 
 // 单个离线包资源开关:关闭=加入该站 bundleExcludeUrls,然后重生成 manifest;开启=从排除列表移除。

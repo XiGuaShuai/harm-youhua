@@ -8,10 +8,10 @@ import { RemoteApp } from './core/RemoteConfig';
  *   ① EntryAbility.onCreate: WebAccel.init(this.context, { configServer })
  *   ② 入口页:               @Entry struct Index { build() { WebAccelLauncher() } }
  *
- * 内部全包办:读远程配置的应用列表 → 渲染 → 内置 Navigation 跳转 → WebAccelView 展示
- * → 离线进度 → 系统返回(网页内先后退,到顶退回列表)。挂载即自动注入 UIContext 并预热全部应用。
+ * 内部全包办:读远程配置的应用列表 -> 渲染 -> 内置 Navigation 跳转 -> WebAccelView 展示
+ * -> 离线进度 -> 系统返回(网页内先后退,到顶退回列表)。挂载即自动注入 UIContext 并预热全部应用。
  *
- * 想要自定义壳的接入方可改用低层 API:WebAccel.getApps() + WebAccelView({url}) + WebAccel.goBack(url)。
+ * 想要自定义壳的接入方可改用低层 API:WebAccel.getApps() + WebAccelView({ url }) + WebAccel.goBack(url)。
  */
 @Component
 export struct WebAccelLauncher {
@@ -31,7 +31,7 @@ export struct WebAccelLauncher {
   private stack: NavPathStack = new NavPathStack();
 
   aboutToAppear(): void {
-    // 组件天生有 UIContext:挂载即注入 → 自动对配置里所有应用预热(预连接+预下离线包+离屏预渲染)
+    // 组件天生有 UIContext:挂载即注入 -> 自动对配置里所有应用预热(预连接+预下离线包+离屏预渲染)
     // 接入方无需手动 attach / prewarm。
     WebAccel.attach(this.getUIContext());
     if (this.launchTarget.length > 0) {
@@ -39,7 +39,7 @@ export struct WebAccelLauncher {
     }
   }
 
-  // launchTarget 变化(元服务已运行时被卡片再次拉起)→ 直达对应网页
+  // launchTarget 变化(元服务已运行时被卡片再次拉起) -> 直达对应网页
   onLaunchTarget(): void {
     if (this.launchTarget.length > 0) {
       this.openTarget();
@@ -70,21 +70,25 @@ export struct WebAccelLauncher {
     // 根 Stack:Navigation 在下,调试浮窗在最上层(故首页列表 + 网页页全程可见、可拖动)
     Stack() {
       Navigation(this.stack) {
-        Column({ space: 14 }) {
-          Text(this.title)
-            .fontSize(22)
-            .fontWeight(FontWeight.Bold)
-            .margin({ top: 48, bottom: 16 })
-          ForEach(this.apps, (a: RemoteApp) => {
-            Button(a.name)
-              .width('80%')
-              .height(50)
-              .fontSize(16)
-              .backgroundColor(this.accentColor)
-              .onClick(() => {
-                this.stack.pushPath({ name: a.url });
-              })
-          }, (a: RemoteApp) => a.url)
+        Scroll() {
+          Column({ space: 14 }) {
+            Text(this.title)
+              .fontSize(22)
+              .fontWeight(FontWeight.Bold)
+              .margin({ top: 48, bottom: 16 })
+            ForEach(this.apps, (a: RemoteApp) => {
+              Button(a.name)
+                .width('80%')
+                .height(50)
+                .fontSize(16)
+                .backgroundColor(this.accentColor)
+                .onClick(() => {
+                  this.stack.pushPath({ name: a.url });
+                })
+            }, (a: RemoteApp) => a.url)
+          }
+          .width('100%')
+          .padding({ bottom: 32 })
         }
         .width('100%')
         .height('100%')

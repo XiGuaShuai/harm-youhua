@@ -3,7 +3,7 @@ import { fileIo as fs } from '@kit.CoreFileKit';
 import { common } from '@kit.AbilityKit';
 import { util } from '@kit.ArkTS';
 import { resourceManager } from '@kit.LocalizationKit';
-import { webview } from '@kit.ArkWeb';
+import { WebNetErrorList, webview } from '@kit.ArkWeb';
 import { BusinessError, zlib } from '@kit.BasicServicesKit';
 import { hilog } from '@kit.PerformanceAnalysisKit';
 import { RemoteSettings, RemoteApp, StaticCachePolicy } from './RemoteConfig';
@@ -42,8 +42,16 @@ interface RawEntry {
   file: string;
   mime: string;
   size?: number;
+  doc?: boolean;     // true = backend explicitly marked HTML document/fragment for offline caching
   encoding?: string; // zlib: local file is compressed; decode before serving to WebView
   rawSize?: number;  // 原始大小,仅用于统计/排查
+}
+
+interface RemoteManifestObject {
+  configJson?: string;
+  webConfigJson?: string;
+  resources?: RawEntry[];
+  manifest?: RawEntry[];
 }
 
 /** 沙箱运行时缓存索引,可写,带 LRU 字段 */
@@ -59,6 +67,9 @@ interface DiskEntry {
   source?: string;  // runtime / bundle / doc
   encoding?: string; // zlib: local file is compressed; decode before serving to WebView
   rawSize?: number;  // 原始大小,统计用
+  bundleId?: string; // 后台网址 id,用于按 id 删除/查配置
+  region?: string;   // 地区 id,用于地区切换时删除旧地区缓存
+  scope?: string;    // top / region
 }
 
 /** 调试用统计 */
@@ -95,9 +106,14 @@ interface BundleProgressEntry {
 
 /** 离线包已应用状态(持久化):支撑"版本门 + 按 URL 增删"的更新检查 */
 interface BundleState {
+  key?: string;     // 新版持久化 key: 优先 appId,无 appId 时用 origin。兼容老版本没有 key 的状态
+  id?: string;      // 后台网址 id
   origin: string;
+  region?: string;
+  scope?: string;
   version: string; // 已应用的 bundleVersion(与 /api/config 下发的对比,一致则跳过更新)
   urls: string[];  // 已应用清单里的资源 URL(用于清理被服务端移除的旧资源)
+  configJson?: string; // 该网址对应的 H5 配置 JSON,供宿主离线兜底注入
 }
 
 /** 众包探索上报:一条资源 + 报文体 */
@@ -116,6 +132,27 @@ interface ReportBody {
 interface SelfHealBody {
   appId: string;
   reason: string;
+}
+
+interface BundleResourceOwner {
+  bundleKey: string;
+  bundleId: string;
+  origin: string;
+  region: string;
+  scope: string;
+  generation: number;
+}
+
+interface SchemeHit {
+  body: ArrayBuffer;
+  mime: string;
+}
+
+interface DumpEntry {
+  url: string;
+  file: string;
+  mime: string;
+  size: number;
 }
 
 /**
@@ -147,6 +184,11 @@ class WebCacheManager {
   private uaByOrigin: Map<string, string> = new Map();        // 该应用的自定义 UA(覆盖默认手机化 UA;按 origin 索引)
   private staticPolicyByOrigin: Map<string, StaticCachePolicy> = new Map(); // 每应用静态资源缓存策略
   private bundleAppByOrigin: Map<string, string> = new Map(); // origin → appId(仅 bundle:true 的站):离线包资源丢失自愈上报用
+  private bundleScopeByOrigin: Map<string, string> = new Map();
+  private bundleRegionByOrigin: Map<string, string> = new Map();
+  private appOriginById: Map<string, string> = new Map();
+  private appScopeById: Map<string, string> = new Map();
+  private appRegionById: Map<string, string> = new Map();
   private reportedSelfHeal: Set<string> = new Set();          // 已上报过自愈的 appId(本次会话只报一次,防刷)
   private serverBase: string = '';                            // 后端地址(applyApps 时由 remoteConfig.getServer() 注入,自愈上报用)
 
@@ -156,6 +198,7 @@ class WebCacheManager {
   private pending: Set<string> = new Set();
   private bundleQueue: RawEntry[] = [];
   private bundleQueueSources: Map<string, string> = new Map();
+  private bundleQueueOwners: Map<string, BundleResourceOwner> = new Map();
   private activeBundleDownloads: number = 0;
   private totalBytes: number = 0;
   private ready: boolean = false;
@@ -167,9 +210,10 @@ class WebCacheManager {
   private docUrls: Set<string> = new Set();                       // 走 SWR 的主文档 URL
   private docUpdateHandler: ((url: string) => void) | null = null; // 检测到主文档新版本时回调(页面刷新)
   private prefetchedOrigins: Set<string> = new Set();             // 已预取过全部 chunk 的站点
-  private loadedBundles: Set<string> = new Set();                 // 本次会话已拉过远程离线包的站点(按 origin)
-  private pendingBundleVersionByOrigin: Map<string, string> = new Map(); // 兜底配置先拉包、远程配置后到时暂存版本号
+  private loadedBundles: Set<string> = new Set();                 // 本次会话已拉过远程离线包的 key(appId 或 origin)
+  private pendingBundleVersionByKey: Map<string, string> = new Map(); // 兜底配置先拉包、远程配置后到时暂存版本号
   private bundleProgress: Map<string, BundleProgressEntry> = new Map(); // 各站离线包下载进度(按 origin)
+  private bundleErrors: Map<string, string> = new Map();                // 各站离线包最近一次失败原因(调试浮窗用)
   private bundleState: Map<string, BundleState> = new Map();      // 各站离线包已应用状态(版本+URL清单,持久化,用于更新检查)
   private bundleStatePath: string = '';                           // bundle-state.json 路径
   private decodedMemory: Map<string, ArrayBuffer> = new Map();     // decoded compressed bundle bytes; memory only
@@ -178,6 +222,8 @@ class WebCacheManager {
   private lastCachedUrl: string = '';                             // 最近被后台缓存的资源 URL(调试浮窗用)
   private recentCached: string[] = [];                            // 最近若干条后台缓存(新→旧,调试浮窗列表用)
   private lastCacheAt: number = 0;                                // 最近一次"缓存成功"的时刻(判断是否真的还在缓存)
+  private activeRegion: string = '';                              // 当前独占地区缓存
+  private regionGeneration: number = 0;                            // 地区切换代号,旧任务回调用它判废
 
   /** 启动时调用一次(EntryAbility.onCreate) */
   init(context: common.UIAbilityContext): void {
@@ -337,6 +383,11 @@ class WebCacheManager {
     this.uaByOrigin.clear();
     this.staticPolicyByOrigin.clear();
     this.bundleAppByOrigin.clear();
+    this.bundleScopeByOrigin.clear();
+    this.bundleRegionByOrigin.clear();
+    this.appOriginById.clear();
+    this.appScopeById.clear();
+    this.appRegionById.clear();
     if (server && server.length > 0) {
       this.serverBase = server.replace(/\/+$/, '');
     }
@@ -352,6 +403,20 @@ class WebCacheManager {
       const origin: string = om ? om[0] : '';
       if (origin.length === 0) {
         continue;
+      }
+      const scope: string = app.scope && app.scope.length > 0 ? app.scope : '';
+      const region: string = app.region && app.region.length > 0 ? app.region : '';
+      this.bundleScopeByOrigin.set(origin, scope);
+      this.bundleRegionByOrigin.set(origin, region);
+      if (app.id && app.id.length > 0) {
+        this.appOriginById.set(app.id, origin);
+        this.appScopeById.set(app.id, scope);
+        this.appRegionById.set(app.id, region);
+      }
+      if (app.appId && app.appId.length > 0) {
+        this.appOriginById.set(app.appId, origin);
+        this.appScopeById.set(app.appId, scope);
+        this.appRegionById.set(app.appId, region);
       }
       // 合并黑名单 = 全局 + 该应用额外
       const merged: string[] = this.blockHosts.slice();
@@ -617,13 +682,284 @@ class WebCacheManager {
       this.staticCachePolicy.minDurationMs ? this.staticCachePolicy.minDurationMs : 0);
   }
 
-  /** 查询某站离线包下载进度(无则返回 null) */
-  getBundleProgress(origin: string): BundleProgress | null {
-    const p: BundleProgressEntry | undefined = this.bundleProgress.get(origin);
+  /** 地区切换:取消旧地区队列、删除旧地区沙箱缓存。top 常驻缓存不受影响 */
+  switchRegion(region: string): void {
+    const nextRegion: string = region ? region : '';
+    if (this.activeRegion === nextRegion && nextRegion.length > 0) {
+      return;
+    }
+    const oldRegion: string = this.activeRegion;
+    this.regionGeneration++;
+    this.activeRegion = nextRegion;
+    if (oldRegion.length > 0) {
+      this.cancelRegionQueue(oldRegion);
+      this.deleteRegion(oldRegion);
+    }
+    hilog.info(DOMAIN, TAG, 'switchRegion %{public}s -> %{public}s gen=%{public}d',
+      oldRegion.length > 0 ? oldRegion : '(none)', nextRegion.length > 0 ? nextRegion : '(none)', this.regionGeneration);
+  }
+
+  /** 删除某个地区的离线包缓存。只删 scope=region 的资源,不删 top */
+  deleteRegion(region: string): void {
+    if (!region || region.length === 0) {
+      return;
+    }
+    const urls: string[] = [];
+    this.diskIndex.forEach((v: DiskEntry, k: string) => {
+      if (v.scope === 'region' && v.region === region) {
+        urls.push(k);
+      }
+    });
+    for (let i = 0; i < urls.length; i++) {
+      this.removeCached(urls[i]);
+    }
+    const stateKeys: string[] = [];
+    this.bundleState.forEach((v: BundleState, k: string) => {
+      if (v.scope === 'region' && v.region === region) {
+        stateKeys.push(k);
+      }
+    });
+    for (let i = 0; i < stateKeys.length; i++) {
+      this.bundleState.delete(stateKeys[i]);
+      this.bundleProgress.delete(stateKeys[i]);
+      this.bundleErrors.delete(stateKeys[i]);
+      this.loadedBundles.delete(stateKeys[i]);
+    }
+    this.saveDiskIndex();
+    this.saveBundleState();
+    hilog.info(DOMAIN, TAG, 'deleteRegion %{public}s urls=%{public}d bundles=%{public}d',
+      region, urls.length, stateKeys.length);
+  }
+
+  /** 删除某个网址 id 对应的离线包缓存 */
+  deleteBundle(id: string): void {
+    if (!id || id.length === 0) {
+      return;
+    }
+    const urls: string[] = [];
+    const state: BundleState | undefined = this.bundleState.get(id);
+    if (state && state.urls) {
+      for (let i = 0; i < state.urls.length; i++) {
+        urls.push(state.urls[i]);
+      }
+    }
+    this.diskIndex.forEach((v: DiskEntry, k: string) => {
+      if (v.bundleId === id) {
+        if (urls.indexOf(k) < 0) {
+          urls.push(k);
+        }
+      }
+    });
+    for (let i = 0; i < urls.length; i++) {
+      this.removeCached(urls[i]);
+    }
+    this.bundleState.delete(id);
+    this.bundleProgress.delete(id);
+    this.bundleErrors.delete(id);
+    this.loadedBundles.delete(id);
+    this.saveDiskIndex();
+    this.saveBundleState();
+    hilog.info(DOMAIN, TAG, 'deleteBundle %{public}s urls=%{public}d', id, urls.length);
+  }
+
+  /** 获取随离线包下发/本地保存的 H5 配置 JSON。接入方可用它做接口失败时的 configJson 兜底 */
+  getConfigJson(idOrUrl: string): string {
+    if (!idOrUrl || idOrUrl.length === 0) {
+      hilog.info(DOMAIN, TAG, 'configJson MISS empty key');
+      return '';
+    }
+    const key: string = this.bundleKeyFor('', idOrUrl);
+    const direct: BundleState | undefined = this.bundleState.get(key);
+    if (direct && direct.configJson && direct.configJson.length > 0) {
+      hilog.info(DOMAIN, TAG, 'configJson HIT key=%{public}s origin=%{public}s bytes=%{public}d',
+        key, direct.origin && direct.origin.length > 0 ? direct.origin : '(none)', direct.configJson.length);
+      return direct.configJson as string;
+    }
+    const origin: string = this.originFromUrl(idOrUrl);
+    if (origin.length > 0) {
+      let found: string = '';
+      let foundKey: string = '';
+      this.bundleState.forEach((v: BundleState, k: string) => {
+        if (found.length === 0 && v.origin === origin && v.configJson && v.configJson.length > 0) {
+          found = v.configJson as string;
+          foundKey = k;
+        }
+      });
+      if (found.length > 0) {
+        hilog.info(DOMAIN, TAG, 'configJson HIT key=%{public}s origin=%{public}s bytes=%{public}d',
+          foundKey.length > 0 ? foundKey : key, origin, found.length);
+      } else {
+        hilog.info(DOMAIN, TAG, 'configJson MISS key=%{public}s origin=%{public}s', key, origin);
+      }
+      return found;
+    }
+    hilog.info(DOMAIN, TAG, 'configJson MISS key=%{public}s origin=%{public}s', key, '(none)');
+    return '';
+  }
+
+  /** 接入方从原业务接口拿到最新 configJson 时可同步进离线状态,下次弱网可兜底使用 */
+  updateConfigJson(idOrUrl: string, configJson: string): void {
+    if (!idOrUrl || idOrUrl.length === 0 || !configJson || configJson.length === 0) {
+      return;
+    }
+    const key: string = this.bundleKeyFor('', idOrUrl);
+    let origin: string = this.originFromUrl(idOrUrl);
+    const mappedOrigin: string | undefined = this.appOriginById.get(key);
+    if (origin.length === 0 && mappedOrigin !== undefined) {
+      origin = mappedOrigin;
+    }
+    let scope: string = origin.length > 0 && this.bundleScopeByOrigin.get(origin) !== undefined
+      ? this.bundleScopeByOrigin.get(origin) as string
+      : '';
+    let region: string = origin.length > 0 && this.bundleRegionByOrigin.get(origin) !== undefined
+      ? this.bundleRegionByOrigin.get(origin) as string
+      : '';
+    const mappedScope: string | undefined = this.appScopeById.get(key);
+    const mappedRegion: string | undefined = this.appRegionById.get(key);
+    if (mappedScope !== undefined && mappedScope.length > 0) {
+      scope = mappedScope;
+    }
+    if (mappedRegion !== undefined && mappedRegion.length > 0) {
+      region = mappedRegion;
+    }
+    const state: BundleState | undefined = this.bundleState.get(key);
+    if (state) {
+      state.configJson = configJson;
+      if (state.origin.length === 0 && origin.length > 0) {
+        state.origin = origin;
+      }
+      if ((!state.scope || state.scope.length === 0) && scope.length > 0) {
+        state.scope = this.normalizeScope(scope);
+      }
+      if ((!state.region || state.region.length === 0) && region.length > 0) {
+        state.region = region;
+      }
+      this.bundleState.set(key, state);
+      this.saveBundleState();
+      hilog.info(DOMAIN, TAG, 'configJson updated key=%{public}s origin=%{public}s scope=%{public}s region=%{public}s bytes=%{public}d',
+        key,
+        state.origin && state.origin.length > 0 ? state.origin : '(none)',
+        state.scope && state.scope.length > 0 ? state.scope : '(none)',
+        state.region && state.region.length > 0 ? state.region : '(none)',
+        configJson.length);
+      return;
+    }
+    const fallbackId: string | undefined = origin.length > 0 ? this.bundleAppByOrigin.get(origin) : undefined;
+    const saved: BundleState = {
+      key: key,
+      id: key.indexOf('http://') !== 0 && key.indexOf('https://') !== 0 ? key : (fallbackId !== undefined ? fallbackId : key),
+      origin: origin,
+      region: region.length > 0 ? region : undefined,
+      scope: this.normalizeScope(scope),
+      version: '',
+      urls: new Array<string>(),
+      configJson: configJson
+    };
+    this.bundleState.set(key, saved);
+    this.saveBundleState();
+    hilog.info(DOMAIN, TAG, 'configJson saved key=%{public}s origin=%{public}s scope=%{public}s region=%{public}s bytes=%{public}d',
+      key,
+      origin.length > 0 ? origin : '(none)',
+      saved.scope && saved.scope.length > 0 ? saved.scope : '(none)',
+      saved.region && saved.region.length > 0 ? saved.region : '(none)',
+      configJson.length);
+  }
+
+  private originFromUrl(input: string): string {
+    if (!input || input.length === 0) {
+      return '';
+    }
+    const om: RegExpMatchArray | null = input.match(/^https?:\/\/[^\/]+/);
+    return om ? om[0] : '';
+  }
+
+  private bundleKeyFor(origin: string, appId: string = ''): string {
+    if (appId && appId.length > 0 && appId.indexOf('http://') !== 0 && appId.indexOf('https://') !== 0) {
+      return appId;
+    }
+    if (origin && origin.length > 0) {
+      return origin;
+    }
+    const om: RegExpMatchArray | null = appId.match(/^https?:\/\/[^\/]+/);
+    return om ? om[0] : appId;
+  }
+
+  private normalizeScope(scope: string): string {
+    if (scope === 'top' || scope === 'region') {
+      return scope;
+    }
+    return 'top';
+  }
+
+  private buildOwner(origin: string, appId: string, region: string, scope: string): BundleResourceOwner {
+    const finalScope: string = this.normalizeScope(scope);
+    return {
+      bundleKey: this.bundleKeyFor(origin, appId),
+      bundleId: appId && appId.length > 0 ? appId : origin,
+      origin: origin,
+      region: region ? region : '',
+      scope: finalScope,
+      generation: finalScope === 'region' ? this.regionGeneration : 0
+    };
+  }
+
+  private isOwnerCancelled(owner: BundleResourceOwner | undefined): boolean {
+    if (!owner) {
+      return false;
+    }
+    if (owner.scope === 'region') {
+      if (owner.region.length > 0 && owner.region !== this.activeRegion) {
+        return true;
+      }
+      if (owner.generation !== this.regionGeneration) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  private cancelRegionQueue(region: string): void {
+    if (!region || region.length === 0 || this.bundleQueue.length === 0) {
+      return;
+    }
+    const next: RawEntry[] = [];
+    let removed: number = 0;
+    for (let i = 0; i < this.bundleQueue.length; i++) {
+      const entry: RawEntry = this.bundleQueue[i];
+      const owner: BundleResourceOwner | undefined = this.bundleQueueOwners.get(entry.url);
+      if (owner && owner.scope === 'region' && owner.region === region) {
+        this.bundleQueueSources.delete(entry.url);
+        this.bundleQueueOwners.delete(entry.url);
+        removed++;
+      } else {
+        next.push(entry);
+      }
+    }
+    this.bundleQueue = next;
+    if (removed > 0) {
+      hilog.info(DOMAIN, TAG, 'cancelRegionQueue %{public}s removed=%{public}d', region, removed);
+    }
+  }
+
+  /** 查询某站离线包下载进度(无则返回 null)。参数可传 app id / origin / URL */
+  getBundleProgress(idOrUrl: string): BundleProgress | null {
+    const key: string = this.bundleKeyFor('', idOrUrl);
+    const p: BundleProgressEntry | undefined = this.bundleProgress.get(key);
     if (p) {
       return { total: p.total, done: p.done };
     }
-    const state: BundleState | undefined = this.bundleState.get(origin);
+    let state: BundleState | undefined = this.bundleState.get(key);
+    if (!state) {
+      const om: RegExpMatchArray | null = idOrUrl.match(/^https?:\/\/[^\/]+/);
+      const origin: string = om ? om[0] : '';
+      if (origin.length > 0) {
+        this.bundleState.forEach((v: BundleState) => {
+          if (!state && v.origin === origin) {
+            state = v;
+          }
+        });
+      }
+    }
     if (state && state.urls && state.urls.length > 0) {
       let done: number = 0;
       for (let i = 0; i < state.urls.length; i++) {
@@ -635,6 +971,44 @@ class WebCacheManager {
       return { total: state.urls.length, done: done };
     }
     return null;
+  }
+
+  /** 查询某站离线包最近一次失败原因(无则返回空字符串) */
+  getBundleError(origin: string): string {
+    const err: string | undefined = this.bundleErrors.get(origin);
+    return err ? err : '';
+  }
+
+  isBundleApplied(idOrUrl: string, bundleVersion: string = ''): boolean {
+    const key: string = this.bundleKeyFor('', idOrUrl);
+    let state: BundleState | undefined = this.bundleState.get(key);
+    if (!state) {
+      const om: RegExpMatchArray | null = idOrUrl.match(/^https?:\/\/[^\/]+/);
+      const origin: string = om ? om[0] : '';
+      if (origin.length > 0) {
+        this.bundleState.forEach((v: BundleState) => {
+          if (!state && v.origin === origin) {
+            state = v;
+          }
+        });
+      }
+    }
+    if (!state) {
+      return false;
+    }
+    if (!state || !state.urls || state.urls.length === 0) {
+      return false;
+    }
+    if (bundleVersion.length > 0 && state.version !== bundleVersion) {
+      return false;
+    }
+    for (let i = 0; i < state.urls.length; i++) {
+      const u: string = state.urls[i];
+      if (!this.diskIndex.has(u) && !this.rawIndex.has(u)) {
+        return false;
+      }
+    }
+    return true;
   }
 
   /** 某资源下完后:若属于某站离线包,推进其完成计数 */
@@ -812,6 +1186,10 @@ class WebCacheManager {
     if (!this.ready) {
       return null;
     }
+    url = this.normalizeRequestUrl(url);
+    if (url.length === 0) {
+      return null;
+    }
 
     // ⓪ 黑名单:国内不可达、会挂死的外部请求(Google 翻译)→ 立刻空响应,避免卡住 load
     if (this.isBlocked(url)) {
@@ -950,7 +1328,193 @@ class WebCacheManager {
     return null;
   }
 
+  /**
+   * 给外部 WebView 容器使用的 SchemeHandler 接入口。
+   * 命中离线包时直接向 WebResourceHandler 写响应;未命中返回 false,由宿主继续放行网络。
+   */
+  handleSchemeRequest(request: webview.WebSchemeHandlerRequest, handler: webview.WebResourceHandler): boolean {
+    if (!this.ready || !request || !handler) {
+      return false;
+    }
+    const url: string = request.getRequestUrl();
+    const method: string = request.getRequestMethod();
+    const m: string = method && method.length > 0 ? method.toUpperCase() : 'GET';
+    if (m !== 'GET') {
+      return false;
+    }
+    const hit: SchemeHit | null = this.readSchemeHit(url);
+    if (!hit) {
+      return false;
+    }
+    try {
+      const response = new webview.WebSchemeHandlerResponse();
+      response.setNetErrorCode(WebNetErrorList.NET_OK);
+      response.setStatus(200);
+      response.setStatusText('OK');
+      response.setMimeType(hit.mime);
+      response.setEncoding('utf-8');
+      handler.didReceiveResponse(response);
+      handler.didReceiveResponseBody(hit.body);
+      handler.didFinish();
+      hilog.info(DOMAIN, TAG, 'offline HIT %{public}s mime=%{public}s bytes=%{public}d',
+        url, hit.mime, hit.body.byteLength);
+      return true;
+    } catch (e) {
+      const er = e as BusinessError;
+      hilog.warn(DOMAIN, TAG, 'scheme response failed %{public}s', er.message);
+      return false;
+    }
+  }
+
+  private readSchemeHit(url: string): SchemeHit | null {
+    if (!url || url.length === 0) {
+      return null;
+    }
+    let cacheKey: string = url;
+    let disk: DiskEntry | undefined = this.diskIndex.get(cacheKey);
+    let raw: RawEntry | undefined = this.rawIndex.get(cacheKey);
+    if (disk === undefined && raw === undefined) {
+      const matchingKey: string = this.matchingWordpressStaticKey(url);
+      if (matchingKey.length > 0) {
+        cacheKey = matchingKey;
+        disk = this.diskIndex.get(cacheKey);
+        raw = this.rawIndex.get(cacheKey);
+      }
+    }
+    if (disk) {
+      if (disk.source !== 'bundle') {
+        this.removeCached(cacheKey);
+        this.saveDiskIndex();
+        return null;
+      }
+      if (disk.encoding && disk.encoding.length > 0) {
+        const decoded: ArrayBuffer | undefined = this.decodedMemory.get(cacheKey);
+        if (decoded !== undefined) {
+          disk.atime = Date.now();
+          this.hitDisk++;
+          return { body: decoded, mime: disk.mime };
+        }
+        this.warmDecodedEntry(cacheKey, disk);
+        return null;
+      }
+      const buf: ArrayBuffer | null = this.readFile(this.cacheDir + '/' + disk.file);
+      if (buf) {
+        disk.atime = Date.now();
+        this.hitDisk++;
+        return { body: buf, mime: disk.mime };
+      }
+      this.removeCached(cacheKey);
+      this.saveDiskIndex();
+      this.reportBundleCorruptIfNeeded(cacheKey);
+      return null;
+    }
+    if (raw && this.resMgr && (!raw.encoding || raw.encoding.length === 0)) {
+      try {
+        const u8: Uint8Array = this.resMgr.getRawFileContentSync(RAW_DIR + '/' + raw.file);
+        const buf: ArrayBuffer = u8.buffer.slice(u8.byteOffset, u8.byteOffset + u8.byteLength);
+        this.hitRaw++;
+        return { body: buf, mime: raw.mime };
+      } catch (e) {
+        return null;
+      }
+    }
+    return null;
+  }
+
   /** 页面加载完成后调用:把本次未命中的静态资源后台抓回,供下次秒开 */
+  private normalizeRequestUrl(input: string): string {
+    let out: string = input ? input.trim() : '';
+    if (out.length === 0) {
+      return '';
+    }
+    const hash: number = out.indexOf('#');
+    if (hash >= 0) {
+      out = out.substring(0, hash);
+    }
+    const scheme: number = out.indexOf('://');
+    if (scheme > 0) {
+      const hostStart: number = scheme + 3;
+      const pathStart: number = out.indexOf('/', hostStart);
+      const queryStart: number = out.indexOf('?', hostStart);
+      if (pathStart < 0 || (queryStart >= 0 && queryStart < pathStart)) {
+        if (queryStart >= 0) {
+          out = out.substring(0, queryStart) + '/' + out.substring(queryStart);
+        } else {
+          out = out + '/';
+        }
+      }
+    }
+    return out;
+  }
+
+  shouldDropUnbundledRequest(url: string, method: string): boolean {
+    const m: string = method && method.length > 0 ? method.toUpperCase() : 'GET';
+    if (m !== 'GET') {
+      return false;
+    }
+    const normalized: string = this.normalizeRequestUrl(url);
+    if (normalized.length === 0 || this.hasOfflineResource(normalized)) {
+      return false;
+    }
+    const origin: string = this.originFromUrl(normalized);
+    if (origin.length === 0 || !this.bundleAppByOrigin.has(origin)) {
+      return false;
+    }
+    const state: BundleState | undefined = this.bundleStateForOrigin(origin);
+    if (!state || !state.urls || state.urls.length === 0) {
+      return false;
+    }
+    if (this.bundleStateHasUrl(state, normalized)) {
+      return false;
+    }
+    return this.isStrictStaticRequest(normalized);
+  }
+
+  dropResponse(url: string): WebResourceResponse {
+    return this.emptyResponse(this.normalizeRequestUrl(url));
+  }
+
+  private hasOfflineResource(url: string): boolean {
+    if (this.diskIndex.has(url) || this.rawIndex.has(url)) {
+      return true;
+    }
+    const matchingKey: string = this.matchingWordpressStaticKey(url);
+    return matchingKey.length > 0 && (this.diskIndex.has(matchingKey) || this.rawIndex.has(matchingKey));
+  }
+
+  private bundleStateForOrigin(origin: string): BundleState | undefined {
+    let state: BundleState | undefined = undefined;
+    this.bundleState.forEach((v: BundleState) => {
+      if (!state && v.origin === origin) {
+        state = v;
+      }
+    });
+    return state;
+  }
+
+  private bundleStateHasUrl(state: BundleState, url: string): boolean {
+    for (let i = 0; i < state.urls.length; i++) {
+      if (this.normalizeRequestUrl(state.urls[i]) === url) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  private isStrictStaticRequest(url: string): boolean {
+    if (url.indexOf('/_next/static/') >= 0 || url.indexOf('/_next/image?') >= 0) {
+      return true;
+    }
+    const q: number = url.indexOf('?');
+    const path: string = (q >= 0 ? url.substring(0, q) : url).toLowerCase();
+    return path.endsWith('.js') || path.endsWith('.mjs') || path.endsWith('.css') ||
+      path.endsWith('.woff') || path.endsWith('.woff2') || path.endsWith('.ttf') ||
+      path.endsWith('.otf') || path.endsWith('.eot') || path.endsWith('.png') ||
+      path.endsWith('.jpg') || path.endsWith('.jpeg') || path.endsWith('.webp') ||
+      path.endsWith('.avif') || path.endsWith('.gif') || path.endsWith('.svg') ||
+      path.endsWith('.ico');
+  }
+
   flushPending(): void {
     this.pending.clear();
   }
@@ -1023,7 +1587,10 @@ class WebCacheManager {
     resp.setResponseMimeType(mime);
     resp.setResponseCode(200);
     resp.setReasonMessage('OK');
-    resp.setResponseHeader([{ headerKey: 'Access-Control-Allow-Origin', headerValue: '*' }]);
+    resp.setResponseHeader([
+      { headerKey: 'Access-Control-Allow-Origin', headerValue: '*' },
+      { headerKey: 'X-Offline-Cache', headerValue: 'DROP' }
+    ]);
     resp.setResponseIsReady(true);
     return resp;
   }
@@ -1083,8 +1650,14 @@ class WebCacheManager {
    */
   private fetchAndStore(cacheKey: string, sourceUrl: string, forceMime: string, overwrite: boolean,
     onDone?: (ok: boolean) => void, sourceKind: string = 'runtime',
-    contentEncoding: string = '', rawSize: number = 0): void {
+    contentEncoding: string = '', rawSize: number = 0, owner?: BundleResourceOwner): void {
     if (sourceKind !== 'bundle') {
+      if (onDone) {
+        onDone(false);
+      }
+      return;
+    }
+    if (this.isOwnerCancelled(owner)) {
       if (onDone) {
         onDone(false);
       }
@@ -1129,7 +1702,9 @@ class WebCacheManager {
       this.inflight.delete(cacheKey);
       let ok: boolean = false;
       try {
-        if (!err && data && data.responseCode === 200 && data.result instanceof ArrayBuffer) {
+        if (this.isOwnerCancelled(owner)) {
+          ok = false;
+        } else if (!err && data && data.responseCode === 200 && data.result instanceof ArrayBuffer) {
           const body: ArrayBuffer = data.result as ArrayBuffer;
           const costMs: number = Date.now() - startedAt;
           const mime: string = forceMime && forceMime.length > 0 ? forceMime : this.pickMime(cacheKey, data.header);
@@ -1155,7 +1730,10 @@ class WebCacheManager {
               url: cacheKey, file: file, mime: mime, size: body.byteLength, atime: now, storedAt: now,
               version: newVersion, costMs: costMs, source: sourceKind,
               encoding: contentEncoding && contentEncoding.length > 0 ? contentEncoding : undefined,
-              rawSize: rawSize > 0 ? rawSize : undefined
+              rawSize: rawSize > 0 ? rawSize : undefined,
+              bundleId: owner && owner.bundleId.length > 0 ? owner.bundleId : undefined,
+              region: owner && owner.region.length > 0 ? owner.region : undefined,
+              scope: owner && owner.scope.length > 0 ? owner.scope : undefined
             };
             this.diskIndex.set(cacheKey, entry);
             this.totalBytes += body.byteLength;
@@ -1192,13 +1770,21 @@ class WebCacheManager {
   }
 
   /** 远程离线包下载任务入队,用有限并发避免抢占首屏主链路 */
-  private enqueueBundleDownload(entry: RawEntry, sourceUrl: string): void {
+  private enqueueBundleDownload(entry: RawEntry, sourceUrl: string, owner: BundleResourceOwner): void {
+    if (this.isOwnerCancelled(owner)) {
+      return;
+    }
     if (this.diskIndex.has(entry.url) || this.rawIndex.has(entry.url) || this.inflight.has(entry.url) ||
       this.bundleQueueSources.has(entry.url)) {
       return;
     }
     this.bundleQueue.push(entry);
     this.bundleQueueSources.set(entry.url, sourceUrl);
+    this.bundleQueueOwners.set(entry.url, owner);
+    hilog.info(DOMAIN, TAG, 'bundle enqueue key=%{public}s id=%{public}s region=%{public}s scope=%{public}s url=%{public}s source=%{public}s queued=%{public}d active=%{public}d',
+      owner.bundleKey, owner.bundleId,
+      owner.region.length > 0 ? owner.region : '(none)', owner.scope,
+      entry.url, sourceUrl, this.bundleQueue.length, this.activeBundleDownloads);
     this.pumpBundleQueue();
   }
 
@@ -1209,8 +1795,13 @@ class WebCacheManager {
         return;
       }
       const src: string | undefined = this.bundleQueueSources.get(entry.url);
+      const owner: BundleResourceOwner | undefined = this.bundleQueueOwners.get(entry.url);
       this.bundleQueueSources.delete(entry.url);
+      this.bundleQueueOwners.delete(entry.url);
       if (!src || src.length === 0) {
+        continue;
+      }
+      if (this.isOwnerCancelled(owner)) {
         continue;
       }
       if (this.diskIndex.has(entry.url) || this.rawIndex.has(entry.url)) {
@@ -1222,7 +1813,7 @@ class WebCacheManager {
       this.fetchAndStore(entry.url, src, entry.mime, false, (_ok: boolean) => {
         this.activeBundleDownloads--;
         this.pumpBundleQueue();
-      }, 'bundle', entry.encoding ? entry.encoding : '', rawSize);
+      }, 'bundle', entry.encoding ? entry.encoding : '', rawSize, owner);
     }
   }
 
@@ -1232,52 +1823,101 @@ class WebCacheManager {
    * @param siteUrl     站点任意 URL(取 origin,完成后通知补注入字节码)
    * @param manifestUrl 后台 manifest 全地址(如 http://server:8787/bundles/<id>/manifest.json)
    */
-  async loadRemoteBundle(siteUrl: string, manifestUrl: string, bundleVersion: string = ''): Promise<void> {
+  async loadRemoteBundle(siteUrl: string, manifestUrl: string, bundleVersion: string = '',
+    appId: string = '', region: string = '', scope: string = 'app', configJson: string = ''): Promise<void> {
     const om = siteUrl.match(/^https?:\/\/[^\/]+/);
     const origin: string = om ? om[0] : '';
     if (origin.length === 0 || manifestUrl.length === 0) {
       return;
     }
-    // 版本门:已应用版本 == 当前下发版本 → 离线包无变化,直接用本地(连清单都不拉)
-    const applied: BundleState | undefined = this.bundleState.get(origin);
-    if (bundleVersion.length > 0 && applied !== undefined && applied.version === bundleVersion) {
-      this.warmCompressedDiskEntriesForUrls(applied.urls);
+    const owner: BundleResourceOwner = this.buildOwner(origin, appId, region, scope);
+    if (this.isOwnerCancelled(owner)) {
+      hilog.info(DOMAIN, TAG, 'bundle request canceled key=%{public}s id=%{public}s origin=%{public}s region=%{public}s scope=%{public}s',
+        owner.bundleKey, owner.bundleId, owner.origin,
+        owner.region.length > 0 ? owner.region : '(none)', owner.scope);
       return;
     }
-    if (this.loadedBundles.has(origin)) {
+    const bundleKey: string = owner.bundleKey;
+    hilog.info(DOMAIN, TAG, 'bundle request key=%{public}s id=%{public}s origin=%{public}s region=%{public}s scope=%{public}s ver=%{public}s manifest=%{public}s configJsonBytes=%{public}d',
+      bundleKey, owner.bundleId, origin,
+      owner.region.length > 0 ? owner.region : '(none)', owner.scope,
+      bundleVersion.length > 0 ? bundleVersion : '(none)', manifestUrl, configJson.length);
+    // 版本门:已应用版本 == 当前下发版本 → 离线包无变化,直接用本地(连清单都不拉)
+    const applied: BundleState | undefined = this.bundleState.get(bundleKey);
+    if (bundleVersion.length > 0 && applied !== undefined && applied.version === bundleVersion) {
+      this.warmCompressedDiskEntriesForUrls(applied.urls);
+      hilog.info(DOMAIN, TAG, 'bundle already applied key=%{public}s id=%{public}s origin=%{public}s region=%{public}s scope=%{public}s ver=%{public}s urls=%{public}d configJsonBytes=%{public}d',
+        bundleKey,
+        applied.id && applied.id.length > 0 ? applied.id : owner.bundleId,
+        applied.origin && applied.origin.length > 0 ? applied.origin : origin,
+        applied.region && applied.region.length > 0 ? applied.region : '(none)',
+        applied.scope && applied.scope.length > 0 ? applied.scope : owner.scope,
+        bundleVersion, applied.urls.length,
+        applied.configJson && applied.configJson.length > 0 ? applied.configJson.length : 0);
+      return;
+    }
+    if (this.loadedBundles.has(bundleKey)) {
       if (applied !== undefined) {
         this.warmCompressedDiskEntriesForUrls(applied.urls);
       }
       if (bundleVersion.length > 0) {
-        const current: BundleState | undefined = this.bundleState.get(origin);
+        const current: BundleState | undefined = this.bundleState.get(bundleKey);
         if (current !== undefined && current.version !== bundleVersion) {
-          this.bundleState.set(origin, { origin: origin, version: bundleVersion, urls: current.urls });
+          this.bundleState.set(bundleKey, {
+            key: current.key,
+            id: current.id,
+            origin: current.origin,
+            region: current.region,
+            scope: current.scope,
+            version: bundleVersion,
+            urls: current.urls,
+            configJson: current.configJson
+          });
           this.saveBundleState();
           hilog.info(DOMAIN, TAG, 'bundle version recorded after refresh: %{public}s', bundleVersion);
         } else if (current === undefined) {
-          this.pendingBundleVersionByOrigin.set(origin, bundleVersion);
+          this.pendingBundleVersionByKey.set(bundleKey, bundleVersion);
           hilog.info(DOMAIN, TAG, 'bundle version pending until current download completes: %{public}s', bundleVersion);
         }
       }
       return; // 本次会话已处理过该站
     }
-    this.loadedBundles.add(origin);
+    this.loadedBundles.add(bundleKey);
+    this.bundleErrors.delete(bundleKey);
     const base: string = manifestUrl.replace(/\/manifest(?:\.[A-Za-z0-9_-]+)?\.json.*$/, ''); // 后台资源目录
     const txt: string = await this.httpGetText(manifestUrl);
     if (txt.length === 0) {
       hilog.warn(DOMAIN, TAG, 'remote bundle manifest unreachable: %{public}s', manifestUrl);
-      this.loadedBundles.delete(origin);
+      this.bundleErrors.set(bundleKey, 'manifest不可达');
+      this.loadedBundles.delete(bundleKey);
       return;
     }
     let arr: RawEntry[] = [];
+    let manifestConfigJson: string = '';
     try {
-      arr = JSON.parse(txt) as RawEntry[];
+      const parsed: Object = JSON.parse(txt) as Object;
+      if (Array.isArray(parsed)) {
+        arr = parsed as RawEntry[];
+      } else {
+        const obj = parsed as RemoteManifestObject;
+        manifestConfigJson = obj.configJson && obj.configJson.length > 0
+          ? obj.configJson
+          : (obj.webConfigJson && obj.webConfigJson.length > 0 ? obj.webConfigJson : '');
+        if (obj.resources && Array.isArray(obj.resources)) {
+          arr = obj.resources;
+        } else if (obj.manifest && Array.isArray(obj.manifest)) {
+          arr = obj.manifest;
+        }
+      }
     } catch (e) {
       const er = e as BusinessError;
       hilog.error(DOMAIN, TAG, 'remote manifest parse failed: %{public}s', er.message);
-      this.loadedBundles.delete(origin);
+      this.bundleErrors.set(bundleKey, 'manifest解析失败');
+      this.loadedBundles.delete(bundleKey);
       return;
     }
+    hilog.info(DOMAIN, TAG, 'bundle manifest parsed key=%{public}s id=%{public}s resources=%{public}d manifestConfigJsonBytes=%{public}d manifest=%{public}s',
+      bundleKey, owner.bundleId, arr.length, manifestConfigJson.length, manifestUrl);
     let total: number = 0;
     let done: number = 0;
     const expected: Set<string> = new Set();
@@ -1296,7 +1936,7 @@ class WebCacheManager {
         }
       }
       // 主文档只有启用 SWR 时才会被 intercept 使用。未启用时跳过 HTML,避免无效占用沙箱。
-      if (e.mime === 'text/html' && !this.docUrls.has(e.url)) {
+      if (e.mime === 'text/html' && e.doc !== true && !this.docUrls.has(e.url)) {
         continue;
       }
       total++;
@@ -1323,7 +1963,7 @@ class WebCacheManager {
         done++;
       } else {
         expected.add(e.url);
-        this.enqueueBundleDownload(e, base + '/' + e.file); // 来源=后台文件,缓存 key=原站 URL
+        this.enqueueBundleDownload(e, base + '/' + e.file, owner); // 来源=后台文件,缓存 key=原站 URL
       }
     }
     // 清理:上次清单里有、这次没有的资源 → 删本地(服务端移除/换名后去陈旧)
@@ -1343,15 +1983,32 @@ class WebCacheManager {
       }
     }
     // 记录已应用版本 + URL 清单(下次开机版本门据此判断要不要更新)
-    const pendingVersion: string | undefined = this.pendingBundleVersionByOrigin.get(origin);
+    const pendingVersion: string | undefined = this.pendingBundleVersionByKey.get(bundleKey);
     const effectiveVersion: string = bundleVersion.length > 0 ? bundleVersion : (pendingVersion !== undefined ? pendingVersion : '');
-    this.pendingBundleVersionByOrigin.delete(origin);
-    this.bundleState.set(origin, { origin: origin, version: effectiveVersion, urls: newUrls });
+    this.pendingBundleVersionByKey.delete(bundleKey);
+    const finalConfigJson: string = manifestConfigJson.length > 0 ? manifestConfigJson : configJson;
+    this.bundleState.set(bundleKey, {
+      key: bundleKey,
+      id: owner.bundleId,
+      origin: origin,
+      region: owner.region,
+      scope: owner.scope,
+      version: effectiveVersion,
+      urls: newUrls,
+      configJson: finalConfigJson.length > 0 ? finalConfigJson : undefined
+    });
     this.saveBundleState();
     const prog: BundleProgressEntry = { total: total, done: done, expected: expected };
+    this.bundleProgress.set(bundleKey, prog);
     this.bundleProgress.set(origin, prog);
+    this.bundleErrors.delete(bundleKey);
     hilog.info(DOMAIN, TAG, 'remote bundle: total %{public}d, to download %{public}d, ver %{public}s',
       total, total - done, effectiveVersion.length > 0 ? effectiveVersion : '(none)');
+    hilog.info(DOMAIN, TAG, 'bundle state saved key=%{public}s id=%{public}s origin=%{public}s region=%{public}s scope=%{public}s ver=%{public}s urls=%{public}d download=%{public}d configJsonBytes=%{public}d',
+      bundleKey, owner.bundleId, origin,
+      owner.region.length > 0 ? owner.region : '(none)', owner.scope,
+      effectiveVersion.length > 0 ? effectiveVersion : '(none)', newUrls.length, total - done,
+      finalConfigJson.length);
   }
 
   private httpGetText(url: string): Promise<string> {
@@ -1505,6 +2162,61 @@ class WebCacheManager {
     } catch (e) {
       const er = e as BusinessError;
       hilog.error(DOMAIN, TAG, 'writeBinary failed: %{public}s', er.message);
+    }
+  }
+
+  dumpBase64Resource(url: string, mime: string, base64: string): void {
+    try {
+      if (!this.ready || this.cacheDir.length === 0 || url.length === 0 || base64.length === 0) {
+        return;
+      }
+      const dir: string = this.cacheDir + '/xe-dump';
+      if (!fs.accessSync(dir)) {
+        fs.mkdirSync(dir, true);
+      }
+      const file: string = this.fileNameFor(url);
+      const decoded: Uint8Array = new util.Base64Helper().decodeSync(base64);
+      const buf: ArrayBuffer = decoded.buffer.slice(decoded.byteOffset, decoded.byteOffset + decoded.byteLength);
+      this.writeBinary(dir + '/' + file, buf);
+      this.upsertDumpManifest(dir, { url: url, file: file, mime: mime, size: decoded.byteLength });
+      hilog.info(DOMAIN, TAG, 'XE_DUMP file=%{public}s size=%{public}d url=%{public}s', file, decoded.byteLength, url);
+      hilog.info(DOMAIN, TAG, 'XE_DUMP_DIR %{public}s', dir);
+    } catch (e) {
+      const er = e as BusinessError;
+      hilog.warn(DOMAIN, TAG, 'XE_DUMP failed %{public}s', er.message);
+    }
+  }
+
+  private upsertDumpManifest(dir: string, entry: DumpEntry): void {
+    const path: string = dir + '/manifest.json';
+    let arr: DumpEntry[] = [];
+    try {
+      const buf: ArrayBuffer | null = this.readFile(path);
+      if (buf) {
+        const txt: string = util.TextDecoder.create('utf-8').decodeToString(new Uint8Array(buf));
+        const parsed = JSON.parse(txt) as DumpEntry[];
+        if (Array.isArray(parsed)) {
+          arr = parsed;
+        }
+      }
+    } catch (e) {
+      arr = [];
+    }
+    const next: DumpEntry[] = [];
+    for (let i = 0; i < arr.length; i++) {
+      if (arr[i] && arr[i].url !== entry.url) {
+        next.push(arr[i]);
+      }
+    }
+    next.push(entry);
+    try {
+      const txt: string = JSON.stringify(next);
+      const f = fs.openSync(path, fs.OpenMode.READ_WRITE | fs.OpenMode.CREATE | fs.OpenMode.TRUNC);
+      fs.writeSync(f.fd, txt);
+      fs.closeSync(f);
+    } catch (e) {
+      const er = e as BusinessError;
+      hilog.warn(DOMAIN, TAG, 'XE_DUMP manifest failed %{public}s', er.message);
     }
   }
 
@@ -1670,8 +2382,16 @@ class WebCacheManager {
         for (let i = 0; i < arr.length; i++) {
           const s: BundleState = arr[i];
           if (s && s.origin) {
-            this.bundleState.set(s.origin, {
-              origin: s.origin, version: s.version ? s.version : '', urls: s.urls ? s.urls : []
+            const key: string = s.key && s.key.length > 0 ? s.key : (s.id && s.id.length > 0 ? s.id : s.origin);
+            this.bundleState.set(key, {
+              key: key,
+              id: s.id ? s.id : '',
+              origin: s.origin,
+              region: s.region ? s.region : '',
+              scope: s.scope ? s.scope : '',
+              version: s.version ? s.version : '',
+              urls: s.urls ? s.urls : [],
+              configJson: s.configJson ? s.configJson : undefined
             });
           }
         }

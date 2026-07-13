@@ -34,10 +34,44 @@ const VEXERE_UA: string =
 const HANCHAO_SUBWAY_UA: string =
   'Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1';
 
+const XE_UA: string =
+  'Mozilla/5.0 (Phone; OpenHarmony 6.0) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36  ArkWeb/6.0.0.130 Mobile';
+
 const FALLBACK_APPS: RemoteApp[] = [
+  {
+    id: 'xe',
+    name: 'Xe',
+    localOnly: true,
+    scope: 'region',
+    region: 'FX',
+    appId: 'xe',
+    appVersion: '2026.07',
+    priority: 1000,
+    url: 'https://www.xe.com/zh-cn/',
+    routes: ['/zh-cn/'],
+    swrDoc: false,
+    prerender: false,
+    codeCache: false,
+    bundle: true,
+    manifestUrl: 'http://192.168.20.197:8787/bundles/xe/manifest.json',
+    bundleVersion: '85ba1a8f0d24acda',
+    compressedManifestUrl: 'http://192.168.20.197:8787/bundles/xe/manifest.zz.json',
+    compressedBundleVersion: 'e5761f97b02d7f41',
+    prefetchChunks: false,
+    userAgent: XE_UA,
+    preconnectHosts: [
+      'https://www.xe.com',
+      'https://356ac961549f.9e641471.eu-central-1.token.awswaf.com'
+    ]
+  },
   {
     id: 'premierinn',
     name: 'Premier Inn Hotels',
+    scope: 'region',
+    region: 'GB',
+    appId: 'premierinn',
+    appVersion: '2026.07',
+    priority: 100,
     url: 'https://www.premierinn.com/gb/en/home.html?isFirst=1',
     routes: ['/gb/en/home.html?isFirst=1', '/gb/en/home.html'],
     swrDoc: false,
@@ -64,6 +98,11 @@ const FALLBACK_APPS: RemoteApp[] = [
   {
     id: 'britishmuseum',
     name: 'British Museum',
+    scope: 'region',
+    region: 'GB',
+    appId: 'britishmuseum',
+    appVersion: '2026.07',
+    priority: 95,
     url: 'https://www.britishmuseum.org/',
     routes: ['/', '/visit', '/exhibitions-events'],
     swrDoc: false,
@@ -91,6 +130,11 @@ const FALLBACK_APPS: RemoteApp[] = [
   {
     id: 'burjkhalifa',
     name: '\u54c8\u5229\u6cd5\u5854',
+    scope: 'region',
+    region: 'AE',
+    appId: 'burjkhalifa',
+    appVersion: '2026.07',
+    priority: 100,
     url: 'https://www.burjkhalifa.ae/zh-hans/',
     routes: ['/zh-hans/'],
     swrDoc: false,
@@ -120,6 +164,11 @@ const FALLBACK_APPS: RemoteApp[] = [
   {
     id: 'getyourguide_burj',
     name: 'GetYourGuide',
+    scope: 'region',
+    region: 'AE',
+    appId: 'getyourguide_burj',
+    appVersion: '2026.07',
+    priority: 90,
     url: 'https://www.getyourguide.com/zh-cn/?visitor-id=CX728L4F9H1IKHG7O6YFWTSGRD5JCVL7&locale_autoredirect_optout=true',
     routes: ['/zh-cn/'],
     swrDoc: false,
@@ -152,6 +201,11 @@ const FALLBACK_APPS: RemoteApp[] = [
   {
     id: 'suriaklcc',
     name: 'Suria KLCC',
+    scope: 'region',
+    region: 'MY',
+    appId: 'suriaklcc',
+    appVersion: '2026.07',
+    priority: 100,
     url: 'https://www.suriaklcc.com.my?isFirst=1',
     routes: ['/', '/?isFirst=1'],
     swrDoc: false,
@@ -195,6 +249,11 @@ const FALLBACK_APPS: RemoteApp[] = [
   {
     id: 'tmb',
     name: 'TMB',
+    scope: 'region',
+    region: 'ES',
+    appId: 'tmb',
+    appVersion: '2026.07',
+    priority: 100,
     url: 'https://www.tmb.cat/en/home',
     routes: ['/en/home'],
     swrDoc: false,
@@ -236,6 +295,11 @@ const FALLBACK_APPS: RemoteApp[] = [
   {
     id: 'vexere',
     name: 'Vexere',
+    scope: 'region',
+    region: 'VN',
+    appId: 'vexere',
+    appVersion: '2026.07',
+    priority: 100,
     url: 'https://vexere.com/en-US',
     routes: ['/en-US'],
     swrDoc: false,
@@ -292,6 +356,11 @@ const FALLBACK_APPS: RemoteApp[] = [
   {
     id: 'hanchao_subway',
     name: '\u97e9\u5de2\u97e9\u56fd\u5730\u94c1',
+    scope: 'region',
+    region: 'KR',
+    appId: 'hanchao_subway',
+    appVersion: '2026.07',
+    priority: 100,
     url: 'https://map.hanchao.com/psubway',
     routes: ['/psubway'],
     swrDoc: false,
@@ -365,12 +434,16 @@ export default class EntryAbility extends UIAbility {
   private applyLaunchTarget(want: Want): void {
     const params = want.parameters as Record<string, Object>;
     if (!params) {
+      AppStorage.setOrCreate<string>('launchTarget', '');
       return;
     }
-    const url = params.targetUrl as string;
+    const rawUrl = params.targetUrl;
+    const url = typeof rawUrl === 'string' ? rawUrl.trim() : '';
     if (typeof url === 'string' && url.length > 0) {
       AppStorage.setOrCreate<string>('launchTarget', url);
+      return;
     }
+    AppStorage.setOrCreate<string>('launchTarget', '');
   }
 
   onDestroy(): void {

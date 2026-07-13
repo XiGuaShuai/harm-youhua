@@ -56,6 +56,7 @@ export class WebAccel {
     webCache.applySettings(remoteConfig.getSettings());
     webCache.applyApps(remoteConfig.getApps(), remoteConfig.getServer()); // 每应用精细配置(额外黑名单/预取开关)按 origin 生效 + 注入后端地址(自愈上报用)
     webPool.bindRemoteConfig();
+    webPool.loadTopBundles();
 
     // ⑤ 异步:有后台且允许时拉服务器最新配置,成功后再注入一次
     const autoRefresh: boolean = !(options && options.autoRefresh === false);
@@ -65,6 +66,7 @@ export class WebAccel {
           webCache.setBlockHosts(remoteConfig.getBlockHosts());
           webCache.applySettings(remoteConfig.getSettings());
           webCache.applyApps(remoteConfig.getApps(), remoteConfig.getServer()); // 每应用精细配置按 origin 生效 + 后端地址
+          webPool.loadTopBundles();
           WebAccel.runExploreReports(); // 众包探索:对后台标记的待探索 app 匿名上报本地已缓存资源
         }
       });
@@ -112,6 +114,70 @@ export class WebAccel {
     return webPool.obtain(url);
   }
 
+  /** 按当前远程配置触发指定网页应用的离线包下载,不打开 WebView。 */
+  static loadBundle(url: string): void {
+    webPool.loadBundle(url);
+  }
+
+  /** 按指定 app 的 id/manifestUrl 精确触发离线包下载。适用于同一 URL 同时存在 TOP 和地区配置的场景。 */
+  static loadBundleForApp(app: RemoteApp): void {
+    webPool.loadBundleForApp(app);
+  }
+
+  /** 初始化/配置刷新后主动拉 top 常驻离线包。通常 init 内部已调用,这里给宿主手动重试 */
+  static loadTopBundles(): void {
+    webPool.loadTopBundles();
+  }
+
+  /**
+   * 切换应用地区。旧地区下载任务会失效,旧地区沙箱缓存会删除;top 常驻包保留。
+   * 后台应把香港/英国等地区资源配置为 scope='region' 且 region=地区 id。
+   */
+  static switchRegion(region: string): void {
+    webPool.switchRegion(region);
+  }
+
+  /** 删除某地区离线包缓存,不影响 top */
+  static deleteRegion(region: string): void {
+    webCache.deleteRegion(region);
+  }
+
+  /** 删除某个网址 id 的离线包缓存 */
+  static deleteBundle(id: string): void {
+    webCache.deleteBundle(id);
+  }
+
+  /**
+   * 给外部 WebView 容器使用的 SchemeHandler 接口。
+   * 命中离线包时返回 true 并写入响应;未命中返回 false,宿主继续放行网络。
+   */
+  static handleSchemeRequest(request: webview.WebSchemeHandlerRequest,
+    handler: webview.WebResourceHandler): boolean {
+    return webCache.handleSchemeRequest(request, handler);
+  }
+
+  /** 获取随离线包保存的 H5 配置 JSON,用于宿主 getAppInfo 接口失败时兜底注入 */
+  static interceptRequest(url: string, method: string, headers: Array<Header>): WebResourceResponse | null {
+    return webCache.intercept(url, method, headers);
+  }
+
+  static shouldDropUnbundledRequest(url: string, method: string): boolean {
+    return webCache.shouldDropUnbundledRequest(url, method);
+  }
+
+  static dropResponse(url: string): WebResourceResponse {
+    return webCache.dropResponse(url);
+  }
+
+  static getConfigJson(idOrUrl: string): string {
+    return webCache.getConfigJson(idOrUrl);
+  }
+
+  /** 宿主从业务接口拿到最新 configJson 后,可同步给 SDK 做离线兜底 */
+  static updateConfigJson(idOrUrl: string, configJson: string): void {
+    webCache.updateConfigJson(idOrUrl, configJson);
+  }
+
   /** 该网页能后退则后退,返回是否消费了返回事件。宿主页 onBackPress 里转调即可 */
   static goBack(url: string): boolean {
     return webPool.goBack(url);
@@ -133,7 +199,8 @@ export class WebAccel {
     if (ok) {
       webCache.setBlockHosts(remoteConfig.getBlockHosts());
       webCache.applySettings(remoteConfig.getSettings());
-      webCache.applyApps(remoteConfig.getApps()); // 每应用精细配置按 origin 生效
+      webCache.applyApps(remoteConfig.getApps(), remoteConfig.getServer()); // 每应用精细配置按 origin 生效
+      webPool.loadTopBundles();
     }
     return ok;
   }
@@ -160,5 +227,9 @@ export class WebAccel {
   /** 某站离线包下载进度(无则 null) */
   static bundleProgress(origin: string): BundleProgress | null {
     return webCache.getBundleProgress(origin);
+  }
+
+  static isBundleApplied(url: string, bundleVersion: string = ''): boolean {
+    return webCache.isBundleApplied(url, bundleVersion);
   }
 }

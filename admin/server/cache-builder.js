@@ -169,6 +169,25 @@ function sha256(data) {
   return crypto.createHash('sha256').update(data).digest('hex');
 }
 
+function configJsonText(appCfg) {
+  return appCfg && typeof appCfg.configJson === 'string' ? appCfg.configJson.trim() : '';
+}
+
+function configJsonFileName(appCfg) {
+  const fallback = `${appCfg && appCfg.id ? appCfg.id : 'webaccel'}.json`;
+  const raw = String(appCfg && appCfg.configJsonFileName || fallback).trim();
+  const base = path.basename(raw || fallback).replace(/[^A-Za-z0-9._-]+/g, '_') || fallback;
+  return base.toLowerCase().endsWith('.json') ? base : `${base}.json`;
+}
+
+function configJsonBundleFile(appCfg) {
+  return `webaccel_config_${configJsonFileName(appCfg)}`;
+}
+
+function configJsonBundleUrl(appCfg) {
+  return new URL(`/__webaccel_config__/${configJsonFileName(appCfg)}`, appCfg.url).href;
+}
+
 function manifestEntry(entry, outDir, extra = {}) {
   const target = path.join(outDir, entry.file);
   let size = Number(extra.size || entry.size || 0);
@@ -180,7 +199,50 @@ function manifestEntry(entry, outDir, extra = {}) {
   }
   const out = { url: entry.url, file: entry.file, mime: extra.mime || entry.mime || mimeOf(entry.file), size, hash };
   if (typeof extra.costMs === 'number') out.costMs = extra.costMs;
+  if (extra.source) out.source = extra.source;
   return out;
+}
+
+function removeConfigJsonBundleFiles(outDir) {
+  if (!fs.existsSync(outDir)) return;
+  for (const f of fs.readdirSync(outDir)) {
+    if (/^webaccel_config_.*\.json(?:\.zz|\.gz|\.br)?$/i.test(f)) {
+      fs.rmSync(path.join(outDir, f), { force: true });
+    }
+  }
+}
+
+function syncConfigJsonResource(appCfg, outDir, manifest) {
+  removeConfigJsonBundleFiles(outDir);
+  const kept = manifest.filter((item) => {
+    const file = String(item && item.file || '');
+    const url = String(item && item.url || '');
+    return !/^webaccel_config_.*\.json$/i.test(file) && !url.includes('/__webaccel_config__/');
+  });
+  manifest.length = 0;
+  manifest.push(...kept);
+  const text = configJsonText(appCfg);
+  if (!text) return 0;
+  const file = configJsonBundleFile(appCfg);
+  const target = path.join(outDir, file);
+  fs.writeFileSync(target, text, 'utf8');
+  const entry = manifestEntry({
+    url: configJsonBundleUrl(appCfg),
+    file,
+    mime: 'application/json'
+  }, outDir, { source: 'local-config', costMs: 0 });
+  manifest.push(entry);
+  return Buffer.byteLength(text, 'utf8');
+}
+
+function manifestPayload(appCfg, resources) {
+  const text = configJsonText(appCfg);
+  if (!text) return resources;
+  return { configJson: text, resources };
+}
+
+function writeManifest(outDir, appCfg, resources) {
+  fs.writeFileSync(path.join(outDir, 'manifest.json'), JSON.stringify(manifestPayload(appCfg, resources), null, 2), 'utf8');
 }
 
 function bundleBudgetBytes(appCfg) {
@@ -208,7 +270,8 @@ function fitManifestToBudget(manifest, outDir, appCfg) {
     const target = path.join(outDir, entry.file);
     const size = Number(entry.size || (fs.existsSync(target) ? fs.statSync(target).size : 0));
     const storedSize = estimatedStoredSize(entry, outDir, size);
-    if (entry.file !== 'home.html' && storedTotal + storedSize > budget) {
+    const alwaysKeep = entry.file === 'home.html' || entry.source === 'local-config';
+    if (!alwaysKeep && storedTotal + storedSize > budget) {
       skipped.push(entry.file);
       continue;
     }
@@ -227,7 +290,7 @@ function isCompressibleBundleEntry(entry) {
     /\.(?:js|mjs|css|html|json|svg|txt)$/i.test(file);
 }
 
-function writeCompressedManifest(outDir, manifest) {
+function writeCompressedManifest(outDir, manifest, appCfg = null) {
   for (const f of fs.readdirSync(outDir)) {
     if (f.endsWith('.br') || f.endsWith('.gz') || f.endsWith('.zz') ||
         f === 'manifest.br.json' || f === 'manifest.gz.json' || f === 'manifest.zz.json') {
@@ -257,7 +320,7 @@ function writeCompressedManifest(outDir, manifest) {
       size: packed.length
     }));
   }
-  fs.writeFileSync(path.join(outDir, 'manifest.zz.json'), JSON.stringify(compressed, null, 2), 'utf8');
+  fs.writeFileSync(path.join(outDir, 'manifest.zz.json'), JSON.stringify(manifestPayload(appCfg, compressed), null, 2), 'utf8');
   return compressed;
 }
 
@@ -301,7 +364,10 @@ function readManifestByFile(outDir) {
   const mf = path.join(outDir, 'manifest.json');
   if (!fs.existsSync(mf)) return out;
   try {
-    const arr = JSON.parse(fs.readFileSync(mf, 'utf8'));
+    const parsed = JSON.parse(fs.readFileSync(mf, 'utf8'));
+    const arr = Array.isArray(parsed)
+      ? parsed
+      : (Array.isArray(parsed && parsed.resources) ? parsed.resources : (Array.isArray(parsed && parsed.manifest) ? parsed.manifest : []));
     if (!Array.isArray(arr)) return out;
     for (const e of arr) {
       if (e && e.file && e.url) out.set(e.file, e);
@@ -314,8 +380,11 @@ function readManifest(outDir) {
   const mf = path.join(outDir, 'manifest.json');
   if (!fs.existsSync(mf)) return [];
   try {
-    const arr = JSON.parse(fs.readFileSync(mf, 'utf8'));
-    return Array.isArray(arr) ? arr : [];
+    const parsed = JSON.parse(fs.readFileSync(mf, 'utf8'));
+    if (Array.isArray(parsed)) return parsed;
+    if (Array.isArray(parsed && parsed.resources)) return parsed.resources;
+    if (Array.isArray(parsed && parsed.manifest)) return parsed.manifest;
+    return [];
   } catch {
     return [];
   }
@@ -564,13 +633,14 @@ async function updateServerCache(appCfg) {
   } else {
     fs.rmSync(path.join(outDir, 'home.html'), { force: true });
   }
+  syncConfigJsonResource(appCfg, outDir, manifest);
   const budgeted = fitManifestToBudget(manifest, outDir, appCfg);
   const manifestOut = budgeted.manifest;
   const manifestTmp = path.join(outDir, 'manifest.json.tmp');
-  fs.writeFileSync(manifestTmp, JSON.stringify(manifestOut, null, 2), 'utf8');
+  fs.writeFileSync(manifestTmp, JSON.stringify(manifestPayload(appCfg, manifestOut), null, 2), 'utf8');
 
   atomicReplace(manifestTmp, path.join(outDir, 'manifest.json'));
-  const compressed = writeCompressedManifest(outDir, manifestOut);
+  const compressed = writeCompressedManifest(outDir, manifestOut, appCfg);
   const compressedTotal = compressed.reduce((sum, entry) => sum + Number(entry.size || 0), 0);
   return {
     id: appCfg.id,
@@ -591,9 +661,50 @@ async function updateServerCache(appCfg) {
   };
 }
 
+function buildConfigOnlyBundle(appCfg, reason = null) {
+  const outDir = path.join(BUNDLES_DIR, appCfg.id);
+  const tmpDir = path.join(BUNDLES_DIR, `.${appCfg.id}.config-${process.pid}-${Date.now()}`);
+  fs.rmSync(tmpDir, { recursive: true, force: true });
+  fs.mkdirSync(tmpDir, { recursive: true });
+  const manifest = [];
+  const bytes = syncConfigJsonResource(appCfg, tmpDir, manifest);
+  if (!manifest.length) {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+    if (reason instanceof Error) throw reason;
+    throw new Error('no bundle resources and no configJson');
+  }
+  writeManifest(tmpDir, appCfg, manifest);
+  const compressed = writeCompressedManifest(tmpDir, manifest, appCfg);
+  const compressedTotal = compressed.reduce((sum, entry) => sum + Number(entry.size || 0), 0);
+  fs.rmSync(outDir, { recursive: true, force: true });
+  fs.renameSync(tmpDir, outDir);
+  return {
+    id: appCfg.id,
+    count: manifest.length,
+    discovered: 0,
+    failed: reason ? 1 : 0,
+    skipped: 0,
+    skippedByPolicy: 0,
+    skippedByConfig: 0,
+    kb: Math.round(bytes / 1024),
+    compressedKB: Math.round(compressedTotal / 1024),
+    builtAt: new Date().toISOString(),
+    mode: 'config-only',
+    warning: reason ? String(reason && reason.message || reason) : ''
+  };
+}
+
 async function buildServerCache(appCfg) {
   const origin = new URL(appCfg.url).origin;
-  const discovered = await discoverResources(appCfg); // 通用发现(Next + CRA/AEM 等)
+  let discovered;
+  try {
+    discovered = await discoverResources(appCfg); // 通用发现(Next + CRA/AEM 等)
+  } catch (e) {
+    if (configJsonText(appCfg).length > 0) {
+      return buildConfigOnlyBundle(appCfg, e);
+    }
+    throw e;
+  }
 
   const outDir = path.join(BUNDLES_DIR, appCfg.id);
   const tmpDir = path.join(BUNDLES_DIR, `.${appCfg.id}.build-${process.pid}-${Date.now()}`);
@@ -652,8 +763,10 @@ async function buildServerCache(appCfg) {
     fs.rmSync(tmpDir, { recursive: true, force: true });
     throw new Error(`关键固定资源下载失败,保留旧离线包: ${requiredFailed.slice(0, 3).map((e) => e.url).join(', ')}`);
   }
-  fs.writeFileSync(path.join(tmpDir, 'manifest.json'), JSON.stringify(manifest, null, 2), 'utf8');
-  const compressed = writeCompressedManifest(tmpDir, manifest);
+  const configJsonBytes = syncConfigJsonResource(appCfg, tmpDir, manifest);
+  total += configJsonBytes;
+  writeManifest(tmpDir, appCfg, manifest);
+  const compressed = writeCompressedManifest(tmpDir, manifest, appCfg);
   const compressedTotal = compressed.reduce((sum, entry) => sum + Number(entry.size || 0), 0);
   fs.rmSync(outDir, { recursive: true, force: true });
   fs.renameSync(tmpDir, outDir);
@@ -684,7 +797,7 @@ function buildCacheManifest(appCfg) {
       const ra = cacheFileRank(a), rb = cacheFileRank(b);
       return ra === rb ? a.localeCompare(b) : ra - rb;
     });
-  if (!files.length) {
+  if (!files.length && configJsonText(appCfg).length === 0) {
     throw new Error(`服务器缓存目录没有资源文件: ${outDir}`);
   }
   const manifest = [];
@@ -700,12 +813,13 @@ function buildCacheManifest(appCfg) {
       costMs
     }));
   }
+  syncConfigJsonResource(appCfg, outDir, manifest);
   if (!manifest.length) {
     throw new Error('未能从缓存文件推导出任何原站 URL,请保留旧 manifest 或使用 chunks_/css_/media_/home.html 命名');
   }
   const budgeted = fitManifestToBudget(manifest, outDir, appCfg);
-  fs.writeFileSync(path.join(outDir, 'manifest.json'), JSON.stringify(budgeted.manifest, null, 2), 'utf8');
-  const compressed = writeCompressedManifest(outDir, budgeted.manifest);
+  writeManifest(outDir, appCfg, budgeted.manifest);
+  const compressed = writeCompressedManifest(outDir, budgeted.manifest, appCfg);
   const compressedTotal = compressed.reduce((sum, entry) => sum + Number(entry.size || 0), 0);
   return {
     id: appCfg.id,

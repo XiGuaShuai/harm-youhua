@@ -21,6 +21,7 @@ export struct WebAccelView {
   @Prop showPlaceholder: boolean = true;
   /** 占位背景色 */
   @Prop placeholderColor: string = '#F0F2F5';
+  @Prop autoLoadBundle: boolean = true;
 
   private node: WebNode | null = null;
   private timerId: number = -1;
@@ -39,7 +40,7 @@ export struct WebAccelView {
     webPool.setUIContext(this.getUIContext());
     const om = this.url.match(/^https?:\/\/[^\/]+/);
     this.origin = om ? om[0] : '';
-    this.node = webPool.obtain(this.url);
+    this.node = this.autoLoadBundle ? webPool.obtain(this.url) : webPool.obtainNoBundle(this.url);
     // 同步初始状态:若预渲染已完成,这里直接就是已绘制,占位立刻消失
     this.firstPaint = this.node.model.firstPaint;
     this.node.model.notify = () => {

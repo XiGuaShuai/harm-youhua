@@ -1,5 +1,5 @@
 <script setup>
-import { ref, onMounted, computed } from 'vue';
+import { ref, onMounted, computed, watch } from 'vue';
 import { ElMessage } from 'element-plus';
 import { Upload } from '@element-plus/icons-vue';
 import api from '../api';
@@ -8,11 +8,16 @@ const bundles = ref([]);
 const loading = ref(false);
 const selectedId = ref('');
 const resourceFilter = ref('all');
+const groupFilter = ref('all');
 const togglingKey = ref('');
 const importDialog = ref(false);
 const importText = ref('');
 const importing = ref(false);
 const importResults = ref([]);
+const configDialog = ref(false);
+const configText = ref('');
+const configFileName = ref('');
+const configSaving = ref(false);
 
 const autoLog = ref(null);
 const autoRunning = ref(false);
@@ -32,6 +37,12 @@ async function load() {
   loadAutoLog();
 }
 onMounted(load);
+
+watch(groupFilter, () => {
+  if (!filteredBundles.value.some((b) => b.id === selectedId.value)) {
+    selectedId.value = filteredBundles.value[0]?.id || '';
+  }
+});
 
 async function loadAutoLog() {
   try {
@@ -56,6 +67,37 @@ async function runAutoUpdate() {
 }
 
 const selected = computed(() => bundles.value.find((b) => b.id === selectedId.value) || null);
+
+function groupKey(row) {
+  const scope = row?.scope || row?.config?.scope || 'top';
+  if (scope === 'top') return 'top';
+  if (scope === 'region') return `region:${row.region || row.config?.region || ''}`;
+  return 'top';
+}
+
+function groupName(row) {
+  const scope = row?.scope || row?.config?.scope || 'top';
+  if (scope === 'region') return row.regionName || row.config?.regionName || row.region || row.config?.region || '地区';
+  return 'TOP';
+}
+
+const groupOptions = computed(() => {
+  const map = new Map();
+  map.set('all', '全部');
+  map.set('top', 'TOP 常驻');
+  bundles.value.forEach((b) => {
+    const key = groupKey(b);
+    if (key.startsWith('region:') && !map.has(key)) {
+      map.set(key, groupName(b));
+    }
+  });
+  return Array.from(map.entries()).map(([value, label]) => ({ value, label }));
+});
+
+const filteredBundles = computed(() => {
+  if (groupFilter.value === 'all') return bundles.value;
+  return bundles.value.filter((b) => groupKey(b) === groupFilter.value);
+});
 
 const resources = computed(() => {
   const list = selected.value?.resources || [];
@@ -163,6 +205,70 @@ function openImportDialog() {
   importDialog.value = true;
 }
 
+function configMeta(row) {
+  return row?.config || row || {};
+}
+
+function openConfigDialog() {
+  if (!selected.value) return;
+  const meta = configMeta(selected.value);
+  configText.value = '';
+  configFileName.value = meta.configJsonFileName || selected.value.configJsonFileName || `${selected.value.id}.json`;
+  configDialog.value = true;
+}
+
+function safeJsonFileName(name) {
+  const raw = String(name || '').trim() || 'config.json';
+  const base = raw.split(/[\\/]/).pop().replace(/[^A-Za-z0-9._-]+/g, '_') || 'config.json';
+  return base.toLowerCase().endsWith('.json') ? base : `${base}.json`;
+}
+
+async function onConfigFileChange(file) {
+  const raw = file?.raw || file;
+  if (!raw) return;
+  configFileName.value = safeJsonFileName(raw.name || configFileName.value);
+  configText.value = await raw.text();
+}
+
+async function saveConfigJson() {
+  if (!selected.value) return;
+  const text = configText.value.trim();
+  if (!text) {
+    ElMessage.warning('请选择或粘贴 JSON 内容');
+    return;
+  }
+  try {
+    JSON.parse(text);
+  } catch (e) {
+    ElMessage.error('JSON 格式不正确:' + e.message);
+    return;
+  }
+  configSaving.value = true;
+  try {
+    const { data } = await api.put(`/api/admin/bundles/${selected.value.id}/config-json`, {
+      configJson: text,
+      fileName: safeJsonFileName(configFileName.value || `${selected.value.id}.json`)
+    });
+    if (data?.bundle) {
+      const idx = bundles.value.findIndex((x) => x.id === selected.value.id);
+      if (idx >= 0) bundles.value[idx] = data.bundle;
+    } else {
+      await load();
+    }
+    configDialog.value = false;
+    ElMessage.success('配置 JSON 已写入离线包');
+  } catch (e) {
+    const data = e.response?.data;
+    ElMessage.error('保存失败:' + (data?.error || e.message));
+    if (data?.bundle) {
+      const idx = bundles.value.findIndex((x) => x.id === selected.value.id);
+      if (idx >= 0) bundles.value[idx] = data.bundle;
+    }
+  } finally {
+    configSaving.value = false;
+  }
+}
+
 async function importResources() {
   if (!selected.value) return;
   if (!importText.value.trim()) {
@@ -208,6 +314,9 @@ function importStatusText(row) {
         <div class="muted">按网站查看离线包配置、文件名、大小、耗时和沙箱占用</div>
       </div>
       <div class="head-actions">
+        <el-select v-model="groupFilter" size="small" style="width:160px">
+          <el-option v-for="g in groupOptions" :key="g.value" :label="g.label" :value="g.value" />
+        </el-select>
         <el-tag v-if="autoRunning" type="warning" size="small">检查中</el-tag>
         <el-button :loading="loading" @click="load">刷新</el-button>
         <el-button type="primary" :loading="triggering" @click="runAutoUpdate">检查更新</el-button>
@@ -224,11 +333,12 @@ function importStatusText(row) {
     <div class="bundle-layout">
       <aside class="site-pane">
         <div class="pane-title">网站</div>
-        <el-table :data="bundles" size="small" highlight-current-row :current-row-key="selectedId" row-key="id" @row-click="selectSite">
+        <el-table :data="filteredBundles" size="small" highlight-current-row :current-row-key="selectedId" row-key="id" @row-click="selectSite">
           <el-table-column label="名称" min-width="150" show-overflow-tooltip>
             <template #default="{ row }">
               <div class="site-name">{{ row.name || row.id }}</div>
               <div class="site-id">{{ row.id }}</div>
+              <el-tag size="small" :type="(row.scope || row.config?.scope) === 'region' ? 'success' : 'info'">{{ groupName(row) }}</el-tag>
             </template>
           </el-table-column>
           <el-table-column label="资源" width="86" align="right">
@@ -248,6 +358,7 @@ function importStatusText(row) {
           </div>
           <div class="resource-actions">
             <el-button type="primary" :icon="Upload" @click="openImportDialog">导入资源</el-button>
+            <el-button :icon="Upload" @click="openConfigDialog">导入配置 JSON</el-button>
             <el-button link type="primary" @click="copyManifest(selected)">复制 manifest</el-button>
             <el-link type="primary" :href="manifestLink(selected)" target="_blank">打开 manifest</el-link>
           </div>
@@ -283,6 +394,9 @@ function importStatusText(row) {
 
         <div class="config-strip">
           <el-tag size="small" :type="selected.config?.bundle ? 'success' : 'info'">{{ selected.config?.bundle ? '离线包开启' : '离线包关闭' }}</el-tag>
+          <el-tag v-if="configMeta(selected).hasConfigJson" size="small" type="warning">
+            JSON {{ configMeta(selected).configJsonFileName || selected.configJsonFileName }} {{ formatSize(configMeta(selected).configJsonBytes || selected.configJsonBytes) }}
+          </el-tag>
           <el-tag size="small" type="info">固定 {{ selected.config?.bundleExtraUrls?.length || 0 }}</el-tag>
           <el-tag size="small" type="info">关闭 {{ selected.config?.bundleExcludeUrls?.length || 0 }}</el-tag>
           <span class="muted">{{ staticCacheText(selected) }}</span>
@@ -363,6 +477,31 @@ function importStatusText(row) {
         <el-button type="primary" :loading="importing" @click="importResources">导入</el-button>
       </template>
     </el-dialog>
+
+    <el-dialog v-model="configDialog" title="导入配置 JSON" width="760px">
+      <el-form label-position="top">
+        <el-form-item label="目标网站">
+          <el-input :model-value="selected ? `${selected.name || selected.id} (${selected.id})` : ''" disabled />
+        </el-form-item>
+        <el-form-item label="本地 JSON 文件">
+          <div class="config-upload">
+            <el-upload action="#" :auto-upload="false" :show-file-list="false"
+              accept=".json,application/json" @change="onConfigFileChange">
+              <el-button :icon="Upload">选择 JSON 文件</el-button>
+            </el-upload>
+            <span class="muted">{{ configFileName || '未选择文件' }}</span>
+          </div>
+        </el-form-item>
+        <el-form-item label="JSON 内容">
+          <el-input v-model="configText" type="textarea" :rows="10"
+            placeholder="选择本地 JSON 文件后会自动填充，也可以直接粘贴完整 JSON" />
+        </el-form-item>
+      </el-form>
+      <template #footer>
+        <el-button @click="configDialog = false">关闭</el-button>
+        <el-button type="primary" :loading="configSaving" @click="saveConfigJson">保存到离线包</el-button>
+      </template>
+    </el-dialog>
   </div>
 </template>
 
@@ -382,7 +521,8 @@ function importStatusText(row) {
 .auto-line,
 .config-strip,
 .table-tools,
-.resource-actions {
+.resource-actions,
+.config-upload {
   display: flex;
   align-items: center;
   gap: 8px;

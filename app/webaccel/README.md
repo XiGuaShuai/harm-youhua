@@ -23,12 +23,21 @@ import { WebAccel, WebAccelLauncher, WebAccelView, WebAccelOptions, RemoteApp } 
 | API | 说明 |
 |---|---|
 | `WebAccel.init(context, options?)` | UIAbility.onCreate 调一次,初始化 Web 内核、读取本地配置、拉后台配置和离线包 |
-| `WebAccelLauncher()` | 开箱即用整页组件:后台应用列表 + 网页容器 + 返回 + 调试浮窗 |
+| `WebAccelLauncher()` | 开箱即用整页组件:地区列表 + 当前地区应用列表 + 网页容器 + 返回 + 调试浮窗 |
 | `WebAccelView({ url })` | 自定义壳时使用的网页容器 |
 | `WebAccel.goBack(url)` | WebView 能后退则后退 |
+| `WebAccel.loadBundle(url)` | 只触发指定网页应用离线包下载,不打开 WebView |
+| `WebAccel.loadBundleForApp(app)` | 按 app id 精确触发离线包下载,适合同 URL 多地区配置 |
+| `WebAccel.loadTopBundles()` | 主动拉取 `scope=top` 的常驻离线包 |
+| `WebAccel.switchRegion(region)` | 切换地区:中断旧地区任务、删除旧地区缓存、拉取新地区离线包 |
+| `WebAccel.deleteRegion(region)` | 删除某地区离线包缓存,不影响 top |
+| `WebAccel.deleteBundle(id)` | 删除某个网址 id 的离线包缓存 |
+| `WebAccel.handleSchemeRequest(request, handler)` | 给外部 WebView/SchemeHandler 使用的离线命中入口 |
+| `WebAccel.getConfigJson(idOrUrl)` | 读取随离线包保存的 H5 配置 JSON |
+| `WebAccel.updateConfigJson(idOrUrl, configJson)` | 宿主拿到最新 H5 配置后同步给离线兜底 |
 | `WebAccel.getApps()` / `setApps(apps)` | 读取或直接注入应用列表 |
 | `WebAccel.refreshConfig()` | 手动拉一次后台最新配置。后台离线包更新后,可用它主动拉新版本 |
-| `WebAccel.bundleProgress(origin)` | 查询某站离线包下载进度 |
+| `WebAccel.bundleProgress(idOrUrl)` | 查询某个 id / URL 的离线包下载进度 |
 | `WebAccel.stats()` | 调试统计 |
 | `WebAccel.setDebug(on)` | 调试浮窗开关。显示 `包准备中`、`包下载 x/y`、`包完成 x/y` |
 
@@ -93,15 +102,94 @@ onBackPress(): boolean {
 
 也可用 `@StorageLink('apps') apps: RemoteApp[]` 监听后台应用列表更新。
 
+## 接入已有 WebSDK 容器
+
+如果宿主已经有自己的 H5 容器、`configJson` 注入和 JSBridge,不要替换成 `WebAccelView`。保留原容器,只把离线命中接进 SchemeHandler:
+
+```ts
+import { WebAccel } from 'webaccel';
+
+class OfflineRequestHandler implements IHandleRequestStart {
+  getTag(): string {
+    return 'WebAccelOffline';
+  }
+
+  onHandleRequestStart(request: webview.WebSchemeHandlerRequest,
+    handler: webview.WebResourceHandler): boolean {
+    return WebAccel.handleSchemeRequest(request, handler);
+  }
+}
+
+schemeHandler.addHandler(new OfflineRequestHandler());
+controller.setWebSchemeHandler('https', schemeHandler);
+```
+
+推荐 handler 顺序:
+
+```text
+WebAccelOffline -> 业务代理/特殊站点 handler -> 网络监控 observer
+```
+
+H5 配置兜底:
+
+```ts
+try {
+  const configJson = await requestWebConfigFromBusinessApi(appId);
+  WebAccel.updateConfigJson(appId, configJson);
+  return JSON.parse(configJson);
+} catch (_) {
+  const cached = WebAccel.getConfigJson(appId);
+  if (cached.length > 0) {
+    return JSON.parse(cached);
+  }
+  throw _;
+}
+```
+
+## 地区缓存模型
+
+后台每个网址必须有稳定 `id`。SDK 按 `id` 保存 bundle state,按原始 URL 命中资源。
+
+```ts
+const apps: RemoteApp[] = [
+  {
+    id: 'top_exchange_rate',
+    name: '汇率',
+    url: 'https://example.com/rate/',
+    scope: 'top',
+    bundle: true,
+    configJson: '{...}'
+  },
+  {
+    id: 'hk_ticket_1',
+    name: '香港门票',
+    url: 'https://hk.example.com/ticket/',
+    scope: 'region',
+    region: 'HK',
+    bundle: true,
+    configJson: '{...}'
+  }
+];
+```
+
+规则:
+
+1. `scope: "top"`: SDK 初始化后自动拉取,长期保留。
+2. `scope: "region"`: 宿主调用 `WebAccel.switchRegion(regionId)` 后拉取该地区包。
+3. 切香港到英国时,SDK 会让香港未完成任务失效,删除香港 `scope=region` 缓存,再拉英国包。
+4. `scope: "app"`: 不自动拉,宿主可用 `WebAccel.loadBundleForApp(app)` 或打开页面时触发。
+5. `configJson` 可放在 `/api/config` 的 app 字段里;新版 SDK 也兼容 manifest 对象格式 `{ "configJson": "...", "resources": [...] }`。
+
 ## 离线包规则
 
-1. 后台配置 `bundle:true` 且已有 manifest 时,SDK 会下载该站离线包。
-2. SDK 拉到服务端 `/api/config` 后,会把所有 `bundle:true` 站点加入离线包下载队列,不是只下载当前打开页面。
-3. 本地旧配置只作为兜底展示,不会触发全量离线包下载,避免抢先拉旧版本。
-4. 资源下载源是后台 `/bundles/<site>/...`,但本地命中 key 是网页原始 URL。
-5. 文本资源可用 `.zz` 压缩落盘;命中时端侧内存解压后返回原文给 WebView。
-6. 未进入离线包的资源直接走网络,不会被端侧运行时自动缓存。
-7. 后台更新离线包后,端侧需要重新打开应用或调用 `WebAccel.refreshConfig()` 才会拉到新版本。
+1. 后台配置 `scope: "top"` 且 `bundle:true` 时,SDK 初始化后默认拉取对应离线包。
+2. 后台配置 `scope: "region"` 时,SDK 只在 `WebAccel.switchRegion(region)` 后拉取该地区离线包。
+3. SDK 不会在配置到达时批量下载所有地区离线包。
+4. 本地旧配置只作为兜底展示,不会触发全量离线包下载,避免抢先拉旧版本。
+5. 资源下载源是后台 `/bundles/<site>/...`,但本地命中 key 是网页原始 URL。
+6. 文本资源可用 `.zz` 压缩落盘;命中时端侧内存解压后返回原文给 WebView。
+7. 未进入离线包的资源直接走网络,不会被端侧运行时自动缓存。
+8. 后台更新离线包后,端侧需要重新打开应用或调用 `WebAccel.refreshConfig()` 才会拉到新版本。
 
 ## 元服务注意事项
 
