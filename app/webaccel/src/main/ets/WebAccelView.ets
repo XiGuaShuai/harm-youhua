@@ -2,7 +2,7 @@ import { webPool, WebNode } from './core/WebPreRender';
 import { webCache, BundleProgress } from './core/WebCacheManager';
 
 /**
- * 开箱即用的加速网页展示组件。内部:取离屏预渲染好的节点 → NodeContainer 挂载;
+ * 开箱即用的加速网页展示组件。内部按需创建 Web 节点并由 NodeContainer 挂载;
  * 首屏前显示白屏占位,离线包下载时显示底部进度条(下完自动消失)。
  *
  * 用法(宿主页只需一行):
@@ -13,11 +13,11 @@ import { webCache, BundleProgress } from './core/WebCacheManager';
  */
 @Component
 export struct WebAccelView {
-  /** 要展示的网页 URL(应已在 launcher 阶段 WebAccel.prewarm 过,未预热则即时创建退化为普通加载) */
+  /** 要展示的网页 URL。 */
   url: string = '';
   /** 是否显示底部「离线加速准备中 x/y」进度条 */
   @Prop showBundleProgress: boolean = true;
-  /** 是否在首屏绘制前显示白屏占位(预渲染已完成时不会出现) */
+  /** 是否在首屏绘制前显示原生占位。 */
   @Prop showPlaceholder: boolean = true;
   /** 占位背景色 */
   @Prop placeholderColor: string = '#F0F2F5';
@@ -41,7 +41,7 @@ export struct WebAccelView {
     const om = this.url.match(/^https?:\/\/[^\/]+/);
     this.origin = om ? om[0] : '';
     this.node = this.autoLoadBundle ? webPool.obtain(this.url) : webPool.obtainNoBundle(this.url);
-    // 同步初始状态:若预渲染已完成,这里直接就是已绘制,占位立刻消失
+    // 同步首屏状态，FCP/进度回调会通知组件收起占位。
     this.firstPaint = this.node.model.firstPaint;
     this.node.model.notify = () => {
       if (this.node) {
@@ -119,7 +119,7 @@ export struct WebAccelView {
           .height('100%')
       }
 
-      // 白屏期原生占位:预渲染已完成时不会出现
+      // 白屏期原生占位
       if (this.showPlaceholder && !this.firstPaint) {
         Column({ space: 14 }) {
           LoadingProgress()

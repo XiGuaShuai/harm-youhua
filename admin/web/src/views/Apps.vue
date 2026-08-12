@@ -1,12 +1,14 @@
 <script setup>
 import { ref, onMounted, computed } from 'vue';
 import { storeToRefs } from 'pinia';
+import { useRouter } from 'vue-router';
 import { ElMessage, ElMessageBox } from 'element-plus';
-import { Plus, Refresh, Search, Upload } from '@element-plus/icons-vue';
+import { Box, EditPen, MoreFilled, Plus, Refresh, Search, Upload } from '@element-plus/icons-vue';
 import api from '../api';
 import { useConfigStore } from '../stores/config';
 
 const store = useConfigStore();
+const router = useRouter();
 const { apps } = storeToRefs(store);
 
 const dialog = ref(false);
@@ -14,10 +16,41 @@ const editing = ref(null);
 const activeGroup = ref('top');
 const activeDialogTab = ref('base');
 const appQuery = ref('');
+const groupQuery = ref('');
 const form = ref(emptyForm());
 const detecting = ref(false);
 
 const bundleMap = ref({});
+
+function regionIdsOf(row) {
+  const values = Array.isArray(row?.regions) && row.regions.length > 0
+    ? row.regions
+    : (row?.region ? [row.region] : []);
+  return [...new Set(values.map((id) => String(id || '').trim()).filter(Boolean))];
+}
+
+function regionNamesOf(row) {
+  const names = { ...(row?.regionNames || {}) };
+  if (row?.region && row?.regionName && !names[row.region]) names[row.region] = row.regionName;
+  return names;
+}
+
+function regionNameOf(row, id) {
+  return regionNamesOf(row)[id] || id;
+}
+
+const regionOptions = computed(() => {
+  const map = new Map();
+  apps.value.forEach((app) => {
+    regionIdsOf(app).forEach((id) => {
+      const name = regionNameOf(app, id);
+      if (!map.has(id) || map.get(id) === id) map.set(id, name);
+    });
+  });
+  return Array.from(map.entries())
+    .map(([id, name]) => ({ id, name, label: name === id ? id : `${name} (${id})` }))
+    .sort((a, b) => String(a.name).localeCompare(String(b.name)));
+});
 
 async function loadBundles() {
   try {
@@ -35,16 +68,21 @@ onMounted(loadBundles);
 function groupOf(row) {
   const scope = row?.scope || 'top';
   if (scope === 'top') return 'top';
-  if (scope === 'region') return `region:${row.region || ''}`;
+  if (scope === 'region') return `region:${regionIdsOf(row)[0] || ''}`;
   return 'top';
+}
+
+function appInGroup(app, groupKey) {
+  if (groupKey === 'top') return (app?.scope || 'top') !== 'region';
+  if (!groupKey?.startsWith('region:') || app?.scope !== 'region') return false;
+  return regionIdsOf(app).includes(groupKey.slice('region:'.length));
 }
 
 const groupList = computed(() => {
   const regionMap = new Map();
   apps.value.forEach((app) => {
-    if ((app.scope || 'top') === 'region' && app.region) {
-      regionMap.set(app.region, app.regionName || app.region);
-    }
+    if ((app.scope || 'top') !== 'region') return;
+    regionIdsOf(app).forEach((id) => regionMap.set(id, regionNameOf(app, id)));
   });
   const groups = [
     {
@@ -59,24 +97,31 @@ const groupList = computed(() => {
       key: `region:${id}`,
       name: name || id,
       desc: `地区 ${id}`,
-      count: apps.value.filter((a) => (a.scope || 'top') === 'region' && a.region === id).length
+      count: apps.value.filter((a) => appInGroup(a, `region:${id}`)).length
     });
   });
   return groups;
 });
 
 const activeGroupInfo = computed(() => groupList.value.find((g) => g.key === activeGroup.value) || groupList.value[0]);
+const visibleGroupList = computed(() => {
+  const q = groupQuery.value.trim().toLowerCase();
+  if (!q) return groupList.value;
+  return groupList.value.filter((group) =>
+    [group.name, group.desc].some((value) => String(value || '').toLowerCase().includes(q))
+  );
+});
 const filteredApps = computed(() => {
   const q = appQuery.value.trim().toLowerCase();
   return apps.value.filter((app) => {
-    if (groupOf(app) !== activeGroup.value) return false;
+    if (!appInGroup(app, activeGroup.value)) return false;
     if (!q) return true;
     return [
       app.id,
       app.name,
       app.url,
-      app.region,
-      app.regionName
+      ...regionIdsOf(app),
+      ...Object.values(regionNamesOf(app))
     ].some((v) => String(v || '').toLowerCase().includes(q));
   });
 });
@@ -87,7 +132,7 @@ const summary = computed(() => {
   let jsonCount = 0;
   let readyCount = 0;
   apps.value.forEach((app) => {
-    if ((app.scope || 'top') === 'region' && app.region) regionSet.add(app.region);
+    if ((app.scope || 'top') === 'region') regionIdsOf(app).forEach((id) => regionSet.add(id));
     if (app.bundle) bundleEnabled++;
     if (app.configJson) jsonCount++;
     if (app.bundle && bundleMap.value[app.id]) readyCount++;
@@ -105,8 +150,28 @@ const formConfigState = computed(() => inspectConfigJson(form.value.configJson, 
 
 function scopeLabel(row) {
   const scope = row?.scope || 'top';
-  if (scope === 'region') return row.regionName || row.region || '地区';
+  if (scope === 'region') return regionIdsOf(row).map((id) => regionNameOf(row, id)).join('、') || '地区';
   return 'TOP';
+}
+
+function regionItems(row) {
+  return regionIdsOf(row).map((id) => ({ id, name: regionNameOf(row, id) }));
+}
+
+function visibleRegions(row) {
+  return regionItems(row).slice(0, 2);
+}
+
+function hiddenRegionCount(row) {
+  return Math.max(0, regionIdsOf(row).length - 2);
+}
+
+function regionTooltip(row) {
+  return regionItems(row).map((item) => `${item.name} (${item.id})`).join('、');
+}
+
+function openBundle(row) {
+  router.push({ path: '/bundles', query: { app: row.id } });
 }
 
 function emptyForm(groupKey = activeGroup.value) {
@@ -126,8 +191,23 @@ function emptyForm(groupKey = activeGroup.value) {
     scope,
     region,
     regionName,
+    regions: region ? [region] : [],
+    regionNames: region ? { [region]: regionName || region } : {},
     configJson: '',
     configJsonFileName: '',
+    configJsonSyncEnabled: false,
+    configJsonSyncLoginUrl: '',
+    configJsonSyncLoginMethod: 'POST',
+    configJsonSyncLoginHeadersText: '',
+    configJsonSyncLoginBody: '',
+    configJsonSyncConfigUrl: '',
+    configJsonSyncConfigMethod: 'GET',
+    configJsonSyncConfigHeadersText: '',
+    configJsonSyncConfigBody: '',
+    configJsonSyncTokenPath: '',
+    configJsonSyncTokenHeader: 'Authorization',
+    configJsonSyncTokenPrefix: 'Bearer ',
+    configJsonSyncConfigPath: '',
     routesText: '/',
     swrDoc: true,
     prerender: true,
@@ -158,17 +238,33 @@ function openAdd() {
 
 function openEdit(row) {
   const staticCache = row.staticCache || {};
+  const configJsonSync = row.configJsonSync || {};
   editing.value = row.id;
   activeDialogTab.value = 'base';
   form.value = {
     ...emptyForm(),
     ...row,
+    regions: regionIdsOf(row),
+    regionNames: regionNamesOf(row),
     routesText: (row.routes || []).join('\n'),
     extraBlockHostsText: (row.extraBlockHosts || []).join('\n'),
     preconnectHostsText: (row.preconnectHosts || []).join('\n'),
     bundleExtraUrlsText: (row.bundleExtraUrls || []).join('\n'),
     bundleExcludeUrlsText: (row.bundleExcludeUrls || []).join('\n'),
     bundleMaxSizeKB: row.bundleMaxSizeKB ?? 5120,
+    configJsonSyncEnabled: configJsonSync.enabled !== false && (!!configJsonSync.loginUrl || !!configJsonSync.configUrl),
+    configJsonSyncLoginUrl: configJsonSync.loginUrl || '',
+    configJsonSyncLoginMethod: configJsonSync.loginMethod || 'POST',
+    configJsonSyncLoginHeadersText: stringifyObject(configJsonSync.loginHeaders),
+    configJsonSyncLoginBody: configJsonSync.loginBody || '',
+    configJsonSyncConfigUrl: configJsonSync.configUrl || '',
+    configJsonSyncConfigMethod: configJsonSync.configMethod || 'GET',
+    configJsonSyncConfigHeadersText: stringifyObject(configJsonSync.configHeaders),
+    configJsonSyncConfigBody: configJsonSync.configBody || '',
+    configJsonSyncTokenPath: configJsonSync.tokenPath || '',
+    configJsonSyncTokenHeader: configJsonSync.tokenHeader || 'Authorization',
+    configJsonSyncTokenPrefix: configJsonSync.tokenPrefix ?? 'Bearer ',
+    configJsonSyncConfigPath: configJsonSync.configPath || '',
     staticCacheEnabled: staticCache.enabled !== false,
     staticCacheMinSizeKB: staticCache.minSizeKB ?? 64,
     staticCacheMinDurationMs: staticCache.minDurationMs ?? 800,
@@ -271,6 +367,27 @@ function splitLines(text) {
   return String(text || '').split('\n').map((s) => s.trim()).filter(Boolean);
 }
 
+function stringifyObject(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value) || Object.keys(value).length === 0) return '';
+  return JSON.stringify(value, null, 2);
+}
+
+function parseObjectText(text) {
+  const raw = String(text || '').trim();
+  if (!raw) return {};
+  try {
+    const parsed = JSON.parse(raw);
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {};
+  } catch (e) {
+    const out = {};
+    raw.split('\n').forEach((line) => {
+      const idx = line.indexOf(':');
+      if (idx > 0) out[line.slice(0, idx).trim()] = line.slice(idx + 1).trim();
+    });
+    return out;
+  }
+}
+
 function bundleOf(row) {
   return bundleMap.value[row.id];
 }
@@ -302,11 +419,12 @@ async function submit() {
     ElMessage.warning('URL 必须是 http(s):// 开头的完整地址');
     return;
   }
-  if (form.value.scope !== 'top' && !form.value.region) {
-    ElMessage.warning('地区应用必须填写地区 ID');
+  const selectedRegions = regionIdsOf({ regions: form.value.regions });
+  if (form.value.scope !== 'top' && selectedRegions.length === 0) {
+    ElMessage.warning('地区应用必须至少填写一个地区 ID');
     return;
   }
-  if (form.value.bundle && !form.value.configJson.trim()) {
+  if (form.value.bundle && !form.value.configJson.trim() && !form.value.configJsonSyncEnabled) {
     ElMessage.warning('启用离线包时请填写或导入 websdk 配置 JSON');
     activeDialogTab.value = 'json';
     return;
@@ -319,15 +437,38 @@ async function submit() {
   }
 
   const scope = form.value.scope === 'region' ? 'region' : 'top';
+  const regionNames = {};
+  selectedRegions.forEach((id) => {
+    const existingName = String(form.value.regionNames?.[id] || '').trim();
+    const option = regionOptions.value.find((item) => item.id === id);
+    regionNames[id] = existingName || option?.name || id;
+  });
   const item = {
     id: form.value.id.trim(),
     name: form.value.name.trim(),
     url: form.value.url.trim(),
     scope,
-    region: scope === 'region' ? (form.value.region || '').trim() : '',
-    regionName: scope === 'region' ? (form.value.regionName || '').trim() : '',
+    regions: scope === 'region' ? selectedRegions : [],
+    regionNames: scope === 'region' ? regionNames : {},
+    region: scope === 'region' ? (selectedRegions[0] || '') : '',
+    regionName: scope === 'region' && selectedRegions[0] ? regionNames[selectedRegions[0]] : '',
     configJson: (form.value.configJson || '').trim(),
     configJsonFileName: (form.value.configJsonFileName || '').trim(),
+    configJsonSync: {
+      enabled: form.value.configJsonSyncEnabled,
+      loginUrl: (form.value.configJsonSyncLoginUrl || '').trim(),
+      loginMethod: form.value.configJsonSyncLoginMethod || 'POST',
+      loginHeaders: parseObjectText(form.value.configJsonSyncLoginHeadersText),
+      loginBody: form.value.configJsonSyncLoginBody || '',
+      configUrl: (form.value.configJsonSyncConfigUrl || '').trim(),
+      configMethod: form.value.configJsonSyncConfigMethod || 'GET',
+      configHeaders: parseObjectText(form.value.configJsonSyncConfigHeadersText),
+      configBody: form.value.configJsonSyncConfigBody || '',
+      tokenPath: (form.value.configJsonSyncTokenPath || '').trim(),
+      tokenHeader: (form.value.configJsonSyncTokenHeader || 'Authorization').trim(),
+      tokenPrefix: form.value.configJsonSyncTokenPrefix ?? 'Bearer ',
+      configPath: (form.value.configJsonSyncConfigPath || '').trim()
+    },
     routes: splitLines(form.value.routesText),
     swrDoc: form.value.swrDoc,
     prerender: form.value.prerender,
@@ -391,6 +532,20 @@ const checking = ref('');
 const updating = ref('');
 const building = ref('');
 const generating = ref('');
+const syncingJson = ref('');
+
+function rowBusy(row) {
+  return [checking.value, updating.value, building.value, generating.value, syncingJson.value].includes(row.id);
+}
+
+function handleRowCommand(command, row) {
+  if (command === 'check') return checkUpdate(row);
+  if (command === 'update') return updateCache(row);
+  if (command === 'sync') return syncConfigJson(row);
+  if (command === 'build') return buildCache(row);
+  if (command === 'manifest') return generateManifest(row);
+  if (command === 'delete') return remove(row);
+}
 
 async function checkUpdate(row) {
   checking.value = row.id;
@@ -448,6 +603,24 @@ async function generateManifest(row) {
     generating.value = '';
   }
 }
+
+async function syncConfigJson(row) {
+  syncingJson.value = row.id;
+  try {
+    const { data } = await api.post('/api/admin/config-json-sync/run', { appId: row.id });
+    const item = data?.log?.results?.[0];
+    if (item && item.ok === false) {
+      ElMessage.error('JSON 同步失败:' + item.detail);
+    } else {
+      ElMessage.success(item?.changed ? 'JSON 已同步并更新' : 'JSON 已同步，无变化');
+      await store.load();
+    }
+  } catch (e) {
+    ElMessage.error('JSON 同步失败:' + (e.response?.data?.error || e.message));
+  } finally {
+    syncingJson.value = '';
+  }
+}
 </script>
 
 <template>
@@ -490,15 +663,26 @@ async function generateManifest(row) {
 
     <div class="region-layout">
       <aside class="region-pane">
-        <div class="pane-title">地区分组</div>
-        <button v-for="g in groupList" :key="g.key" class="group-item" :class="{ active: activeGroup === g.key }"
-          @click="activeGroup = g.key">
-          <span>
-            <b>{{ g.name }}</b>
-            <em>{{ g.desc }}</em>
-          </span>
-          <el-tag size="small" type="info" effect="plain">{{ g.count }}</el-tag>
-        </button>
+        <div class="pane-title-row">
+          <div>
+            <div class="pane-title">地区分组</div>
+            <div class="pane-subtitle">选择地区查看关联应用</div>
+          </div>
+          <span class="group-total">{{ groupList.length }}</span>
+        </div>
+        <el-input v-model="groupQuery" :prefix-icon="Search" clearable size="small" class="group-search"
+          placeholder="搜索地区名称或 ID" />
+        <div class="group-list">
+          <button v-for="g in visibleGroupList" :key="g.key" class="group-item" :class="{ active: activeGroup === g.key }"
+            @click="activeGroup = g.key">
+            <span>
+              <b>{{ g.name }}</b>
+              <em>{{ g.desc }}</em>
+            </span>
+            <span class="group-count">{{ g.count }}</span>
+          </button>
+          <el-empty v-if="visibleGroupList.length === 0" description="没有匹配地区" :image-size="54" />
+        </div>
       </aside>
 
       <section class="apps-pane">
@@ -510,7 +694,7 @@ async function generateManifest(row) {
           <el-tag type="info" effect="plain">{{ filteredApps.length }} 个网址</el-tag>
         </div>
 
-        <el-table :data="filteredApps" row-key="id" class="apps-table" empty-text="当前分组暂无应用">
+        <el-table :data="filteredApps" row-key="id" class="apps-table" empty-text="当前分组暂无应用" stripe>
           <el-table-column label="应用" min-width="280">
             <template #default="{ row }">
               <div class="app-cell">
@@ -522,16 +706,26 @@ async function generateManifest(row) {
               </div>
             </template>
           </el-table-column>
-          <el-table-column label="分组" width="150">
+          <el-table-column label="所属地区" width="220">
             <template #default="{ row }">
-              <el-tag size="small" :type="row.scope === 'region' ? 'success' : 'info'" effect="plain">{{ scopeLabel(row) }}</el-tag>
-              <div v-if="row.scope === 'region'" class="table-sub">{{ row.region }}</div>
+              <div v-if="row.scope === 'region'" class="region-tags">
+                <el-tag v-for="item in visibleRegions(row)" :key="item.id" size="small" type="success" effect="light">
+                  {{ item.name }}
+                </el-tag>
+                <el-tooltip v-if="hiddenRegionCount(row)" :content="regionTooltip(row)" placement="top" :show-after="250">
+                  <el-tag size="small" type="info" effect="plain" class="more-regions">+{{ hiddenRegionCount(row) }}</el-tag>
+                </el-tooltip>
+              </div>
+              <el-tag v-else size="small" type="info" effect="light">TOP 常驻</el-tag>
+              <div v-if="row.scope === 'region'" class="table-sub region-count-text">关联 {{ regionIdsOf(row).length }} 个地区</div>
             </template>
           </el-table-column>
           <el-table-column label="websdk 配置" width="160">
             <template #default="{ row }">
               <el-tag size="small" :type="configTag(row).type" effect="plain">{{ configTag(row).text }}</el-tag>
+              <el-tag v-if="row.configJsonSync?.enabled" size="small" type="warning" effect="plain" class="json-sync-tag">自动同步</el-tag>
               <div v-if="row.configJsonFileName" class="table-sub">{{ row.configJsonFileName }}</div>
+              <div v-if="row.configJsonSyncedAt" class="table-sub">{{ String(row.configJsonSyncedAt).slice(0, 16).replace('T', ' ') }}</div>
             </template>
           </el-table-column>
           <el-table-column label="离线包" width="160">
@@ -544,26 +738,33 @@ async function generateManifest(row) {
               <el-tag v-else size="small" type="info" effect="plain">未启用</el-tag>
             </template>
           </el-table-column>
-          <el-table-column label="加速项" width="190">
+          <el-table-column label="能力" width="170">
             <template #default="{ row }">
               <div class="tag-row">
                 <el-tag v-if="row.bundle" size="small" type="success">离线包</el-tag>
-                <el-tag v-if="row.prerender" size="small">预渲染</el-tag>
-                <el-tag v-if="row.swrDoc" size="small">SWR</el-tag>
-                <el-tag v-if="row.codeCache" size="small">字节码</el-tag>
-                <el-tag v-if="row.prefetchChunks" size="small" type="info">预取</el-tag>
+                <el-tag v-if="row.configJsonSync?.enabled" size="small" type="warning" effect="plain">JSON 同步</el-tag>
+                <el-tag v-if="row.preconnectHosts?.length" size="small" type="info" effect="plain">预连接 {{ row.preconnectHosts.length }}</el-tag>
               </div>
             </template>
           </el-table-column>
-          <el-table-column label="操作" width="370" fixed="right">
+          <el-table-column label="操作" width="270" fixed="right">
             <template #default="{ row }">
-              <div class="op-row">
-                <el-button size="small" link type="primary" :loading="checking === row.id" @click="checkUpdate(row)">检查</el-button>
-                <el-button size="small" link type="primary" :loading="updating === row.id" @click="updateCache(row)">更新</el-button>
-                <el-button size="small" link type="primary" :loading="building === row.id" @click="buildCache(row)">重建</el-button>
-                <el-button size="small" link type="primary" :loading="generating === row.id" @click="generateManifest(row)">清单</el-button>
-                <el-button size="small" @click="openEdit(row)">编辑</el-button>
-                <el-button size="small" type="danger" plain @click="remove(row)">删除</el-button>
+              <div class="op-row compact-actions">
+                <el-button size="small" type="primary" plain :icon="Box" @click="openBundle(row)">资源</el-button>
+                <el-button size="small" :icon="EditPen" @click="openEdit(row)">编辑</el-button>
+                <el-dropdown trigger="click" :disabled="rowBusy(row)" @command="(command) => handleRowCommand(command, row)">
+                  <el-button size="small" class="more-button" :loading="rowBusy(row)" :icon="MoreFilled">更多</el-button>
+                  <template #dropdown>
+                    <el-dropdown-menu>
+                      <el-dropdown-item command="check">检查资源更新</el-dropdown-item>
+                      <el-dropdown-item command="update">增量更新离线包</el-dropdown-item>
+                      <el-dropdown-item v-if="row.configJsonSync?.enabled" command="sync">立即同步 JSON</el-dropdown-item>
+                      <el-dropdown-item command="build" divided>强制重建离线包</el-dropdown-item>
+                      <el-dropdown-item command="manifest">重新生成清单</el-dropdown-item>
+                      <el-dropdown-item command="delete" divided class="danger-menu-item">删除应用</el-dropdown-item>
+                    </el-dropdown-menu>
+                  </template>
+                </el-dropdown>
               </div>
             </template>
           </el-table-column>
@@ -604,13 +805,14 @@ async function generateManifest(row) {
                   <el-radio-button label="region">地区应用</el-radio-button>
                 </el-radio-group>
               </el-form-item>
-              <el-form-item label="地区 ID" v-if="form.scope === 'region'">
-                <el-input v-model="form.region" placeholder="1988526837953462273" />
-              </el-form-item>
-              <el-form-item label="地区名称" v-if="form.scope === 'region'">
-                <el-input v-model="form.regionName" placeholder="印度尼西亚" />
+              <el-form-item label="地区 ID（可多选）" v-if="form.scope === 'region'">
+                <el-select v-model="form.regions" multiple filterable allow-create default-first-option
+                  :reserve-keyword="false" placeholder="选择已有地区或直接输入地区 ID" class="region-select">
+                  <el-option v-for="option in regionOptions" :key="option.id" :label="option.label" :value="option.id" />
+                </el-select>
               </el-form-item>
             </div>
+            <div v-if="form.scope === 'region'" class="field-hint">同一网址只保存一份离线包；切换到任一已选地区时，SDK 都会加载该离线包。</div>
             <el-form-item label="路由">
               <el-input v-model="form.routesText" type="textarea" :rows="3" placeholder="每行一个路径,例如 /" />
             </el-form-item>
@@ -638,6 +840,66 @@ async function generateManifest(row) {
               <el-input v-model="form.configJson" type="textarea" :rows="18"
                 placeholder='粘贴 websdk 配置 JSON,必须包含 "url" 字段并与应用 URL 同源' />
             </el-form-item>
+            <div class="sync-panel">
+              <div class="sync-title">
+                <b>每天 12:00 自动同步</b>
+                <el-switch v-model="form.configJsonSyncEnabled" active-text="开启" inactive-text="关闭" />
+              </div>
+              <div v-if="form.configJsonSyncEnabled">
+                <div class="form-grid two">
+                  <el-form-item label="登录接口 URL">
+                    <el-input v-model="form.configJsonSyncLoginUrl" placeholder="https://example.com/api/login" />
+                  </el-form-item>
+                  <el-form-item label="登录方法">
+                    <el-radio-group v-model="form.configJsonSyncLoginMethod">
+                      <el-radio-button label="POST">POST</el-radio-button>
+                      <el-radio-button label="GET">GET</el-radio-button>
+                    </el-radio-group>
+                  </el-form-item>
+                </div>
+                <el-form-item label="登录 Headers">
+                  <el-input v-model="form.configJsonSyncLoginHeadersText" type="textarea" :rows="3"
+                    placeholder='JSON 对象或每行 Header: Value' />
+                </el-form-item>
+                <el-form-item label="登录 Body">
+                  <el-input v-model="form.configJsonSyncLoginBody" type="textarea" :rows="4"
+                    placeholder='例如 {"username":"...","password":"..."}；保存后敏感内容会掩码显示' />
+                </el-form-item>
+                <div class="form-grid two">
+                  <el-form-item label="配置接口 URL">
+                    <el-input v-model="form.configJsonSyncConfigUrl" placeholder="https://example.com/api/config" />
+                  </el-form-item>
+                  <el-form-item label="配置接口方法">
+                    <el-radio-group v-model="form.configJsonSyncConfigMethod">
+                      <el-radio-button label="GET">GET</el-radio-button>
+                      <el-radio-button label="POST">POST</el-radio-button>
+                    </el-radio-group>
+                  </el-form-item>
+                </div>
+                <el-form-item label="配置接口 Headers">
+                  <el-input v-model="form.configJsonSyncConfigHeadersText" type="textarea" :rows="3"
+                    placeholder='JSON 对象或每行 Header: Value；可留空继承登录 cookie' />
+                </el-form-item>
+                <el-form-item label="配置接口 Body">
+                  <el-input v-model="form.configJsonSyncConfigBody" type="textarea" :rows="3"
+                    placeholder="配置接口是 POST 时填写" />
+                </el-form-item>
+                <div class="form-grid three">
+                  <el-form-item label="登录 token 路径">
+                    <el-input v-model="form.configJsonSyncTokenPath" placeholder="data.token；留空只用 cookie" />
+                  </el-form-item>
+                  <el-form-item label="token Header">
+                    <el-input v-model="form.configJsonSyncTokenHeader" placeholder="Authorization" />
+                  </el-form-item>
+                  <el-form-item label="token 前缀">
+                    <el-input v-model="form.configJsonSyncTokenPrefix" placeholder="Bearer " />
+                  </el-form-item>
+                </div>
+                <el-form-item label="配置 JSON 路径">
+                  <el-input v-model="form.configJsonSyncConfigPath" placeholder="data.config；留空使用完整响应作为 config.json" />
+                </el-form-item>
+              </div>
+            </div>
           </el-tab-pane>
 
           <el-tab-pane label="离线包资源" name="bundle">
@@ -709,18 +971,18 @@ async function generateManifest(row) {
 .apps-page {
   display: flex;
   flex-direction: column;
-  gap: 16px;
+  gap: 18px;
 }
 .page-head {
   display: flex;
   align-items: flex-start;
   justify-content: space-between;
   gap: 16px;
-  padding: 18px 20px;
-  background: #fff;
-  border: 1px solid #edf0f6;
-  border-radius: 8px;
-  box-shadow: 0 2px 10px rgba(31, 36, 51, .04);
+  padding: 22px 24px;
+  background: linear-gradient(135deg, #ffffff 0%, #f7f8ff 100%);
+  border: 1px solid #e7eaf5;
+  border-radius: 14px;
+  box-shadow: 0 8px 24px rgba(31, 36, 51, .05);
 }
 .eyebrow {
   font-size: 12px;
@@ -754,9 +1016,21 @@ async function generateManifest(row) {
 }
 .summary-item {
   background: #fff;
-  border: 1px solid #edf0f6;
-  border-radius: 8px;
-  padding: 14px 16px;
+  border: 1px solid #e9ecf4;
+  border-radius: 12px;
+  padding: 16px 18px;
+  box-shadow: 0 4px 14px rgba(31, 36, 51, .035);
+  position: relative;
+  overflow: hidden;
+}
+.summary-item::before {
+  content: '';
+  position: absolute;
+  left: 0;
+  top: 0;
+  bottom: 0;
+  width: 3px;
+  background: linear-gradient(180deg, #4f5bd5, #7c3aed);
 }
 .summary-item span {
   display: block;
@@ -771,36 +1045,72 @@ async function generateManifest(row) {
 }
 .region-layout {
   display: grid;
-  grid-template-columns: 260px minmax(0, 1fr);
+  grid-template-columns: 280px minmax(0, 1fr);
   gap: 16px;
 }
 .region-pane,
 .apps-pane {
   border: 1px solid #edf0f6;
-  border-radius: 8px;
+  border-radius: 14px;
   background: #fff;
   min-width: 0;
-  box-shadow: 0 2px 10px rgba(31, 36, 51, .04);
+  box-shadow: 0 6px 20px rgba(31, 36, 51, .04);
 }
 .region-pane {
-  padding: 12px;
+  padding: 16px 12px 12px;
   align-self: start;
+  position: sticky;
+  top: 0;
 }
 .apps-pane {
-  padding: 14px;
+  padding: 18px;
 }
 .pane-title {
-  font-size: 13px;
+  font-size: 15px;
   font-weight: 700;
-  color: #606266;
-  margin-bottom: 10px;
+  color: #303445;
+}
+.pane-title-row {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 0 4px;
+}
+.pane-subtitle {
+  margin-top: 3px;
+  color: #959bad;
+  font-size: 11px;
+}
+.group-total,
+.group-count {
+  min-width: 26px;
+  height: 24px;
+  padding: 0 7px;
+  border-radius: 999px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: #68708a;
+  background: #f0f2f8;
+  font-size: 12px;
+  font-weight: 700;
+}
+.group-search {
+  margin: 14px 0 10px;
+}
+.group-list {
+  max-height: calc(100vh - 390px);
+  min-height: 220px;
+  overflow-y: auto;
+  padding-right: 3px;
 }
 .group-item {
   width: 100%;
   border: 1px solid transparent;
   background: transparent;
-  border-radius: 8px;
-  padding: 10px;
+  border-radius: 10px;
+  padding: 11px 10px;
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -810,11 +1120,16 @@ async function generateManifest(row) {
   color: #303133;
 }
 .group-item:hover {
-  background: #f6f8fc;
+  background: #f6f7fb;
 }
 .group-item.active {
-  border-color: #bfc6f2;
-  background: #f1f4ff;
+  border-color: #cbd0f6;
+  background: linear-gradient(135deg, #f0f2ff 0%, #f7f3ff 100%);
+  box-shadow: inset 3px 0 0 #5964dc;
+}
+.group-item.active .group-count {
+  color: #fff;
+  background: #5964dc;
 }
 .group-item b {
   display: block;
@@ -832,6 +1147,8 @@ async function generateManifest(row) {
   align-items: flex-start;
   justify-content: space-between;
   gap: 12px;
+  padding-bottom: 14px;
+  border-bottom: 1px solid #edf0f6;
 }
 .group-title {
   font-size: 18px;
@@ -839,7 +1156,17 @@ async function generateManifest(row) {
   color: #303133;
 }
 .apps-table {
-  margin-top: 14px;
+  margin-top: 4px;
+  --el-table-row-hover-bg-color: #f7f8ff;
+}
+.apps-table :deep(.el-table__cell) {
+  padding: 14px 0;
+}
+.apps-table :deep(th.el-table__cell) {
+  padding: 11px 0;
+  background: #fafbfe;
+  color: #656c80;
+  font-size: 12px;
 }
 .app-cell {
   min-width: 0;
@@ -861,7 +1188,31 @@ async function generateManifest(row) {
   color: #8a90a2;
   font-size: 12px;
   line-height: 1.35;
-  word-break: break-all;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.app-url {
+  max-width: 420px;
+}
+.region-tags {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  flex-wrap: nowrap;
+}
+.region-tags .el-tag {
+  max-width: 78px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.region-tags .more-regions {
+  flex: none;
+  max-width: none;
+  cursor: help;
+}
+.region-count-text {
+  color: #a0a6b5;
 }
 .tag-row,
 .op-row {
@@ -869,6 +1220,18 @@ async function generateManifest(row) {
   align-items: center;
   flex-wrap: wrap;
   gap: 6px;
+}
+.compact-actions {
+  flex-wrap: nowrap;
+}
+.compact-actions .el-button + .el-button {
+  margin-left: 0;
+}
+.more-button {
+  min-width: 70px;
+}
+:global(.danger-menu-item) {
+  color: #e34d59 !important;
 }
 .dialog-head {
   display: flex;
@@ -900,12 +1263,26 @@ async function generateManifest(row) {
   grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
   gap: 12px;
 }
+.form-grid.three {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 12px;
+}
 .inline-control,
 .json-toolbar {
   display: flex;
   align-items: center;
   gap: 10px;
   width: 100%;
+}
+.region-select {
+  width: 100%;
+}
+.field-hint {
+  margin: -4px 0 14px;
+  color: #747b8f;
+  font-size: 12px;
+  line-height: 1.5;
 }
 .json-toolbar {
   flex-wrap: wrap;
@@ -914,6 +1291,25 @@ async function generateManifest(row) {
 .file-name {
   color: #747b8f;
   font-size: 12px;
+}
+.json-sync-tag {
+  margin-left: 4px;
+}
+.sync-panel {
+  border: 1px solid #edf0f6;
+  border-radius: 8px;
+  padding: 14px;
+  background: #fafbfe;
+}
+.sync-title {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 12px;
+}
+.sync-title b {
+  font-size: 14px;
 }
 .check-grid {
   display: grid;
@@ -939,8 +1335,15 @@ async function generateManifest(row) {
   }
   .region-layout,
   .form-grid.two,
+  .form-grid.three,
   .threshold-grid {
     grid-template-columns: 1fr;
+  }
+  .region-pane {
+    position: static;
+  }
+  .group-list {
+    max-height: 320px;
   }
   .page-head {
     flex-direction: column;

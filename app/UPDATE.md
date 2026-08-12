@@ -14,6 +14,7 @@
 - 不做离屏预渲染。
 - 不做 chunk 预取。
 - 后台更新离线包后,端侧需要重新打开应用或调用 `WebAccel.refreshConfig()` 才会拉新版本。
+- 后台某些站点的 `configJson` 由第三方接口自动同步,不是人工上传到 SDK;端侧仍然只认 `/api/config`。
 
 如果本文后面仍出现运行时缓存自愈、SWR、预渲染等历史描述,以本节、根目录 `新会话快速上下文.md` 和 `SDK_OFFLINE_BUNDLE.md` 为准。
 
@@ -38,6 +39,24 @@
 如果源站 JS/CSS/字体 URL 变化,需要后台重新构建或手动导入新的静态资源。端侧不会自己把用户访问过的新资源写入缓存。
 
 后台离线包更新后,端侧需要重新打开应用或调用 `WebAccel.refreshConfig()` 才会发现新版本并下载。
+
+## 二补、网站 `configJson` 更新后 → 后台自动同步
+
+如果这个站的 H5 配置 JSON 不是你手工填,而是第三方后台生成,就不要往 SDK 里手动上传。
+
+做法是:
+
+1. 在 admin 里给该 app 配好 `configJsonSync`。只要填了登录/配置接口，后台会自动纳入定时同步。
+2. 后台默认每天 12:00 (Asia/Shanghai) 自动登录第三方管理系统。
+3. 先拿登录 token,再调配置接口,把返回里的 `data.records[0].configJson` 写回后台 app 配置。
+4. 端侧按 `configRefreshSec` 周期拉 `/api/config`,或者手动调用 `WebAccel.refreshConfig()` 后就能拿到新 JSON。
+
+示例接口:
+
+- 登录: `POST https://meta-manage.hssstg.com/admin-api/login`
+- 配置: `GET https://meta-manage.hssstg.com/admin-api/api/webappconfig/getList?pageNum=1&pageSize=10&appId=1930101295172853761`
+- token 字段: `token`
+- JSON 路径: `data.records[0].configJson`
 
 ---
 

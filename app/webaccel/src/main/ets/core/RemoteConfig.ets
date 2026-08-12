@@ -25,7 +25,8 @@ export interface RemoteApp {
   name: string;
   url: string;
   scope?: string;            // top / region,用于入口页分组和端侧调度
-  region?: string;           // AtomicPlatform 地区 ID,例如 100004 / 2033730461761748994。未下发时入口页归入 global
+  region?: string;           // 兼容旧版 SDK:regions 的第一个地区 ID
+  regions?: string[];        // AtomicPlatform 地区 ID 列表;同一网址可属于多个地区
   appId?: string;            // 业务应用 ID,不下发时默认等于 id
   appVersion?: string;       // 业务应用版本,用于版本一致性判断
   priority?: number;         // 展示/下载优先级,数字越大越靠前
@@ -53,9 +54,48 @@ export interface RemoteApp {
   staticCache?: StaticCachePolicy; // 每应用运行时静态资源缓存策略:优先缓存大资源/慢资源,排除低价值资源。
 }
 
+/** 读取应用的全部地区 ID。兼容只下发 region 的旧后台配置。 */
+export function remoteAppRegions(app: RemoteApp): string[] {
+  const result: string[] = new Array<string>();
+  const seen: Set<string> = new Set<string>();
+  if (app && app.regions && app.regions.length > 0) {
+    for (let i = 0; i < app.regions.length; i++) {
+      const id: string = app.regions[i] ? app.regions[i].trim() : '';
+      if (id.length > 0 && !seen.has(id)) {
+        seen.add(id);
+        result.push(id);
+      }
+    }
+  }
+  const legacy: string = app && app.region ? app.region.trim() : '';
+  if (legacy.length > 0 && !seen.has(legacy)) {
+    result.push(legacy);
+  }
+  return result;
+}
+
+/** top 应用对任意地区可用;region 应用必须包含当前地区 ID。 */
+export function remoteAppMatchesRegion(app: RemoteApp, region: string): boolean {
+  if (!app || app.scope !== 'region') {
+    return true;
+  }
+  const target: string = region ? region.trim() : '';
+  if (target.length === 0) {
+    return false;
+  }
+  const regions: string[] = remoteAppRegions(app);
+  for (let i = 0; i < regions.length; i++) {
+    if (regions[i] === target) {
+      return true;
+    }
+  }
+  return false;
+}
+
 export interface RemoteSettings {
   diskCapMB?: number;
   docCheckSec?: number;
+  configRefreshSec?: number; // 端侧定时拉取 /api/config 的间隔;<=0 表示关闭,默认由 SDK 控制
   bundleConcurrency?: number;
   prefetchChunks?: boolean;  // 是否预取全站 chunk(Next.js 系站点有效;非 Next 站自动无操作)。默认 true
   bytecodeCache?: boolean;
@@ -242,6 +282,8 @@ class RemoteConfigManager {
       }
       if ((!app.scope || app.scope.length === 0) && fallback.scope) app.scope = fallback.scope;
       if ((!app.region || app.region.length === 0) && fallback.region) app.region = fallback.region;
+      if ((!app.regions || app.regions.length === 0) && fallback.regions) app.regions = fallback.regions.slice();
+      if ((!app.region || app.region.length === 0) && app.regions && app.regions.length > 0) app.region = app.regions[0];
       if ((!app.appId || app.appId.length === 0) && fallback.appId) app.appId = fallback.appId;
       if ((!app.appVersion || app.appVersion.length === 0) && fallback.appVersion) app.appVersion = fallback.appVersion;
       if (app.priority === undefined && fallback.priority !== undefined) app.priority = fallback.priority;

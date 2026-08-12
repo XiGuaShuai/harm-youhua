@@ -6,7 +6,8 @@ import api from '../api';
 export const useConfigStore = defineStore('config', () => {
   const apps = ref([]);
   const blockHosts = ref([]);
-  const settings = ref({ diskCapMB: 160, docCheckSec: 60, bundleConcurrency: 3, bytecodeCache: true });
+  const defaultSettings = { diskCapMB: 160, docCheckSec: 60, configRefreshSec: 300, bundleConcurrency: 3, bytecodeCache: true };
+  const settings = ref({ ...defaultSettings });
   const version = ref('');
   const loading = ref(false);
 
@@ -16,7 +17,7 @@ export const useConfigStore = defineStore('config', () => {
       const { data } = await api.get('/api/admin/config');
       apps.value = data.apps || [];
       blockHosts.value = data.blockHosts || [];
-      settings.value = data.settings || {};
+      settings.value = { ...defaultSettings, ...(data.settings || {}) };
       version.value = data.version || '';
     } finally {
       loading.value = false;

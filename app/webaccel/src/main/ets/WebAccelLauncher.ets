@@ -9,7 +9,7 @@ import { RemoteApp } from './core/RemoteConfig';
  *   ② 入口页:               @Entry struct Index { build() { WebAccelLauncher() } }
  *
  * 内部全包办:读远程配置的应用列表 -> 渲染 -> 内置 Navigation 跳转 -> WebAccelView 展示
- * -> 离线进度 -> 系统返回(网页内先后退,到顶退回列表)。挂载即自动注入 UIContext 并预热全部应用。
+   * -> 离线进度 -> 系统返回(网页内先后退,到顶退回列表)。
  *
  * 想要自定义壳的接入方可改用低层 API:WebAccel.getApps() + WebAccelView({ url }) + WebAccel.goBack(url)。
  */
@@ -31,8 +31,7 @@ export struct WebAccelLauncher {
   private stack: NavPathStack = new NavPathStack();
 
   aboutToAppear(): void {
-    // 组件天生有 UIContext:挂载即注入 -> 自动对配置里所有应用预热(预连接+预下离线包+离屏预渲染)
-    // 接入方无需手动 attach / prewarm。
+    // 保留旧接入钩子；Web 节点在 NodeContainer 挂载时按需创建。
     WebAccel.attach(this.getUIContext());
     if (this.launchTarget.length > 0) {
       this.openTarget(); // 冷启动:卡片带来的目标,挂载即直达

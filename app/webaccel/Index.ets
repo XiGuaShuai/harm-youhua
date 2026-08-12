@@ -7,4 +7,4 @@ export { WebAccelView } from './src/main/ets/WebAccelView';
 export { WebAccelDebugBadge } from './src/main/ets/WebAccelDebugBadge';
 export { WebNode } from './src/main/ets/core/WebPreRender';
 export { CacheStats, BundleProgress } from './src/main/ets/core/WebCacheManager';
-export { RemoteApp, RemoteSettings } from './src/main/ets/core/RemoteConfig';
+export { RemoteApp, RemoteSettings, remoteAppMatchesRegion, remoteAppRegions } from './src/main/ets/core/RemoteConfig';

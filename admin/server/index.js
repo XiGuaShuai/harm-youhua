@@ -138,6 +138,7 @@ function defaultConfig() {
     settings: {
       diskCapMB: 160,        // 运行时缓存上限(按 200MB 沙箱预留余量)
       docCheckSec: 60,       // 主文档版本校验节流(秒)
+      configRefreshSec: 300, // App 端定时拉取 /api/config 的间隔(秒),后台应用 JSON 更新后自动同步
       bundleConcurrency: 8,  // 远程离线包后台下载并发(上限 8)
       prefetchChunks: true,  // 是否预取全站 chunk(Next.js 系有效)
       bytecodeCache: true,
@@ -153,6 +154,9 @@ function loadConfig() {
 }
 function saveConfig(c) {
   c.version = new Date().toISOString();
+  if (Array.isArray(c.apps)) {
+    c.apps = c.apps.map((app) => normalizeAppConfig(app));
+  }
   fs.writeFileSync(DATA_FILE, JSON.stringify(c, null, 2), 'utf8');
   return c;
 }
@@ -164,17 +168,160 @@ function normalizeScope(scope) {
   return 'top';
 }
 
+function normalizeRegionIds(appCfg) {
+  const configured = Array.isArray(appCfg && appCfg.regions)
+    ? appCfg.regions.slice()
+    : (typeof (appCfg && appCfg.regions) === 'string'
+      ? String(appCfg.regions).split(/[\s,;]+/)
+      : []);
+  const raw = [];
+  // Keep the legacy effective region first during migration, then merge new values.
+  if (appCfg && appCfg.region !== undefined && appCfg.region !== null) raw.push(appCfg.region);
+  raw.push(...configured);
+  const seen = new Set();
+  const result = [];
+  for (const value of raw) {
+    const id = String(value || '').trim();
+    if (id && !seen.has(id)) {
+      seen.add(id);
+      result.push(id);
+    }
+  }
+  return result;
+}
+
+function normalizeRegionNames(appCfg, regionIds) {
+  const source = appCfg && appCfg.regionNames && typeof appCfg.regionNames === 'object' && !Array.isArray(appCfg.regionNames)
+    ? appCfg.regionNames
+    : {};
+  const names = {};
+  for (const id of regionIds) {
+    const name = String(source[id] || '').trim();
+    if (name) names[id] = name;
+  }
+  const legacyRegion = String(appCfg && appCfg.region || '').trim();
+  const legacyName = String(appCfg && appCfg.regionName || '').trim();
+  if (legacyName && legacyRegion && regionIds.includes(legacyRegion) && !names[legacyRegion]) {
+    names[legacyRegion] = legacyName;
+  }
+  return names;
+}
+
+function looksLikePlaceholderText(value) {
+  const s = String(value || '').trim();
+  if (!s) return true;
+  return /^[?\s._-]+$/.test(s);
+}
+
+function recoverConfigJsonTitle(appCfg) {
+  try {
+    const parsed = JSON.parse(String(appCfg && appCfg.configJson || '').trim());
+    const title = String(parsed && parsed.title || '').trim();
+    return title || '';
+  } catch {
+    return '';
+  }
+}
+
+function repairAppDisplayNames(appCfg) {
+  const a = Object.assign({}, appCfg || {});
+  const title = recoverConfigJsonTitle(a);
+
+  if (a.id === 'app_mdac') {
+    if (looksLikePlaceholderText(a.name)) a.name = '马来西亚电子入境卡(MDAC)';
+    if (a.scope === 'region') {
+      if (looksLikePlaceholderText(a.regionName)) a.regionName = '马来西亚';
+      if (!a.regionNames || typeof a.regionNames !== 'object' || Array.isArray(a.regionNames)) a.regionNames = {};
+      if (a.region && looksLikePlaceholderText(a.regionNames[a.region])) a.regionNames[a.region] = '马来西亚';
+    }
+    return a;
+  }
+
+  if (looksLikePlaceholderText(a.name) && title) {
+    a.name = title;
+  }
+  if (a.scope === 'region' && looksLikePlaceholderText(a.regionName) && title) {
+    a.regionName = title;
+  }
+  return a;
+}
+
+function normalizeConfigJsonSync(input) {
+  const raw = input && typeof input === 'object' && !Array.isArray(input) ? input : {};
+  const loginUrl = String(raw.loginUrl || '').trim();
+  const configUrl = String(raw.configUrl || '').trim();
+  const out = {
+    enabled: raw.enabled === true || (loginUrl.length > 0 && configUrl.length > 0),
+    loginUrl,
+    loginMethod: String(raw.loginMethod || 'POST').toUpperCase() === 'GET' ? 'GET' : 'POST',
+    loginHeaders: raw.loginHeaders && typeof raw.loginHeaders === 'object' && !Array.isArray(raw.loginHeaders) ? raw.loginHeaders : {},
+    loginBody: String(raw.loginBody || '').trim(),
+    configUrl,
+    configMethod: String(raw.configMethod || 'GET').toUpperCase() === 'POST' ? 'POST' : 'GET',
+    configHeaders: raw.configHeaders && typeof raw.configHeaders === 'object' && !Array.isArray(raw.configHeaders) ? raw.configHeaders : {},
+    configBody: String(raw.configBody || '').trim(),
+    tokenPath: String(raw.tokenPath || '').trim(),
+    tokenHeader: String(raw.tokenHeader || 'Authorization').trim(),
+    tokenPrefix: String(raw.tokenPrefix || 'Bearer ').trim(),
+    configPath: String(raw.configPath || '').trim()
+  };
+  return out;
+}
+
+function hasConfigJsonSyncSource(sync) {
+  const s = normalizeConfigJsonSync(sync);
+  return s.loginUrl.length > 0 && s.configUrl.length > 0;
+}
+
+function redactConfigJsonSync(sync) {
+  const s = normalizeConfigJsonSync(sync);
+  return Object.assign({}, s, {
+    loginBody: s.loginBody ? '******' : '',
+    loginHeaders: redactSecretObject(s.loginHeaders),
+    configHeaders: redactSecretObject(s.configHeaders)
+  });
+}
+
+function redactSecretObject(obj) {
+  const out = {};
+  for (const [key, value] of Object.entries(obj || {})) {
+    if (/authorization|token|secret|password|cookie|key/i.test(key)) out[key] = '******';
+    else out[key] = value;
+  }
+  return out;
+}
+
+function mergeMaskedObject(next, prev) {
+  const out = Object.assign({}, next || {});
+  for (const [key, value] of Object.entries(out)) {
+    if (value === '******' && prev && Object.prototype.hasOwnProperty.call(prev, key)) {
+      out[key] = prev[key];
+    }
+  }
+  return out;
+}
+
+function publicAppConfig(appCfg) {
+  const a = normalizeAppConfig(appCfg);
+  delete a.configJsonSync;
+  return a;
+}
+
 function normalizeAppConfig(appCfg) {
   const a = Object.assign({}, appCfg || {});
   a.id = String(a.id || '').trim();
   a.name = String(a.name || a.id || '').trim();
   a.url = String(a.url || '').trim();
   a.scope = normalizeScope(a.scope);
-  a.region = a.scope === 'region' ? String(a.region || '').trim() : '';
-  a.regionName = a.scope === 'region' ? String(a.regionName || a.region || '').trim() : '';
+  a.regions = a.scope === 'region' ? normalizeRegionIds(a) : [];
+  a.regionNames = a.scope === 'region' ? normalizeRegionNames(a, a.regions) : {};
+  // region/regionName remain for older SDK releases. New clients must use regions[].
+  a.region = a.regions.length > 0 ? a.regions[0] : '';
+  a.regionName = a.region ? (a.regionNames[a.region] || a.region) : '';
   if (typeof a.configJson !== 'string') a.configJson = '';
   a.configJsonFileName = String(a.configJsonFileName || '').trim();
-  return a;
+  a.configJsonSync = normalizeConfigJsonSync(a.configJsonSync);
+  return repairAppDisplayNames(a);
 }
 
 function originOf(input) {
@@ -195,8 +342,8 @@ function validateAppConfigForWebsdk(appCfg) {
   if (!appOrigin) {
     return `应用 ${a.id}: URL 必须是 http(s):// 开头的完整地址`;
   }
-  if (a.scope === 'region' && !a.region) {
-    return `应用 ${a.id}: 地区应用必须填写地区 ID`;
+  if (a.scope === 'region' && a.regions.length === 0) {
+    return `应用 ${a.id}: 地区应用必须至少填写一个地区 ID`;
   }
   if (a.configJson && a.configJson.trim()) {
     let json;
@@ -217,6 +364,15 @@ function validateAppConfigForWebsdk(appCfg) {
       return `应用 ${a.id}: 配置 JSON 的 url 必须和应用 URL 同源`;
     }
   }
+  const sync = a.configJsonSync || {};
+  if (sync.enabled) {
+    if (!originOf(sync.loginUrl)) {
+      return `应用 ${a.id}: JSON 同步登录 URL 必须是 http(s):// 开头的完整地址`;
+    }
+    if (!originOf(sync.configUrl)) {
+      return `应用 ${a.id}: JSON 同步配置接口 URL 必须是 http(s):// 开头的完整地址`;
+    }
+  }
   return '';
 }
 
@@ -224,8 +380,12 @@ function configRegions(apps) {
   const map = new Map();
   for (const appCfg of apps || []) {
     const a = normalizeAppConfig(appCfg);
-    if (a.scope === 'region' && a.region.length > 0 && !map.has(a.region)) {
-      map.set(a.region, { id: a.region, name: a.regionName || a.region });
+    if (a.scope !== 'region') continue;
+    for (const region of a.regions) {
+      const name = a.regionNames[region] || region;
+      if (!map.has(region) || (map.get(region).name === region && name !== region)) {
+        map.set(region, { id: region, name });
+      }
     }
   }
   return Array.from(map.values());
@@ -262,7 +422,10 @@ function runCacheBuilder(mode, appId) {
 const AUTO_UPDATE_INTERVAL_MS = 24 * 60 * 60 * 1000; // 一天一次
 const AUTO_UPDATE_FIRST_DELAY_MS = 60 * 1000;        // 服务启动 1 分钟后先跑一次
 const AUTO_UPDATE_LOG = path.join(__dirname, 'data', 'auto-update-log.json');
+const CONFIG_JSON_SYNC_LOG = path.join(__dirname, 'data', 'config-json-sync-log.json');
 let autoUpdateRunning = false;
+let configJsonSyncRunning = false;
+let configJsonSyncTimer = null;
 
 // ——————————————— Express ———————————————
 const app = express();
@@ -278,7 +441,7 @@ if (fs.existsSync(WEB_DIST)) app.use(express.static(WEB_DIST));
 app.get('/api/config', (req, res) => {
   const c = loadConfig();
   const apps = (c.apps || []).map((a) => {
-    const appCfg = normalizeAppConfig(a);
+    const appCfg = publicAppConfig(a);
     const mfPath = path.join(BUNDLES_DIR, appCfg.id, 'manifest.json');
     const compressedMfPath = path.join(BUNDLES_DIR, appCfg.id, 'manifest.zz.json');
     const hasBundle = fs.existsSync(mfPath);
@@ -496,12 +659,26 @@ app.post('/api/admin/password', (req, res) => {
 
 app.get('/api/admin/config', (req, res) => {
   const c = loadConfig();
-  const apps = (c.apps || []).map((a) => normalizeAppConfig(a));
+  const apps = (c.apps || []).map((a) => {
+    const appCfg = normalizeAppConfig(a);
+    appCfg.configJsonSync = redactConfigJsonSync(appCfg.configJsonSync);
+    return appCfg;
+  });
   res.json(Object.assign({}, c, { apps, regions: configRegions(apps) }));
 });
 app.put('/api/admin/apps', (req, res) => {
   const c = loadConfig();
-  const nextApps = (req.body.apps || []).map((a) => normalizeAppConfig(a)).filter((a) => a.id && a.url);
+  const previousById = new Map((c.apps || []).map((a) => [String(a.id || ''), normalizeAppConfig(a)]));
+  const nextApps = (req.body.apps || []).map((a) => {
+    const appCfg = normalizeAppConfig(a);
+    const prev = previousById.get(appCfg.id);
+    if (prev && appCfg.configJsonSync) {
+      if (appCfg.configJsonSync.loginBody === '******') appCfg.configJsonSync.loginBody = prev.configJsonSync.loginBody;
+      appCfg.configJsonSync.loginHeaders = mergeMaskedObject(appCfg.configJsonSync.loginHeaders, prev.configJsonSync.loginHeaders);
+      appCfg.configJsonSync.configHeaders = mergeMaskedObject(appCfg.configJsonSync.configHeaders, prev.configJsonSync.configHeaders);
+    }
+    return appCfg;
+  }).filter((a) => a.id && a.url);
   const seenIds = new Set();
   const errors = [];
   for (const appCfg of nextApps) {
@@ -555,6 +732,25 @@ app.get('/api/admin/auto-update/log', (req, res) => {
   }
 });
 
+app.post('/api/admin/config-json-sync/run', async (req, res) => {
+  const appId = String(req.body && req.body.appId || '').trim();
+  try {
+    const log = await runConfigJsonSyncOnce(appId ? 'manual-app' : 'manual', appId);
+    res.json({ ok: true, log });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: String(e && e.message || e) });
+  }
+});
+
+app.get('/api/admin/config-json-sync/log', (req, res) => {
+  try {
+    const log = JSON.parse(fs.readFileSync(CONFIG_JSON_SYNC_LOG, 'utf8'));
+    res.json({ ok: true, running: configJsonSyncRunning, log });
+  } catch {
+    res.json({ ok: true, running: configJsonSyncRunning, log: null });
+  }
+});
+
 // 一键探测站点:填 URL → 自动返回 名称/类型/图标/建议加速参数,让新增应用更傻瓜。
 app.post('/api/admin/apps/detect', async (req, res) => {
   const url = String((req.body && req.body.url) || '').trim();
@@ -601,6 +797,182 @@ function configJsonInfo(appCfg) {
     configJsonBytes: bytes,
     configJsonSizeKB: Math.round(bytes / 102.4) / 10
   };
+}
+
+function readPathValue(input, dotPath) {
+  const pathText = String(dotPath || '').trim();
+  if (!pathText) return input;
+  let cur = input;
+  for (const part of pathText.split('.').filter(Boolean)) {
+    if (cur && typeof cur === 'object' && Object.prototype.hasOwnProperty.call(cur, part)) {
+      cur = cur[part];
+    } else {
+      return undefined;
+    }
+  }
+  return cur;
+}
+
+function parseMaybeJson(text) {
+  const raw = String(text || '').trim();
+  if (!raw) return {};
+  try { return JSON.parse(raw); } catch { return raw; }
+}
+
+function parseHeadersObject(value) {
+  if (!value) return {};
+  if (typeof value === 'string') {
+    const text = value.trim();
+    if (!text) return {};
+    try {
+      const parsed = JSON.parse(text);
+      return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {};
+    } catch {
+      const out = {};
+      for (const line of text.split(/\r?\n/)) {
+        const idx = line.indexOf(':');
+        if (idx > 0) out[line.slice(0, idx).trim()] = line.slice(idx + 1).trim();
+      }
+      return out;
+    }
+  }
+  return value && typeof value === 'object' && !Array.isArray(value) ? value : {};
+}
+
+function cookieHeaderFromResponse(res) {
+  const setCookie = res.headers.get('set-cookie');
+  if (!setCookie) return '';
+  return String(setCookie).split(/,(?=[^;,]+=)/).map((item) => item.split(';')[0].trim()).filter(Boolean).join('; ');
+}
+
+async function fetchForConfigSync(url, method, headers, bodyText) {
+  const init = { method, headers: Object.assign({ 'Accept': 'application/json,text/plain,*/*' }, headers || {}) };
+  if (method !== 'GET' && bodyText && bodyText.length > 0) {
+    init.body = bodyText;
+    if (!Object.keys(init.headers).some((k) => k.toLowerCase() === 'content-type')) {
+      init.headers['Content-Type'] = 'application/json';
+    }
+  }
+  const res = await fetch(url, init);
+  const text = await res.text();
+  if (!res.ok) {
+    throw new Error(`${res.status} ${url}: ${text.slice(0, 200)}`);
+  }
+  return { res, text };
+}
+
+async function syncConfigJsonForApp(appCfg) {
+  const app = normalizeAppConfig(appCfg);
+  const sync = app.configJsonSync || {};
+  if (!sync.enabled) return { id: app.id, skipped: true, reason: 'disabled' };
+  if (!hasConfigJsonSyncSource(sync)) return { id: app.id, skipped: true, reason: 'no sync source' };
+  const loginHeaders = parseHeadersObject(sync.loginHeaders);
+  const loginBody = sync.loginBody && sync.loginBody !== '******' ? sync.loginBody : '';
+  const login = await fetchForConfigSync(sync.loginUrl, sync.loginMethod || 'POST', loginHeaders, loginBody);
+  const loginParsed = parseMaybeJson(login.text);
+  const configHeaders = parseHeadersObject(sync.configHeaders);
+  const cookie = cookieHeaderFromResponse(login.res);
+  if (cookie && !Object.keys(configHeaders).some((k) => k.toLowerCase() === 'cookie')) {
+    configHeaders.Cookie = cookie;
+  }
+  if (sync.tokenPath) {
+    const token = readPathValue(loginParsed, sync.tokenPath);
+    if (token !== undefined && token !== null && String(token).length > 0) {
+      configHeaders[sync.tokenHeader || 'Authorization'] = `${sync.tokenPrefix || ''}${String(token)}`;
+    }
+  }
+  const configBody = sync.configBody && sync.configBody !== '******' ? sync.configBody : '';
+  const got = await fetchForConfigSync(sync.configUrl, sync.configMethod || 'GET', configHeaders, configBody);
+  const parsed = parseMaybeJson(got.text);
+  const selected = sync.configPath ? readPathValue(parsed, sync.configPath) : parsed;
+  if (selected === undefined || selected === null) {
+    throw new Error(`配置响应里找不到路径: ${sync.configPath}`);
+  }
+  const configText = typeof selected === 'string' ? selected.trim() : JSON.stringify(selected);
+  JSON.parse(configText);
+  return {
+    id: app.id,
+    skipped: false,
+    configJson: configText,
+    bytes: Buffer.byteLength(configText, 'utf8')
+  };
+}
+
+async function runConfigJsonSyncOnce(trigger = 'scheduled', onlyAppId = '') {
+  if (configJsonSyncRunning) {
+    return { running: true, skipped: true, reason: 'previous sync still running' };
+  }
+  configJsonSyncRunning = true;
+  const startedAt = new Date().toISOString();
+  const cfg = loadConfig();
+  const results = [];
+  let changed = false;
+  try {
+    for (const appCfg of (cfg.apps || [])) {
+      const app = normalizeAppConfig(appCfg);
+      if (onlyAppId && app.id !== onlyAppId) continue;
+      const item = { id: app.id, name: app.name || app.id, ok: true, changed: false, detail: '' };
+      try {
+        const synced = await syncConfigJsonForApp(app);
+        if (!synced.skipped) {
+          const idx = (cfg.apps || []).findIndex((a) => a.id === app.id);
+          if (idx >= 0 && cfg.apps[idx].configJson !== synced.configJson) {
+            cfg.apps[idx].configJson = synced.configJson;
+            cfg.apps[idx].configJsonFileName = cfg.apps[idx].configJsonFileName || `${app.id}.json`;
+            cfg.apps[idx].configJsonSyncedAt = new Date().toISOString();
+            changed = true;
+            item.changed = true;
+          }
+          item.detail = `同步 ${synced.bytes} bytes`;
+        } else {
+          item.detail = synced.reason ? `跳过: ${synced.reason}` : '跳过';
+        }
+      } catch (e) {
+        item.ok = false;
+        item.detail = String(e && e.message || e);
+      }
+      results.push(item);
+    }
+    if (changed) saveConfig(cfg);
+    const log = { startedAt, finishedAt: new Date().toISOString(), trigger, onlyAppId, changed, results };
+    try { fs.writeFileSync(CONFIG_JSON_SYNC_LOG, JSON.stringify(log, null, 2), 'utf8'); } catch {}
+    return log;
+  } finally {
+    configJsonSyncRunning = false;
+  }
+}
+
+function shanghaiDateParts(date = new Date()) {
+  const parts = new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'Asia/Shanghai',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    hour12: false
+  }).formatToParts(date);
+  const out = {};
+  for (const part of parts) {
+    if (part.type !== 'literal') out[part.type] = part.value;
+  }
+  return out;
+}
+
+function msUntilNextShanghaiNoon(date = new Date()) {
+  const sh = shanghaiDateParts(date);
+  const year = Number(sh.year);
+  const month = Number(sh.month);
+  const day = Number(sh.day);
+  const hour = Number(sh.hour);
+  const minute = Number(sh.minute);
+  const second = Number(sh.second);
+  const noonTodayUtc = Date.UTC(year, month - 1, day, 4, 0, 0);
+  if (hour < 12 || (hour === 12 && minute === 0 && second === 0)) {
+    return Math.max(noonTodayUtc - date.getTime(), 1000);
+  }
+  return Math.max(Date.UTC(year, month - 1, day + 1, 4, 0, 0) - date.getTime(), 1000);
 }
 
 function safeBundlePath(dir, file) {
@@ -1287,6 +1659,31 @@ function startAutoUpdateScheduler() {
   console.log(`[AutoUpdate] 定时器已启动:每 24 小时自动检查一次离线包更新`);
 }
 
+function startConfigJsonSyncScheduler() {
+  const scheduleNext = () => {
+    if (configJsonSyncTimer) clearTimeout(configJsonSyncTimer);
+    configJsonSyncTimer = setTimeout(() => {
+      runConfigJsonSyncOnce('daily-noon').catch((e) => {
+        console.warn('[ConfigJsonSync] daily sync failed:', e && e.message);
+      }).finally(() => {
+        scheduleNext();
+      });
+    }, msUntilNextShanghaiNoon());
+  };
+  const now = new Date();
+  const sh = shanghaiDateParts(now);
+  if (Number(sh.hour) === 12 && Number(sh.minute) === 0) {
+    runConfigJsonSyncOnce('daily-noon-startup').catch((e) => {
+      console.warn('[ConfigJsonSync] startup sync failed:', e && e.message);
+    }).finally(() => {
+      scheduleNext();
+    });
+  } else {
+    scheduleNext();
+  }
+  console.log('[ConfigJsonSync] 定时器已启动:每天 12:00 (Asia/Shanghai) 自动同步 configJson');
+}
+
 initDb(); // 后台连 MySQL 并建表(不阻塞;配置/离线包接口走文件,不依赖 DB)
 app.listen(PORT, () => {
   console.log(`[youhua-admin] server on http://localhost:${PORT}`);
@@ -1295,4 +1692,5 @@ app.listen(PORT, () => {
   console.log(`  后台登录:        账号 ${DEFAULT_USER} / 密码 ${DEFAULT_PASS}  (首登后可在后台改;或用 ADMIN_USER/ADMIN_PASS 环境变量)`);
   if (MASTER_TOKEN) console.log(`  主令牌已开启:    X-Admin-Token: <ADMIN_TOKEN>(脚本用)`);
   startAutoUpdateScheduler(); // 启动定时自动更新
+  startConfigJsonSyncScheduler(); // 启动每天中午 configJson 同步
 });

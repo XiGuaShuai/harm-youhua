@@ -14,6 +14,8 @@ SDK 初始化 -> 拉后台 /api/config -> 下载 bundle:true 站点离线包 -> 
 4. SWR 主文档缓存。
 5. chunk 预取。
 
+对外 API 没有新增必须接入的接口;这次新增的是可选 `configRefreshSec`,用于让端侧按间隔自动轮询后台 `/api/config`。
+
 ## 对外 API
 
 ```ts
@@ -36,7 +38,9 @@ import { WebAccel, WebAccelLauncher, WebAccelView, WebAccelOptions, RemoteApp } 
 | `WebAccel.getConfigJson(idOrUrl)` | 读取随离线包保存的 H5 配置 JSON |
 | `WebAccel.updateConfigJson(idOrUrl, configJson)` | 宿主拿到最新 H5 配置后同步给离线兜底 |
 | `WebAccel.getApps()` / `setApps(apps)` | 读取或直接注入应用列表 |
-| `WebAccel.refreshConfig()` | 手动拉一次后台最新配置。后台离线包更新后,可用它主动拉新版本 |
+| `WebAccel.getAppRegions(app)` | 返回应用的全部地区 ID,兼容旧版单值 `region` |
+| `WebAccel.matchesRegion(app, region)` | 判断应用是否属于当前地区;接入方不要自行比较 `app.region` |
+| `WebAccel.refreshConfig()` | 手动拉一次后台最新配置,并立即按当前地区重新匹配和下载地区包 |
 | `WebAccel.bundleProgress(idOrUrl)` | 查询某个 id / URL 的离线包下载进度 |
 | `WebAccel.stats()` | 调试统计 |
 | `WebAccel.setDebug(on)` | 调试浮窗开关。显示 `包准备中`、`包下载 x/y`、`包完成 x/y` |
@@ -50,6 +54,7 @@ interface WebAccelOptions {
   blockHosts?: string[];     // 可选黑名单
   settings?: RemoteSettings; // 沙箱容量、离线包并发等
   autoRefresh?: boolean;     // 是否启动后自动拉后台配置,默认 true
+  configRefreshSec?: number; // 后台应用 JSON 轮询间隔;默认 300 秒,0 表示关闭
 }
 ```
 
@@ -161,11 +166,12 @@ const apps: RemoteApp[] = [
     configJson: '{...}'
   },
   {
-    id: 'hk_ticket_1',
-    name: '香港门票',
-    url: 'https://hk.example.com/ticket/',
+    id: 'getyourguide',
+    name: 'GetYourGuide',
+    url: 'https://www.getyourguide.com/',
     scope: 'region',
-    region: 'HK',
+    regions: ['100253', '100678', '2036722743924088834'],
+    region: '100253', // 后台自动维护的旧 SDK 兼容值,业务代码不要直接判断它
     bundle: true,
     configJson: '{...}'
   }
@@ -176,9 +182,12 @@ const apps: RemoteApp[] = [
 
 1. `scope: "top"`: SDK 初始化后自动拉取,长期保留。
 2. `scope: "region"`: 宿主调用 `WebAccel.switchRegion(regionId)` 后拉取该地区包。
-3. 切香港到英国时,SDK 会让香港未完成任务失效,删除香港 `scope=region` 缓存,再拉英国包。
-4. `scope: "app"`: 不自动拉,宿主可用 `WebAccel.loadBundleForApp(app)` 或打开页面时触发。
-5. `configJson` 可放在 `/api/config` 的 app 字段里;新版 SDK 也兼容 manifest 对象格式 `{ "configJson": "...", "resources": [...] }`。
+3. `regions` 可配置多个地区 ID;切到其中任一地区都会加载同一个应用 `id` 对应的离线包,服务端和沙箱不会按地区复制多份。
+4. `region` 是旧 SDK 兼容字段,后台固定为 `regions[0]`;接入方应调用 `WebAccel.matchesRegion(app, currentRegion)`。
+5. 切香港到英国时,SDK 会让香港未完成任务失效,删除香港 `scope=region` 缓存,再拉英国包。
+6. `scope: "app"`: 不自动拉,宿主可用 `WebAccel.loadBundleForApp(app)` 或打开页面时触发。
+7. `configJson` 可放在 `/api/config` 的 app 字段里;新版 SDK 也兼容 manifest 对象格式 `{ "configJson": "...", "resources": [...] }`。
+8. 如果后台开启了 `configJsonSync`,该字段会由 admin 定时从第三方后台同步,端侧仍然只看 `/api/config`,不需要额外新增接入 API。
 
 ## 离线包规则
 
@@ -189,7 +198,10 @@ const apps: RemoteApp[] = [
 5. 资源下载源是后台 `/bundles/<site>/...`,但本地命中 key 是网页原始 URL。
 6. 文本资源可用 `.zz` 压缩落盘;命中时端侧内存解压后返回原文给 WebView。
 7. 未进入离线包的资源直接走网络,不会被端侧运行时自动缓存。
-8. 后台更新离线包后,端侧需要重新打开应用或调用 `WebAccel.refreshConfig()` 才会拉到新版本。
+8. 后台更新应用 JSON 后,端侧启动会立即拉一次,前台会按 `configRefreshSec` 周期自动拉 `/api/config`;也可调用 `WebAccel.refreshConfig()` 立即刷新。
+9. 后台更新自建网站的 `configJson` 后,端侧拉到新的 `/api/config` 会直接更新本地兜底 JSON,不要求离线包版本变化。
+10. 如果该站点的 `configJson` 由第三方后台自动同步,那么后台定时任务只是把最新 JSON 写进 `/api/config`;SDK 侧的使用方式不变。
+11. 后台更新静态资源离线包后,端侧拉到新 `bundleVersion` 会重新下载清单和新增/变更资源;刷新成功后 SDK 会自动检查 TOP、当前地区和当前会话已打开的网站。
 
 ## 元服务注意事项
 

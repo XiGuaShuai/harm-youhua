@@ -71,9 +71,7 @@ export struct WebAccelDebugBadge {
   }
 
   /**
-   * 某应用的缓存进度。两种模式标清楚:
-   *  - 启用离线包(bundle:true) → 「包 已下/总数」,有明确总数;
-   *  - 未启用(bundle:false)  → 「缓 已缓存条数」,运行时边用边缓存,无固定总数。
+   * 某应用的后台离线包进度。未配置离线包的应用直接走网络。
    */
   private progressText(app: RemoteApp): string {
     const origin: string = this.originOf(app.url);

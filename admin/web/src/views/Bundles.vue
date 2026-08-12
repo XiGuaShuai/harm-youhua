@@ -1,14 +1,18 @@
 <script setup>
 import { ref, onMounted, computed, watch } from 'vue';
+import { useRoute } from 'vue-router';
 import { ElMessage } from 'element-plus';
-import { Upload } from '@element-plus/icons-vue';
+import { Search, Upload } from '@element-plus/icons-vue';
 import api from '../api';
 
+const route = useRoute();
 const bundles = ref([]);
 const loading = ref(false);
 const selectedId = ref('');
 const resourceFilter = ref('all');
 const groupFilter = ref('all');
+const siteQuery = ref('');
+const resourceQuery = ref('');
 const togglingKey = ref('');
 const importDialog = ref(false);
 const importText = ref('');
@@ -28,7 +32,10 @@ async function load() {
   try {
     const { data } = await api.get('/api/admin/bundles');
     bundles.value = Array.isArray(data) ? data : [];
-    if (!selectedId.value || !bundles.value.some((b) => b.id === selectedId.value)) {
+    const requestedId = typeof route.query.app === 'string' ? route.query.app : '';
+    if (requestedId && bundles.value.some((b) => b.id === requestedId)) {
+      selectedId.value = requestedId;
+    } else if (!selectedId.value || !bundles.value.some((b) => b.id === selectedId.value)) {
       selectedId.value = bundles.value[0]?.id || '';
     }
   } finally {
@@ -37,6 +44,12 @@ async function load() {
   loadAutoLog();
 }
 onMounted(load);
+
+watch(() => route.query.app, (appId) => {
+  if (typeof appId === 'string' && bundles.value.some((bundle) => bundle.id === appId)) {
+    selectedId.value = appId;
+  }
+});
 
 watch(groupFilter, () => {
   if (!filteredBundles.value.some((b) => b.id === selectedId.value)) {
@@ -68,17 +81,43 @@ async function runAutoUpdate() {
 
 const selected = computed(() => bundles.value.find((b) => b.id === selectedId.value) || null);
 
-function groupKey(row) {
+function regionIdsOf(row) {
+  const config = row?.config || {};
+  const values = Array.isArray(row?.regions) && row.regions.length > 0
+    ? row.regions
+    : (Array.isArray(config.regions) && config.regions.length > 0
+      ? config.regions
+      : (row?.region || config.region ? [row?.region || config.region] : []));
+  return [...new Set(values.map((id) => String(id || '').trim()).filter(Boolean))];
+}
+
+function regionNameOf(row, id) {
+  const config = row?.config || {};
+  const names = { ...(config.regionNames || {}), ...(row?.regionNames || {}) };
+  if (row?.region === id && row?.regionName) return row.regionName;
+  if (config.region === id && config.regionName) return config.regionName;
+  return names[id] || id;
+}
+
+function groupKeys(row) {
   const scope = row?.scope || row?.config?.scope || 'top';
-  if (scope === 'top') return 'top';
-  if (scope === 'region') return `region:${row.region || row.config?.region || ''}`;
-  return 'top';
+  if (scope !== 'region') return ['top'];
+  return regionIdsOf(row).map((id) => `region:${id}`);
 }
 
 function groupName(row) {
   const scope = row?.scope || row?.config?.scope || 'top';
-  if (scope === 'region') return row.regionName || row.config?.regionName || row.region || row.config?.region || '地区';
+  if (scope === 'region') return regionIdsOf(row).map((id) => regionNameOf(row, id)).join('、') || '地区';
   return 'TOP';
+}
+
+function shortGroupName(row) {
+  const scope = row?.scope || row?.config?.scope || 'top';
+  if (scope !== 'region') return 'TOP 常驻';
+  const ids = regionIdsOf(row);
+  if (!ids.length) return '地区';
+  const first = regionNameOf(row, ids[0]);
+  return ids.length > 1 ? `${first} +${ids.length - 1}` : first;
 }
 
 const groupOptions = computed(() => {
@@ -86,23 +125,32 @@ const groupOptions = computed(() => {
   map.set('all', '全部');
   map.set('top', 'TOP 常驻');
   bundles.value.forEach((b) => {
-    const key = groupKey(b);
-    if (key.startsWith('region:') && !map.has(key)) {
-      map.set(key, groupName(b));
-    }
+    groupKeys(b).forEach((key) => {
+      if (key.startsWith('region:') && !map.has(key)) {
+        const id = key.slice('region:'.length);
+        map.set(key, regionNameOf(b, id));
+      }
+    });
   });
   return Array.from(map.entries()).map(([value, label]) => ({ value, label }));
 });
 
 const filteredBundles = computed(() => {
-  if (groupFilter.value === 'all') return bundles.value;
-  return bundles.value.filter((b) => groupKey(b) === groupFilter.value);
+  const q = siteQuery.value.trim().toLowerCase();
+  return bundles.value.filter((bundle) => {
+    if (groupFilter.value !== 'all' && !groupKeys(bundle).includes(groupFilter.value)) return false;
+    if (!q) return true;
+    return [bundle.id, bundle.name, bundle.url, groupName(bundle)]
+      .some((value) => String(value || '').toLowerCase().includes(q));
+  });
 });
 
 const resources = computed(() => {
   const list = selected.value?.resources || [];
+  const q = resourceQuery.value.trim().toLowerCase();
   return list
     .filter((r) => {
+      if (q && ![r.file, r.url, r.mime].some((value) => String(value || '').toLowerCase().includes(q))) return false;
       if (resourceFilter.value === 'enabled') return r.enabled !== false && r.inManifest !== false;
       if (resourceFilter.value === 'disabled') return r.enabled === false;
       if (resourceFilter.value === 'large') return Number(r.size || 0) >= 64 * 1024;
@@ -332,13 +380,23 @@ function importStatusText(row) {
 
     <div class="bundle-layout">
       <aside class="site-pane">
-        <div class="pane-title">网站</div>
-        <el-table :data="filteredBundles" size="small" highlight-current-row :current-row-key="selectedId" row-key="id" @row-click="selectSite">
+        <div class="site-pane-head">
+          <div>
+            <div class="pane-title">网站</div>
+            <div class="site-pane-sub">选择网站维护静态资源</div>
+          </div>
+          <el-tag size="small" type="info" effect="plain">{{ filteredBundles.length }}</el-tag>
+        </div>
+        <el-input v-model="siteQuery" :prefix-icon="Search" clearable size="small" class="site-search"
+          placeholder="搜索名称 / ID / URL" />
+        <el-table :data="filteredBundles" size="small" height="680" highlight-current-row :current-row-key="selectedId" row-key="id" @row-click="selectSite">
           <el-table-column label="名称" min-width="150" show-overflow-tooltip>
             <template #default="{ row }">
               <div class="site-name">{{ row.name || row.id }}</div>
               <div class="site-id">{{ row.id }}</div>
-              <el-tag size="small" :type="(row.scope || row.config?.scope) === 'region' ? 'success' : 'info'">{{ groupName(row) }}</el-tag>
+              <el-tooltip :content="groupName(row)" placement="top" :show-after="250">
+                <el-tag size="small" :type="(row.scope || row.config?.scope) === 'region' ? 'success' : 'info'">{{ shortGroupName(row) }}</el-tag>
+              </el-tooltip>
             </template>
           </el-table-column>
           <el-table-column label="资源" width="86" align="right">
@@ -403,14 +461,18 @@ function importStatusText(row) {
         </div>
 
         <div class="table-tools">
-          <el-radio-group v-model="resourceFilter" size="small">
-            <el-radio-button label="all">全部</el-radio-button>
-            <el-radio-button label="enabled">已入包</el-radio-button>
-            <el-radio-button label="disabled">已关闭</el-radio-button>
-            <el-radio-button label="large">大资源</el-radio-button>
-            <el-radio-button label="slow">慢资源</el-radio-button>
-          </el-radio-group>
-          <span class="muted">{{ resources.length }} 条</span>
+          <div class="resource-filters">
+            <el-radio-group v-model="resourceFilter" size="small">
+              <el-radio-button label="all">全部</el-radio-button>
+              <el-radio-button label="enabled">已入包</el-radio-button>
+              <el-radio-button label="disabled">已关闭</el-radio-button>
+              <el-radio-button label="large">大资源</el-radio-button>
+              <el-radio-button label="slow">慢资源</el-radio-button>
+            </el-radio-group>
+            <span class="muted">{{ resources.length }} 条</span>
+          </div>
+          <el-input v-model="resourceQuery" :prefix-icon="Search" clearable size="small" class="resource-search"
+            placeholder="搜索文件名、类型或 URL" />
         </div>
 
         <el-table :data="resources" border size="small" height="520">
@@ -536,28 +598,43 @@ function importStatusText(row) {
 }
 .bundle-layout {
   display: grid;
-  grid-template-columns: 280px minmax(0, 1fr);
+  grid-template-columns: 300px minmax(0, 1fr);
   gap: 16px;
   margin-top: 16px;
 }
 .site-pane,
 .resource-pane {
   border: 1px solid #edf0f6;
-  border-radius: 8px;
+  border-radius: 12px;
   background: #fff;
   min-width: 0;
 }
 .site-pane {
   padding: 12px;
+  align-self: start;
 }
 .resource-pane {
   padding: 16px;
 }
 .pane-title {
-  font-size: 13px;
+  font-size: 15px;
   font-weight: 700;
-  color: #606266;
-  margin-bottom: 10px;
+  color: #303445;
+}
+.site-pane-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 2px 4px 0;
+}
+.site-pane-sub {
+  margin-top: 3px;
+  color: #959bad;
+  font-size: 11px;
+}
+.site-search {
+  margin: 12px 0 10px;
 }
 .site-name {
   font-weight: 600;
@@ -567,6 +644,15 @@ function importStatusText(row) {
 .resource-url {
   color: #8a90a2;
   font-size: 12px;
+}
+.site-id {
+  margin: 2px 0 5px;
+}
+.resource-url {
+  max-width: 680px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 .resource-top {
   display: flex;
@@ -616,6 +702,19 @@ function importStatusText(row) {
 .table-tools {
   justify-content: space-between;
   margin-bottom: 10px;
+  padding: 10px 12px;
+  border: 1px solid #edf0f6;
+  border-radius: 10px;
+  background: #fafbfe;
+}
+.resource-filters {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+.resource-search {
+  width: 300px;
 }
 .file-name {
   font-family: ui-monospace, SFMono-Regular, Consolas, 'Liberation Mono', monospace;
@@ -630,6 +729,9 @@ function importStatusText(row) {
   }
   .metric-row {
     grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+  .resource-search {
+    width: 100%;
   }
 }
 </style>

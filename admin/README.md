@@ -33,6 +33,7 @@ npm run dev
 | 应用管理 | `WebAccel.getApps()` / launcher 列表 | 增删网页应用、每个 app 的加速开关、路由列表 |
 | 过滤黑名单 | SDK 注入的 `blockHosts` | 被墙第三方域名,端侧命中即秒拒 |
 | 离线包 | 下载进接入方应用沙箱(不打进 HAP) | 服务端构建/手动导入静态资源,生成 manifest 并托管给端侧 |
+| configJson 自动同步 | 第三方后台登录 + 配置接口 | 每天 12:00 (Asia/Shanghai) 定时登录并把最新 `configJson` 写回后台应用配置 |
 | 全局设置 | 沙箱上限 / 离线包下载并发等 | (`字节码开关` 字段在元服务被忽略,平台不支持) |
 
 ## 关键接口
@@ -42,6 +43,8 @@ npm run dev
 - `POST /api/admin/bundles/<id>/build` —— 服务端为某 app 打包(后台「服务端打包」按钮)
 - `POST /api/admin/bundles/<id>/import` —— 手动导入指定静态资源 URL,立即下载并重生成 manifest/压缩 manifest
 - `POST /api/login` —— 账号密码登录,返回会话 token;后续管理请求带 `X-Admin-Token: <token>` 头
+- `POST /api/admin/config-json-sync/run` —— 手动触发某个 app 的 `configJson` 同步(或全量同步)
+- `GET /api/admin/config-json-sync/log` —— 查看最近一次 `configJson` 同步结果
 - 应用/黑名单/设置的增删改:`/api/admin/*`(需 `X-Admin-Token` 头);改密 `POST /api/admin/password`
 
 ## 鸿蒙端怎么接(已完成,经 webaccel SDK)
@@ -53,6 +56,30 @@ npm run dev
 2. **离线包下载**:SDK 对 `bundle:true` 且已有 manifest 的站点,从 `/bundles/<id>/manifest*.json` 下载该站离线包到沙箱
    (缓存 key = 原站 URL),**改资源不用重发 App**,且不计入元服务包体。
 3. 后台重建离线包后会生成新版本号;端侧重新打开应用或调用 `WebAccel.refreshConfig()` 后拉到新版本并下载新增/变更资源。
+
+## `configJson` 自动同步(后台应用 JSON)
+
+有些站点的 H5 配置不是人工上传,而是第三方后台接口返回的 `configJson`。这类站点在 admin 里配置 `configJsonSync`,由后台定时同步到本地 `configJson` 字段,再一起下发给端侧。
+
+同步链路如下:
+
+1. 先调用第三方登录接口拿 token,例如:
+
+   - `POST https://meta-manage.hssstg.com/admin-api/login`
+   - 响应里的 token 字段: `token`
+
+2. 再调用配置接口拿应用 JSON,例如:
+
+   - `GET https://meta-manage.hssstg.com/admin-api/api/webappconfig/getList?pageNum=1&pageSize=10&appId=1930101295172853761`
+   - 目标 JSON 路径: `data.records[0].configJson`
+
+3. `getWebNameList` 不是 configJson 来源,它只是应用列表接口。
+
+4. 后台默认每天 12:00 (Asia/Shanghai) 自动执行一次同步;当前已配置同步源的应用会自动刷新 `configJson`。也可以手动调 `POST /api/admin/config-json-sync/run` 立即刷新。
+
+5. 同步结果可从 `GET /api/admin/config-json-sync/log` 查看。
+
+6. 端侧不需要新增任何必须接入的 API,还是按 `/api/config` 和 `WebAccel.refreshConfig()` 这条链路拿到最新配置。
 
 > 接入与元服务注意事项见 `app/webaccel/README.md`、维护流程见 `app/UPDATE.md`。
 > 动态接口(跨境实时数据)仍由你的**后端镜像**解决,与本配置服务可以是同一台服务器。

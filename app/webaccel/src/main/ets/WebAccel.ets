@@ -5,10 +5,12 @@ import { hilog } from '@kit.PerformanceAnalysisKit';
 import { BusinessError } from '@kit.BasicServicesKit';
 import { webCache, CacheStats, BundleProgress } from './core/WebCacheManager';
 import { webPool, WebNode } from './core/WebPreRender';
-import { remoteConfig, RemoteApp, ConfigureOptions } from './core/RemoteConfig';
+import { remoteConfig, RemoteApp, ConfigureOptions, remoteAppMatchesRegion, remoteAppRegions } from './core/RemoteConfig';
 
 const TAG: string = 'WebAccel';
 const DOMAIN: number = 0x0001;
+const DEFAULT_CONFIG_REFRESH_SEC: number = 300;
+const MIN_CONFIG_REFRESH_SEC: number = 30;
 
 /**
  * WebAccel.init 入参(继承 ConfigureOptions 的 configServer/apps/blockHosts/settings)。全部可选:
@@ -18,19 +20,24 @@ const DOMAIN: number = 0x0001;
  */
 export interface WebAccelOptions extends ConfigureOptions {
   autoRefresh?: boolean;     // 有 configServer 时是否开机异步拉最新配置(默认 true)
+  configRefreshSec?: number; // 后台应用 JSON 轮询间隔;<=0 关闭,默认 300 秒
 }
 
 /**
- * 网页加速 SDK 门面(全静态)。把内核初始化、离线缓存、远程配置、离屏预渲染收成一组调用。
+ * 网页加速 SDK 门面(全静态)。负责远程配置、后台离线包和 WebView 本地命中。
  *
  * 典型接入(3 步):
  *   ① UIAbility.onCreate:   WebAccel.init(this.context, { configServer })
  *   ② 首个页面 aboutToAppear: WebAccel.attach(this.getUIContext()); WebAccel.prewarm(url)
  *   ③ 展示页:                WebAccelView({ url })   // 或自行 NodeContainer(WebAccel.obtain(url))
  *
- * 元服务(Atomic Service)注意:不要打 rawfile 离线包以保持包体 ≤ 2MB,缓存全走运行时沙箱。
+ * 元服务(Atomic Service)注意:不要打 rawfile 离线包，后台资源只落到应用沙箱。
  */
 export class WebAccel {
+  private static refreshTimerId: number = -1;
+  private static refreshInFlight: boolean = false;
+  private static refreshSecOverride: number = -1;
+
   /**
    * 开机初始化(在 UIAbility.onCreate 调用一次)。内部:
    *   提前初始化 Web 内核 → 初始化离线缓存 → 注入配置 → 同步读缓存/直供 → (可选)异步拉后台最新配置。
@@ -54,62 +61,80 @@ export class WebAccel {
     remoteConfig.load(context);
     webCache.setBlockHosts(remoteConfig.getBlockHosts());
     webCache.applySettings(remoteConfig.getSettings());
-    webCache.applyApps(remoteConfig.getApps(), remoteConfig.getServer()); // 每应用精细配置(额外黑名单/预取开关)按 origin 生效 + 注入后端地址(自愈上报用)
+    webCache.applyApps(remoteConfig.getApps(), remoteConfig.getServer()); // 每应用黑名单、UA 和离线包归属按 origin 生效
     webPool.bindRemoteConfig();
     webPool.loadTopBundles();
 
     // ⑤ 异步:有后台且允许时拉服务器最新配置,成功后再注入一次
     const autoRefresh: boolean = !(options && options.autoRefresh === false);
     if (autoRefresh) {
-      remoteConfig.refresh().then((ok: boolean) => {
-        if (ok) {
-          webCache.setBlockHosts(remoteConfig.getBlockHosts());
-          webCache.applySettings(remoteConfig.getSettings());
-          webCache.applyApps(remoteConfig.getApps(), remoteConfig.getServer()); // 每应用精细配置按 origin 生效 + 后端地址
-          webPool.loadTopBundles();
-          WebAccel.runExploreReports(); // 众包探索:对后台标记的待探索 app 匿名上报本地已缓存资源
-        }
-      });
+      WebAccel.refreshSecOverride = options && typeof options.configRefreshSec === 'number' ? options.configRefreshSec : -1;
+      WebAccel.refreshConfig();
+      WebAccel.startConfigAutoRefresh(options);
     }
     hilog.info(DOMAIN, TAG, 'initialized (server=%{public}s)',
       remoteConfig.getServer().length > 0 ? remoteConfig.getServer() : '(none)');
   }
 
-  // 众包探索上报:对后台标记为待探索(explore)的 app,按采样率上报本地已缓存的静态资源(匿名)
-  private static runExploreReports(): void {
-    const ex = remoteConfig.getExplore();
-    if (ex.apps.length === 0 || ex.sample <= 0) {
+  /** 后台应用 JSON 会变,端侧需要周期性拉取,否则长期前台会一直使用旧配置。 */
+  private static startConfigAutoRefresh(options?: WebAccelOptions): void {
+    if (WebAccel.refreshTimerId >= 0) {
+      clearInterval(WebAccel.refreshTimerId);
+      WebAccel.refreshTimerId = -1;
+    }
+    if (remoteConfig.getServer().length === 0) {
       return;
     }
-    const server: string = remoteConfig.getServer();
-    const apps: RemoteApp[] = remoteConfig.getApps();
-    for (let i = 0; i < ex.apps.length; i++) {
-      const id: string = ex.apps[i];
-      const a: RemoteApp | undefined = apps.find((x: RemoteApp) => x.id === id);
-      if (a) {
-        const om = a.url.match(/^https?:\/\/[^\/]+/);
-        const origin: string = om ? om[0] : '';
-        if (origin.length > 0) {
-          webCache.reportExploration(a.id, origin, server, ex.sample);
-        }
+    let sec: number = DEFAULT_CONFIG_REFRESH_SEC;
+    const optionSec: number = options && typeof options.configRefreshSec === 'number'
+      ? options.configRefreshSec
+      : WebAccel.refreshSecOverride;
+    if (optionSec === 0) {
+      return;
+    }
+    if (optionSec > 0) {
+      sec = optionSec;
+    } else {
+      const settingsSec: number = remoteConfig.getSettings() && typeof remoteConfig.getSettings().configRefreshSec === 'number'
+        ? remoteConfig.getSettings().configRefreshSec as number
+        : -1;
+      if (settingsSec === 0) {
+        return;
+      }
+      if (settingsSec > 0) {
+        sec = settingsSec;
       }
     }
+    sec = Math.max(MIN_CONFIG_REFRESH_SEC, Math.floor(sec));
+    WebAccel.refreshTimerId = setInterval(() => {
+      WebAccel.refreshConfig();
+    }, sec * 1000);
+    hilog.info(DOMAIN, TAG, 'config auto refresh every %{public}d sec', sec);
   }
 
-  /** 提供 UIContext(离屏预渲染需要)。在首个页面/组件 aboutToAppear 调用一次 */
+  /** 后台配置刷新后,立即按当前地区重新匹配并拉取新配置的地区离线包。 */
+  private static reloadActiveRegionBundles(): void {
+    const activeRegion: string = webCache.getActiveRegion();
+    if (activeRegion.length === 0) {
+      return;
+    }
+    hilog.info(DOMAIN, TAG, 'reload active region bundles after config refresh region=%{public}s', activeRegion);
+    webPool.switchRegion(activeRegion);
+  }
+
+  /** 兼容旧接入；Web 节点现在只在 NodeContainer 挂载时创建。 */
   static attach(uiContext: UIContext): void {
     webPool.setUIContext(uiContext);
   }
 
   /**
-   * 预热一个网页:预连接 +(可选)主文档 SWR + 离屏预渲染。通常对列表里每个 URL 调用。
-   * @param swrDoc 是否对主文档启用陈旧即用缓存(公开页可开;含登录态的慎开)。默认 true
+   * 兼容旧接入的预热入口。当前只登记 Web 节点，不做 SWR 或离屏预渲染。
    */
   static prewarm(url: string, swrDoc: boolean = true): void {
     webPool.prewarm(url, swrDoc);
   }
 
-  /** 取一个已离屏渲染好的节点用于显示(WebAccelView 内部用;也可自行 NodeContainer 挂载) */
+  /** 取一个按需创建的网页节点(WebAccelView 内部用;也可自行 NodeContainer 挂载)。 */
   static obtain(url: string): WebNode {
     return webPool.obtain(url);
   }
@@ -188,6 +213,16 @@ export class WebAccel {
     return remoteConfig.getApps();
   }
 
+  /** 返回应用配置的全部地区 ID。兼容旧配置中的单值 region。 */
+  static getAppRegions(app: RemoteApp): string[] {
+    return remoteAppRegions(app);
+  }
+
+  /** 判断应用是否可用于当前地区。TOP 应用始终返回 true。 */
+  static matchesRegion(app: RemoteApp, region: string): boolean {
+    return remoteAppMatchesRegion(app, region);
+  }
+
   /** 运行时直接喂应用列表(不依赖后台;会写入 AppStorage('apps') 并触发 @StorageLink 刷新) */
   static setApps(apps: RemoteApp[]): void {
     remoteConfig.setApps(apps);
@@ -195,14 +230,26 @@ export class WebAccel {
 
   /** 手动拉一次后台最新配置(成功后自动重注入黑名单/设置)。未配置后台返回 false */
   static async refreshConfig(): Promise<boolean> {
-    const ok: boolean = await remoteConfig.refresh();
-    if (ok) {
-      webCache.setBlockHosts(remoteConfig.getBlockHosts());
-      webCache.applySettings(remoteConfig.getSettings());
-      webCache.applyApps(remoteConfig.getApps(), remoteConfig.getServer()); // 每应用精细配置按 origin 生效
-      webPool.loadTopBundles();
+    if (WebAccel.refreshInFlight) {
+      hilog.info(DOMAIN, TAG, 'refreshConfig skipped: previous refresh still running');
+      return false;
     }
-    return ok;
+    WebAccel.refreshInFlight = true;
+    try {
+      const ok: boolean = await remoteConfig.refresh();
+      if (ok) {
+        webCache.setBlockHosts(remoteConfig.getBlockHosts());
+        webCache.applySettings(remoteConfig.getSettings());
+        webCache.applyApps(remoteConfig.getApps(), remoteConfig.getServer()); // 每应用精细配置按 origin 生效
+        webPool.loadTopBundles();
+        WebAccel.reloadActiveRegionBundles();
+        webPool.reloadOpenedBundles();
+        WebAccel.startConfigAutoRefresh();
+      }
+      return ok;
+    } finally {
+      WebAccel.refreshInFlight = false;
+    }
   }
 
   /** 缓存统计快照(调试用) */

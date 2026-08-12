@@ -23,6 +23,10 @@ async function save() {
         <el-input-number v-model="settings.docCheckSec" :min="0" :max="3600" :step="10" />
         <div class="hint">多久才重拉一次首页 HTML 比对版本(对应 DOC_CHECK_MS)。</div>
       </el-form-item>
+      <el-form-item label="应用 JSON 自动刷新 (秒)">
+        <el-input-number v-model="settings.configRefreshSec" :min="0" :max="3600" :step="30" />
+        <div class="hint">App 前台定时拉取 <code>/api/config</code> 的间隔；0 表示关闭，建议 300 秒。</div>
+      </el-form-item>
       <el-form-item label="离线包下载并发">
         <el-input-number v-model="settings.bundleConcurrency" :min="1" :max="8" :step="1" />
         <div class="hint">App 从后台拉取离线包时的后台下载并发;过高会抢占首屏网络。</div>

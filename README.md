@@ -15,7 +15,9 @@ youhua-mono/
 ## 两者关系
 
 - **app** 是端侧元服务:加速能力抽成 `webaccel` HAR SDK,`entry` 是消费它的**元服务本体**(`bundleType: atomicService` + `installationFree: true`);**开机从服务器拉配置**(应用 / 黑名单 / 设置),按后台 manifest 下载离线包进沙箱,WebView 请求命中本地离线包。
-- **admin** 是后台:负责配置应用、筛选大资源/慢资源、生成并托管离线包。后台改配置不用重新发版,但端侧需要重新打开应用或主动 `WebAccel.refreshConfig()` 才会拉到新版本。
+- **admin** 是后台:负责配置应用、筛选大资源/慢资源、生成并托管离线包。后台改配置不用重新发版,`configJson` 也可以由后台每天定时登录第三方系统自动同步,端侧按 `configRefreshSec` 轮询 `/api/config` 或主动 `WebAccel.refreshConfig()` 才会拿到新版本。
+
+> 当前 SDK 对外 API 没有新增必须接入的接口;这次变化主要是后台配置与 `configJson` 的自动同步链路。
 
 > 新会话先读 [新会话快速上下文.md](新会话快速上下文.md)。当前定版口径:端侧不做运行时静态资源自动缓存,不做预渲染,不做 SWR 主文档缓存,不做 chunk 预取;只保留后台离线包链路。
 

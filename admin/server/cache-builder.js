@@ -131,6 +131,23 @@ function configuredBundleUrls(appCfg) {
   return out;
 }
 
+function configuredResourceEntries(appCfg) {
+  const resources = [];
+  for (const url of configuredBundleUrls(appCfg)) {
+    resources.push({
+      url,
+      sourceUrl: url,
+      file: fileNameForPath(url),
+      mime: metricMime(appCfg, url, mimeOf(url))
+    });
+  }
+  resources.sort((a, b) => {
+    const ra = cacheFileRank(a.file), rb = cacheFileRank(b.file);
+    return ra === rb ? a.file.localeCompare(b.file) : ra - rb;
+  });
+  return resources;
+}
+
 function configuredResourceMetric(appCfg, url) {
   const metrics = appCfg && appCfg.bundleResourceMetrics && typeof appCfg.bundleResourceMetrics === 'object'
     ? appCfg.bundleResourceMetrics
@@ -197,7 +214,14 @@ function manifestEntry(entry, outDir, extra = {}) {
     size = buf.length;
     if (!hash) hash = sha256(buf);
   }
-  const out = { url: entry.url, file: entry.file, mime: extra.mime || entry.mime || mimeOf(entry.file), size, hash };
+  const mime = extra.mime || entry.mime || mimeOf(entry.file);
+  const out = { url: entry.url, file: entry.file, mime, size, hash };
+  // Explicitly imported HTML fragments are safe to serve from the bundle. Main documents
+  // remain controlled by the SWR setting and must not become permanently cached here.
+  if (entry.doc === true || extra.doc === true ||
+      (String(mime).toLowerCase().startsWith('text/html') && entry.file !== 'home.html')) {
+    out.doc = true;
+  }
   if (typeof extra.costMs === 'number') out.costMs = extra.costMs;
   if (extra.source) out.source = extra.source;
   return out;
@@ -697,13 +721,21 @@ function buildConfigOnlyBundle(appCfg, reason = null) {
 async function buildServerCache(appCfg) {
   const origin = new URL(appCfg.url).origin;
   let discovered;
+  let discoveryWarning = '';
   try {
     discovered = await discoverResources(appCfg); // 通用发现(Next + CRA/AEM 等)
   } catch (e) {
-    if (configJsonText(appCfg).length > 0) {
+    const configuredResources = configuredResourceEntries(appCfg);
+    if (configuredResources.length > 0) {
+      // Protected entry pages may reject the server crawler. Explicit admin URLs are
+      // still authoritative and must be built instead of being replaced by JSON only.
+      discovered = { html: '', htmlHash: '', resources: configuredResources };
+      discoveryWarning = String(e && e.message || e);
+    } else if (configJsonText(appCfg).length > 0) {
       return buildConfigOnlyBundle(appCfg, e);
+    } else {
+      throw e;
     }
-    throw e;
   }
 
   const outDir = path.join(BUNDLES_DIR, appCfg.id);
@@ -715,7 +747,7 @@ async function buildServerCache(appCfg) {
   const manifest = [];
   const homeEntry = discovered.resources.find((e) => e.file === 'home.html');
   let total = 0;
-  if (appCfg.swrDoc === true) {
+  if (appCfg.swrDoc === true && homeEntry && discovered.html) {
     fs.writeFileSync(path.join(tmpDir, 'home.html'), discovered.html, 'utf8');
     // hash:内容指纹,设备据此判断该文件是否需要更新(同 URL 内容变了 → hash 变)
     const home = manifestEntry(homeEntry || { url: origin + '/', file: 'home.html', mime: 'text/html' }, tmpDir);
@@ -770,7 +802,9 @@ async function buildServerCache(appCfg) {
   const compressedTotal = compressed.reduce((sum, entry) => sum + Number(entry.size || 0), 0);
   fs.rmSync(outDir, { recursive: true, force: true });
   fs.renameSync(tmpDir, outDir);
-  return { id: appCfg.id, count: manifest.length, discovered: discovered.resources.length, failed, skipped, skippedByPolicy, skippedByConfig, kb: Math.round(total / 1024), compressedKB: Math.round(compressedTotal / 1024), builtAt: new Date().toISOString(), mode: 'server-cache' };
+  const result = { id: appCfg.id, count: manifest.length, discovered: discovered.resources.length, failed, skipped, skippedByPolicy, skippedByConfig, kb: Math.round(total / 1024), compressedKB: Math.round(compressedTotal / 1024), builtAt: new Date().toISOString(), mode: 'server-cache' };
+  if (discoveryWarning) result.warning = discoveryWarning;
+  return result;
 }
 
 function buildCacheManifest(appCfg) {

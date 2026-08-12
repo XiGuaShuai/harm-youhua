@@ -15,6 +15,8 @@ harm-youhua 提供两部分能力:
 
 这不是把离线包打进 HAP,也不是端侧访问网页后自动抓资源缓存。
 
+如果某个站点的 H5 配置 JSON 由第三方后台维护,后台会定时登录并把最新 `configJson` 同步到 `/api/config` 对应的 app 项;SDK 侧仍然只负责拉 `/api/config`,不需要新增必须接入的 API。
+
 ## 当前不做的能力
 
 1. 不做端侧运行时静态资源自动缓存。
@@ -30,6 +32,8 @@ harm-youhua 提供两部分能力:
 
 ```text
 bundle=true                  # 开启离线包
+scope=top|region             # TOP 初始化拉取;地区包切区时拉取
+regions=["地区ID1","地区ID2"] # 同一网站可绑定多个地区
 manifestUrl                  # 原始 manifest
 compressedManifestUrl         # 压缩 manifest,新 SDK 优先使用
 bundleVersion                 # 原始 manifest 指纹
@@ -41,12 +45,14 @@ SDK 初始化流程:
 1. 拉 `/api/config`。
 2. 确认配置来源是服务端最新配置。
 3. 遍历后台返回的 `apps`。
-4. 对 `bundle:true` 且有 manifest 的站点全部启动离线包下载。
+4. 初始化时只下载 `scope:top` 的常驻包;调用 `switchRegion(regionId)` 后下载 `regions` 包含该 ID 的地区包。
 5. 旧沙箱缓存配置只用于兜底展示,不会抢先触发全量下载。
 6. 写入接入方应用沙箱。
 7. WebView 请求同一个原站 URL 时,SDK 拦截并返回本地资源。
 
-后台有多个 `bundle:true` 站点时,端侧会逐站进入下载队列,不是只下载当前打开页面对应的离线包。这样首次安装后只要应用启动并成功拉到服务端配置,所有已开启离线包的站点都会开始准备。
+同一应用可以配置多个地区 ID,但后台离线包仍按应用 `id` 只构建一份。切换到任一关联地区时,SDK 将这一份离线包写入当前地区缓存;离开该地区后删除该地区归属的缓存,TOP 缓存不受影响。
+
+接入方必须调用 `WebAccel.matchesRegion(app, currentRegion)` 判断地区,不能直接比较 `app.region`。`region` 只保留第一个 ID 给旧 SDK 兼容。
 
 这个策略的代价是首装会产生集中下载和沙箱占用增长,所以后台必须控制总大小,尤其不要把图片、视频、非关键字体等低收益大资源随意放入离线包。
 
@@ -81,7 +87,7 @@ WebView 请求原站 URL
 端侧发现新版本的方式只有两种:
 
 1. 重新打开应用,SDK 重新初始化并拉 `/api/config`。
-2. 接入方主动调用 `WebAccel.refreshConfig()`。
+2. 接入方主动调用 `WebAccel.refreshConfig()`;刷新成功后 SDK 会立即按当前地区重新匹配并下载地区包,无需再次切区。
 
 当前不是后台改完后实时推送到端侧。如果要实时更新,后续需要增加推送、长连接或定时轮询。
 
