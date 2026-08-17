@@ -20,10 +20,11 @@ import { buildFromConsensus } from './consensus-builder.js';
 import { detectSite } from './cache-builder.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const DATA_FILE = path.join(__dirname, 'data', 'config.json');
-const USERS_FILE = path.join(__dirname, 'data', 'users.json');
-const SESSIONS_FILE = path.join(__dirname, 'data', 'sessions.json');
-const BUNDLES_DIR = path.join(__dirname, 'bundles');
+const DATA_DIR = process.env.DATA_DIR ? path.resolve(process.env.DATA_DIR) : path.join(__dirname, 'data');
+const DATA_FILE = path.join(DATA_DIR, 'config.json');
+const USERS_FILE = path.join(DATA_DIR, 'users.json');
+const SESSIONS_FILE = path.join(DATA_DIR, 'sessions.json');
+const BUNDLES_DIR = process.env.BUNDLES_DIR ? path.resolve(process.env.BUNDLES_DIR) : path.join(__dirname, 'bundles');
 const CACHE_BUILDER = path.join(__dirname, 'cache-builder.js');
 // 管理界面构建产物(admin/web/dist);容器内由 Dockerfile 置于 /app/web/dist 并用 WEB_DIST 指定
 const WEB_DIST = process.env.WEB_DIST || path.join(__dirname, '..', 'web', 'dist');
@@ -35,6 +36,9 @@ const MASTER_TOKEN = process.env.ADMIN_TOKEN || '';
 const DEFAULT_USER = process.env.ADMIN_USER || 'admin';
 const DEFAULT_PASS = process.env.ADMIN_PASS || 'admin123';
 const SESSION_TTL_MS = 7 * 24 * 3600 * 1000; // 登录态有效期 7 天
+const CONFIG_ENVIRONMENTS = ['test', 'pre', 'prod'];
+const CONFIG_ENVIRONMENT_LABELS = { test: '测试', pre: '预发', prod: '正式' };
+const DEFAULT_CONFIG_ENVIRONMENT = normalizeConfigEnvironment(process.env.DEFAULT_CONFIG_ENV, 'test');
 
 fs.mkdirSync(path.dirname(DATA_FILE), { recursive: true });
 fs.mkdirSync(BUNDLES_DIR, { recursive: true });
@@ -213,9 +217,61 @@ function looksLikePlaceholderText(value) {
   return /^[?\s._-]+$/.test(s);
 }
 
+function normalizeConfigEnvironment(value, fallback = DEFAULT_CONFIG_ENVIRONMENT || 'test') {
+  const env = String(value || '').trim().toLowerCase();
+  return CONFIG_ENVIRONMENTS.includes(env) ? env : fallback;
+}
+
+function configEnvironmentLabel(environment) {
+  const env = normalizeConfigEnvironment(environment, 'test');
+  return CONFIG_ENVIRONMENT_LABELS[env] || env;
+}
+
+function normalizeConfigJsonEnvironment(input, fallback = {}) {
+  const raw = input && typeof input === 'object' && !Array.isArray(input) ? input : {};
+  const legacy = fallback && typeof fallback === 'object' && !Array.isArray(fallback) ? fallback : {};
+  const configJson = typeof raw.configJson === 'string'
+    ? raw.configJson
+    : (typeof legacy.configJson === 'string' ? legacy.configJson : '');
+  return {
+    configJson,
+    configJsonFileName: String(raw.configJsonFileName || legacy.configJsonFileName || '').trim(),
+    configJsonSyncedAt: String(raw.configJsonSyncedAt || legacy.configJsonSyncedAt || '').trim(),
+    configJsonSync: normalizeConfigJsonSync(raw.configJsonSync || legacy.configJsonSync)
+  };
+}
+
+function normalizeConfigJsonEnvironments(appCfg) {
+  const configured = appCfg && appCfg.configJsonEnvironments &&
+    typeof appCfg.configJsonEnvironments === 'object' && !Array.isArray(appCfg.configJsonEnvironments)
+    ? appCfg.configJsonEnvironments
+    : {};
+  const legacyTest = {
+    configJson: appCfg && appCfg.configJson,
+    configJsonFileName: appCfg && appCfg.configJsonFileName,
+    configJsonSyncedAt: appCfg && appCfg.configJsonSyncedAt,
+    configJsonSync: appCfg && appCfg.configJsonSync
+  };
+  const result = {};
+  for (const environment of CONFIG_ENVIRONMENTS) {
+    result[environment] = normalizeConfigJsonEnvironment(
+      configured[environment],
+      environment === 'test' ? legacyTest : {}
+    );
+  }
+  return result;
+}
+
+function configJsonEnvironmentOf(appCfg, environment) {
+  const env = normalizeConfigEnvironment(environment, 'test');
+  return normalizeConfigJsonEnvironments(appCfg)[env];
+}
+
 function recoverConfigJsonTitle(appCfg) {
   try {
-    const parsed = JSON.parse(String(appCfg && appCfg.configJson || '').trim());
+    const environments = normalizeConfigJsonEnvironments(appCfg);
+    const first = CONFIG_ENVIRONMENTS.map((environment) => environments[environment].configJson).find(Boolean) || '';
+    const parsed = JSON.parse(String(first).trim());
     const title = String(parsed && parsed.title || '').trim();
     return title || '';
   } catch {
@@ -262,7 +318,8 @@ function normalizeConfigJsonSync(input) {
     configBody: String(raw.configBody || '').trim(),
     tokenPath: String(raw.tokenPath || '').trim(),
     tokenHeader: String(raw.tokenHeader || 'Authorization').trim(),
-    tokenPrefix: String(raw.tokenPrefix || 'Bearer ').trim(),
+    // tokenPrefix 的尾部空格有语义（例如 "Bearer "），不能 trim 掉。
+    tokenPrefix: raw.tokenPrefix === undefined || raw.tokenPrefix === null ? 'Bearer ' : String(raw.tokenPrefix),
     configPath: String(raw.configPath || '').trim()
   };
   return out;
@@ -277,9 +334,21 @@ function redactConfigJsonSync(sync) {
   const s = normalizeConfigJsonSync(sync);
   return Object.assign({}, s, {
     loginBody: s.loginBody ? '******' : '',
+    configBody: s.configBody ? '******' : '',
     loginHeaders: redactSecretObject(s.loginHeaders),
     configHeaders: redactSecretObject(s.configHeaders)
   });
+}
+
+function redactConfigJsonEnvironments(appCfg) {
+  const environments = normalizeConfigJsonEnvironments(appCfg);
+  const result = {};
+  for (const environment of CONFIG_ENVIRONMENTS) {
+    result[environment] = Object.assign({}, environments[environment], {
+      configJsonSync: redactConfigJsonSync(environments[environment].configJsonSync)
+    });
+  }
+  return result;
 }
 
 function redactSecretObject(obj) {
@@ -301,9 +370,29 @@ function mergeMaskedObject(next, prev) {
   return out;
 }
 
-function publicAppConfig(appCfg) {
+function mergeMaskedConfigJsonEnvironments(nextApp, previousApp) {
+  const next = normalizeConfigJsonEnvironments(nextApp);
+  const previous = normalizeConfigJsonEnvironments(previousApp);
+  for (const environment of CONFIG_ENVIRONMENTS) {
+    const sync = next[environment].configJsonSync;
+    const oldSync = previous[environment].configJsonSync;
+    if (sync.loginBody === '******') sync.loginBody = oldSync.loginBody;
+    if (sync.configBody === '******') sync.configBody = oldSync.configBody;
+    sync.loginHeaders = mergeMaskedObject(sync.loginHeaders, oldSync.loginHeaders);
+    sync.configHeaders = mergeMaskedObject(sync.configHeaders, oldSync.configHeaders);
+  }
+  return next;
+}
+
+function publicAppConfig(appCfg, requestedEnvironment = 'test') {
   const a = normalizeAppConfig(appCfg);
-  delete a.configJsonSync;
+  const environment = normalizeConfigEnvironment(requestedEnvironment, 'test');
+  const envConfig = a.configJsonEnvironments[environment];
+  a.configJson = envConfig.configJson;
+  a.configJsonFileName = envConfig.configJsonFileName;
+  a.configJsonSyncedAt = envConfig.configJsonSyncedAt;
+  a.configEnvironment = environment;
+  delete a.configJsonEnvironments;
   return a;
 }
 
@@ -318,9 +407,11 @@ function normalizeAppConfig(appCfg) {
   // region/regionName remain for older SDK releases. New clients must use regions[].
   a.region = a.regions.length > 0 ? a.regions[0] : '';
   a.regionName = a.region ? (a.regionNames[a.region] || a.region) : '';
-  if (typeof a.configJson !== 'string') a.configJson = '';
-  a.configJsonFileName = String(a.configJsonFileName || '').trim();
-  a.configJsonSync = normalizeConfigJsonSync(a.configJsonSync);
+  a.configJsonEnvironments = normalizeConfigJsonEnvironments(a);
+  delete a.configJson;
+  delete a.configJsonFileName;
+  delete a.configJsonSyncedAt;
+  delete a.configJsonSync;
   return repairAppDisplayNames(a);
 }
 
@@ -345,32 +436,36 @@ function validateAppConfigForWebsdk(appCfg) {
   if (a.scope === 'region' && a.regions.length === 0) {
     return `应用 ${a.id}: 地区应用必须至少填写一个地区 ID`;
   }
-  if (a.configJson && a.configJson.trim()) {
-    let json;
-    try {
-      json = JSON.parse(a.configJson);
-    } catch {
-      return `应用 ${a.id}: 配置 JSON 格式错误`;
+  for (const environment of CONFIG_ENVIRONMENTS) {
+    const label = configEnvironmentLabel(environment);
+    const envConfig = a.configJsonEnvironments[environment];
+    if (envConfig.configJson && envConfig.configJson.trim()) {
+      let json;
+      try {
+        json = JSON.parse(envConfig.configJson);
+      } catch {
+        return `应用 ${a.id} [${label}]: 配置 JSON 格式错误`;
+      }
+      const configUrl = String(json && json.url || '').trim();
+      if (!configUrl) {
+        return `应用 ${a.id} [${label}]: 配置 JSON 必须包含 url 字段`;
+      }
+      const configOrigin = originOf(configUrl);
+      if (!configOrigin) {
+        return `应用 ${a.id} [${label}]: 配置 JSON 的 url 不是有效地址`;
+      }
+      if (configOrigin !== appOrigin) {
+        return `应用 ${a.id} [${label}]: 配置 JSON 的 url 必须和应用 URL 同源`;
+      }
     }
-    const configUrl = String(json && json.url || '').trim();
-    if (!configUrl) {
-      return `应用 ${a.id}: 配置 JSON 必须包含 url 字段`;
-    }
-    const configOrigin = originOf(configUrl);
-    if (!configOrigin) {
-      return `应用 ${a.id}: 配置 JSON 的 url 不是有效地址`;
-    }
-    if (configOrigin !== appOrigin) {
-      return `应用 ${a.id}: 配置 JSON 的 url 必须和应用 URL 同源`;
-    }
-  }
-  const sync = a.configJsonSync || {};
-  if (sync.enabled) {
-    if (!originOf(sync.loginUrl)) {
-      return `应用 ${a.id}: JSON 同步登录 URL 必须是 http(s):// 开头的完整地址`;
-    }
-    if (!originOf(sync.configUrl)) {
-      return `应用 ${a.id}: JSON 同步配置接口 URL 必须是 http(s):// 开头的完整地址`;
+    const sync = envConfig.configJsonSync || {};
+    if (sync.enabled) {
+      if (!originOf(sync.loginUrl)) {
+        return `应用 ${a.id} [${label}]: JSON 同步登录 URL 必须是 http(s):// 开头的完整地址`;
+      }
+      if (!originOf(sync.configUrl)) {
+        return `应用 ${a.id} [${label}]: JSON 同步配置接口 URL 必须是 http(s):// 开头的完整地址`;
+      }
     }
   }
   return '';
@@ -421,8 +516,8 @@ function runCacheBuilder(mode, appId) {
 // 结果写 data/auto-update-log.json,后台可查"上次自动更新时间/结果"。函数定义见文件末尾(会提升)。
 const AUTO_UPDATE_INTERVAL_MS = 24 * 60 * 60 * 1000; // 一天一次
 const AUTO_UPDATE_FIRST_DELAY_MS = 60 * 1000;        // 服务启动 1 分钟后先跑一次
-const AUTO_UPDATE_LOG = path.join(__dirname, 'data', 'auto-update-log.json');
-const CONFIG_JSON_SYNC_LOG = path.join(__dirname, 'data', 'config-json-sync-log.json');
+const AUTO_UPDATE_LOG = path.join(DATA_DIR, 'auto-update-log.json');
+const CONFIG_JSON_SYNC_LOG = path.join(DATA_DIR, 'config-json-sync-log.json');
 let autoUpdateRunning = false;
 let configJsonSyncRunning = false;
 let configJsonSyncTimer = null;
@@ -430,18 +525,27 @@ let configJsonSyncTimer = null;
 // ——————————————— Express ———————————————
 const app = express();
 app.use(cors());
-app.use(express.json({ limit: '4mb' }));
+// 三套 configJson 会随管理配置一起提交；共享离线资源不重复，但 JSON 总量可能超过原 4MB。
+app.use(express.json({ limit: '16mb' }));
 
 // 同源托管管理界面(admin/web 构建产物):静态资源命中即返回,未命中则交给后续路由。
 // 本地用 vite(5174)代理调试时 WEB_DIST 不存在,此块自动跳过,不影响开发流程。
 if (fs.existsSync(WEB_DIST)) app.use(express.static(WEB_DIST));
 
-// 鸿蒙 App 开机拉取(公开)
-// 对启用离线包且服务端已有缓存清单的 app,附上 manifestUrl —— App 据此去服务器下载缓存资源
-app.get('/api/config', (req, res) => {
+function requestConfigEnvironment(req) {
+  return normalizeConfigEnvironment(
+    req.params && req.params.environment || req.query && req.query.env || req.headers['x-webaccel-environment'],
+    DEFAULT_CONFIG_ENVIRONMENT
+  );
+}
+
+// 鸿蒙 App 开机拉取(公开)。应用/离线包配置共享，只有 configJson 按环境覆盖。
+// 支持 /api/config?env=pre 和 /pre/api/config；无环境参数时兼容旧客户端，默认 test。
+function sendPublicConfig(req, res) {
+  const environment = requestConfigEnvironment(req);
   const c = loadConfig();
   const apps = (c.apps || []).map((a) => {
-    const appCfg = publicAppConfig(a);
+    const appCfg = publicAppConfig(a, environment);
     const mfPath = path.join(BUNDLES_DIR, appCfg.id, 'manifest.json');
     const compressedMfPath = path.join(BUNDLES_DIR, appCfg.id, 'manifest.zz.json');
     const hasBundle = fs.existsSync(mfPath);
@@ -475,11 +579,16 @@ app.get('/api/config', (req, res) => {
     k: s.exploreK || 3,
     sample: typeof s.exploreSample === 'number' ? s.exploreSample : 0.1
   };
-  res.json(Object.assign({}, c, { apps, regions: configRegions(apps), explore }));
-});
+  res.set('X-WebAccel-Environment', environment);
+  res.json(Object.assign({}, c, { environment, apps, regions: configRegions(apps), explore }));
+}
+app.get('/api/config', sendPublicConfig);
+app.get('/:environment(test|pre|prod)/api/config', sendPublicConfig);
 
 // 离线包静态托管:App 从 /bundles/<id>/manifest.json 拉取
 app.use('/bundles', express.static(BUNDLES_DIR));
+// 环境路径只选择 configJson；离线资源仍指向同一个物理目录。
+app.use('/:environment(test|pre|prod)/bundles', express.static(BUNDLES_DIR));
 
 // ——————————————— 众包上报(设备探索结果)———————————————
 // 设备打开某 app 时,把加载到的静态资源 {url, hash, mime, size} 报上来(公开接口,带限频/校验)。
@@ -661,10 +770,14 @@ app.get('/api/admin/config', (req, res) => {
   const c = loadConfig();
   const apps = (c.apps || []).map((a) => {
     const appCfg = normalizeAppConfig(a);
-    appCfg.configJsonSync = redactConfigJsonSync(appCfg.configJsonSync);
+    appCfg.configJsonEnvironments = redactConfigJsonEnvironments(appCfg);
     return appCfg;
   });
-  res.json(Object.assign({}, c, { apps, regions: configRegions(apps) }));
+  res.json(Object.assign({}, c, {
+    apps,
+    regions: configRegions(apps),
+    configEnvironments: CONFIG_ENVIRONMENTS.map((id) => ({ id, name: configEnvironmentLabel(id) }))
+  }));
 });
 app.put('/api/admin/apps', (req, res) => {
   const c = loadConfig();
@@ -672,10 +785,8 @@ app.put('/api/admin/apps', (req, res) => {
   const nextApps = (req.body.apps || []).map((a) => {
     const appCfg = normalizeAppConfig(a);
     const prev = previousById.get(appCfg.id);
-    if (prev && appCfg.configJsonSync) {
-      if (appCfg.configJsonSync.loginBody === '******') appCfg.configJsonSync.loginBody = prev.configJsonSync.loginBody;
-      appCfg.configJsonSync.loginHeaders = mergeMaskedObject(appCfg.configJsonSync.loginHeaders, prev.configJsonSync.loginHeaders);
-      appCfg.configJsonSync.configHeaders = mergeMaskedObject(appCfg.configJsonSync.configHeaders, prev.configJsonSync.configHeaders);
+    if (prev) {
+      appCfg.configJsonEnvironments = mergeMaskedConfigJsonEnvironments(appCfg, prev);
     }
     return appCfg;
   }).filter((a) => a.id && a.url);
@@ -734,8 +845,13 @@ app.get('/api/admin/auto-update/log', (req, res) => {
 
 app.post('/api/admin/config-json-sync/run', async (req, res) => {
   const appId = String(req.body && req.body.appId || '').trim();
+  const requestedEnvironment = String(req.body && req.body.environment || '').trim();
+  const environment = requestedEnvironment ? normalizeConfigEnvironment(requestedEnvironment, '') : '';
+  if (requestedEnvironment && !environment) {
+    return res.status(400).json({ ok: false, error: 'environment 必须是 test/pre/prod' });
+  }
   try {
-    const log = await runConfigJsonSyncOnce(appId ? 'manual-app' : 'manual', appId);
+    const log = await runConfigJsonSyncOnce(appId ? 'manual-app' : 'manual', appId, environment);
     res.json({ ok: true, log });
   } catch (e) {
     res.status(500).json({ ok: false, error: String(e && e.message || e) });
@@ -788,15 +904,28 @@ function safeConfigJsonFileName(name, appId) {
   return base.toLowerCase().endsWith('.json') ? base : `${base}.json`;
 }
 
-function configJsonInfo(appCfg) {
-  const text = typeof appCfg.configJson === 'string' ? appCfg.configJson : '';
+function configJsonInfo(appCfg, requestedEnvironment = DEFAULT_CONFIG_ENVIRONMENT) {
+  const environment = normalizeConfigEnvironment(requestedEnvironment, DEFAULT_CONFIG_ENVIRONMENT);
+  const envConfig = configJsonEnvironmentOf(appCfg, environment);
+  const text = envConfig.configJson;
   const bytes = Buffer.byteLength(text, 'utf8');
   return {
+    environment,
     hasConfigJson: text.length > 0,
-    configJsonFileName: safeConfigJsonFileName(appCfg.configJsonFileName, appCfg.id),
+    configJsonFileName: safeConfigJsonFileName(envConfig.configJsonFileName, appCfg.id),
     configJsonBytes: bytes,
-    configJsonSizeKB: Math.round(bytes / 102.4) / 10
+    configJsonSizeKB: Math.round(bytes / 102.4) / 10,
+    configJsonSyncedAt: envConfig.configJsonSyncedAt,
+    syncEnabled: envConfig.configJsonSync.enabled === true
   };
+}
+
+function configJsonEnvironmentInfo(appCfg) {
+  const result = {};
+  for (const environment of CONFIG_ENVIRONMENTS) {
+    result[environment] = configJsonInfo(appCfg, environment);
+  }
+  return result;
 }
 
 function readPathValue(input, dotPath) {
@@ -861,11 +990,12 @@ async function fetchForConfigSync(url, method, headers, bodyText) {
   return { res, text };
 }
 
-async function syncConfigJsonForApp(appCfg) {
+async function syncConfigJsonForApp(appCfg, requestedEnvironment) {
   const app = normalizeAppConfig(appCfg);
-  const sync = app.configJsonSync || {};
-  if (!sync.enabled) return { id: app.id, skipped: true, reason: 'disabled' };
-  if (!hasConfigJsonSyncSource(sync)) return { id: app.id, skipped: true, reason: 'no sync source' };
+  const environment = normalizeConfigEnvironment(requestedEnvironment, 'test');
+  const sync = app.configJsonEnvironments[environment].configJsonSync || {};
+  if (!sync.enabled) return { id: app.id, environment, skipped: true, reason: 'disabled' };
+  if (!hasConfigJsonSyncSource(sync)) return { id: app.id, environment, skipped: true, reason: 'no sync source' };
   const loginHeaders = parseHeadersObject(sync.loginHeaders);
   const loginBody = sync.loginBody && sync.loginBody !== '******' ? sync.loginBody : '';
   const login = await fetchForConfigSync(sync.loginUrl, sync.loginMethod || 'POST', loginHeaders, loginBody);
@@ -892,13 +1022,14 @@ async function syncConfigJsonForApp(appCfg) {
   JSON.parse(configText);
   return {
     id: app.id,
+    environment,
     skipped: false,
     configJson: configText,
     bytes: Buffer.byteLength(configText, 'utf8')
   };
 }
 
-async function runConfigJsonSyncOnce(trigger = 'scheduled', onlyAppId = '') {
+async function runConfigJsonSyncOnce(trigger = 'scheduled', onlyAppId = '', onlyEnvironment = '') {
   if (configJsonSyncRunning) {
     return { running: true, skipped: true, reason: 'previous sync still running' };
   }
@@ -908,33 +1039,59 @@ async function runConfigJsonSyncOnce(trigger = 'scheduled', onlyAppId = '') {
   const results = [];
   let changed = false;
   try {
-    for (const appCfg of (cfg.apps || [])) {
-      const app = normalizeAppConfig(appCfg);
-      if (onlyAppId && app.id !== onlyAppId) continue;
-      const item = { id: app.id, name: app.name || app.id, ok: true, changed: false, detail: '' };
-      try {
-        const synced = await syncConfigJsonForApp(app);
-        if (!synced.skipped) {
-          const idx = (cfg.apps || []).findIndex((a) => a.id === app.id);
-          if (idx >= 0 && cfg.apps[idx].configJson !== synced.configJson) {
-            cfg.apps[idx].configJson = synced.configJson;
-            cfg.apps[idx].configJsonFileName = cfg.apps[idx].configJsonFileName || `${app.id}.json`;
-            cfg.apps[idx].configJsonSyncedAt = new Date().toISOString();
-            changed = true;
-            item.changed = true;
+    const environments = onlyEnvironment
+      ? [normalizeConfigEnvironment(onlyEnvironment, 'test')]
+      : CONFIG_ENVIRONMENTS;
+    for (const environment of environments) {
+      for (const appCfg of (cfg.apps || [])) {
+        const app = normalizeAppConfig(appCfg);
+        if (onlyAppId && app.id !== onlyAppId) continue;
+        const item = {
+          id: app.id,
+          name: app.name || app.id,
+          environment,
+          environmentName: configEnvironmentLabel(environment),
+          ok: true,
+          changed: false,
+          detail: ''
+        };
+        try {
+          const synced = await syncConfigJsonForApp(app, environment);
+          if (!synced.skipped) {
+            const idx = (cfg.apps || []).findIndex((a) => a.id === app.id);
+            if (idx >= 0) {
+              const normalized = normalizeAppConfig(cfg.apps[idx]);
+              const envConfig = normalized.configJsonEnvironments[environment];
+              if (envConfig.configJson !== synced.configJson) {
+                envConfig.configJson = synced.configJson;
+                envConfig.configJsonFileName = envConfig.configJsonFileName || `${app.id}-${environment}.json`;
+                envConfig.configJsonSyncedAt = new Date().toISOString();
+                cfg.apps[idx] = normalized;
+                changed = true;
+                item.changed = true;
+              }
+            }
+            item.detail = `同步 ${synced.bytes} bytes`;
+          } else {
+            item.detail = synced.reason ? `跳过: ${synced.reason}` : '跳过';
           }
-          item.detail = `同步 ${synced.bytes} bytes`;
-        } else {
-          item.detail = synced.reason ? `跳过: ${synced.reason}` : '跳过';
+        } catch (e) {
+          item.ok = false;
+          item.detail = String(e && e.message || e);
         }
-      } catch (e) {
-        item.ok = false;
-        item.detail = String(e && e.message || e);
+        results.push(item);
       }
-      results.push(item);
     }
     if (changed) saveConfig(cfg);
-    const log = { startedAt, finishedAt: new Date().toISOString(), trigger, onlyAppId, changed, results };
+    const log = {
+      startedAt,
+      finishedAt: new Date().toISOString(),
+      trigger,
+      onlyAppId,
+      onlyEnvironment,
+      changed,
+      results
+    };
     try { fs.writeFileSync(CONFIG_JSON_SYNC_LOG, JSON.stringify(log, null, 2), 'utf8'); } catch {}
     return log;
   } finally {
@@ -1272,6 +1429,7 @@ function bundleInfo(id, appCfg) {
   const serverBytes = fs.readdirSync(dir)
     .reduce((s, f) => s + fs.statSync(path.join(dir, f)).size, 0);
   const cfgJson = appCfg ? configJsonInfo(appCfg) : configJsonInfo({ id });
+  const cfgJsonEnvironments = appCfg ? configJsonEnvironmentInfo(appCfg) : {};
   return {
     id,
     name: appCfg && appCfg.name ? appCfg.name : id,
@@ -1283,6 +1441,7 @@ function bundleInfo(id, appCfg) {
     configJsonFileName: cfgJson.configJsonFileName,
     configJsonBytes: cfgJson.configJsonBytes,
     configJsonSizeKB: cfgJson.configJsonSizeKB,
+    configJsonEnvironments: cfgJsonEnvironments,
     count: resources.length,
     sizeBytes: resourceBytes,
     sizeKB: Math.round(resourceBytes / 102.4) / 10,
@@ -1302,6 +1461,7 @@ function bundleInfo(id, appCfg) {
       configJsonFileName: cfgJson.configJsonFileName,
       configJsonBytes: cfgJson.configJsonBytes,
       configJsonSizeKB: cfgJson.configJsonSizeKB,
+      configJsonEnvironments: cfgJsonEnvironments,
       swrDoc: appCfg ? appCfg.swrDoc !== false : false,
       prerender: appCfg ? appCfg.prerender !== false : false,
       bundleMaxSizeKB: appCfg && appCfg.bundleMaxSizeKB ? appCfg.bundleMaxSizeKB : 5120,
@@ -1333,6 +1493,7 @@ app.get('/api/admin/bundles', (req, res) => {
     seen.add(appCfg.id);
     const info = bundleInfo(appCfg.id, appCfg);
     const cfgJson = configJsonInfo(appCfg);
+    const cfgJsonEnvironments = configJsonEnvironmentInfo(appCfg);
     out.push(info || {
       id: appCfg.id,
       name: appCfg.name || appCfg.id,
@@ -1344,6 +1505,7 @@ app.get('/api/admin/bundles', (req, res) => {
       configJsonFileName: cfgJson.configJsonFileName,
       configJsonBytes: cfgJson.configJsonBytes,
       configJsonSizeKB: cfgJson.configJsonSizeKB,
+      configJsonEnvironments: cfgJsonEnvironments,
       count: 0,
       sizeBytes: 0,
       sizeKB: 0,
@@ -1363,6 +1525,7 @@ app.get('/api/admin/bundles', (req, res) => {
         configJsonFileName: cfgJson.configJsonFileName,
         configJsonBytes: cfgJson.configJsonBytes,
         configJsonSizeKB: cfgJson.configJsonSizeKB,
+        configJsonEnvironments: cfgJsonEnvironments,
         swrDoc: appCfg.swrDoc !== false,
         prerender: appCfg.prerender !== false,
         bundleMaxSizeKB: appCfg.bundleMaxSizeKB || 5120,
@@ -1385,11 +1548,15 @@ app.get('/api/admin/bundles', (req, res) => {
 
 app.put('/api/admin/bundles/:id/config-json', async (req, res) => {
   const c = loadConfig();
-  const appCfg = (c.apps || []).find((a) => a.id === req.params.id);
-  if (!appCfg) return res.status(404).json({ error: 'app not found' });
+  const appIndex = (c.apps || []).findIndex((a) => a.id === req.params.id);
+  if (appIndex < 0) return res.status(404).json({ error: 'app not found' });
+  const appCfg = normalizeAppConfig(c.apps[appIndex]);
+  const requestedEnvironment = String(req.body && req.body.environment || DEFAULT_CONFIG_ENVIRONMENT).trim();
+  const environment = normalizeConfigEnvironment(requestedEnvironment, '');
+  if (!environment) return res.status(400).json({ error: 'environment 必须是 test/pre/prod' });
 
   const text = String((req.body && (req.body.configJson ?? req.body.text)) || '').trim();
-  const fileName = safeConfigJsonFileName(req.body && req.body.fileName, appCfg.id);
+  const fileName = safeConfigJsonFileName(req.body && req.body.fileName, `${appCfg.id}-${environment}`);
   if (text.length > 0) {
     try {
       JSON.parse(text);
@@ -1398,34 +1565,21 @@ app.put('/api/admin/bundles/:id/config-json', async (req, res) => {
     }
   }
 
-  appCfg.configJson = text;
-  appCfg.configJsonFileName = fileName;
+  const envConfig = appCfg.configJsonEnvironments[environment];
+  envConfig.configJson = text;
+  envConfig.configJsonFileName = fileName;
+  envConfig.configJsonSyncedAt = new Date().toISOString();
   if (text.length > 0 && req.body && req.body.enableBundle !== false) appCfg.bundle = true;
+  c.apps[appIndex] = appCfg;
   saveConfig(c);
-
-  let manifest = null;
-  try {
-    const dir = path.join(BUNDLES_DIR, appCfg.id);
-    if (fs.existsSync(dir) && fs.readdirSync(dir).some((f) => f !== 'manifest.json' && f !== 'manifest.zz.json')) {
-      manifest = await runCacheBuilder('manifest', appCfg.id);
-    } else if (appCfg.bundle === true) {
-      manifest = await runCacheBuilder('build', appCfg.id);
-    }
-  } catch (e) {
-    return res.status(500).json({
-      ok: false,
-      saved: true,
-      error: String(e && e.message || e),
-      configJson: configJsonInfo(appCfg),
-      bundle: bundleInfo(appCfg.id, appCfg)
-    });
-  }
 
   res.json({
     ok: true,
     saved: true,
-    manifest,
-    configJson: configJsonInfo(appCfg),
+    environment,
+    // configJson 与离线资源解耦，更新 JSON 不再重建共享 manifest。
+    manifest: null,
+    configJson: configJsonInfo(appCfg, environment),
     bundle: bundleInfo(appCfg.id, appCfg)
   });
 });
@@ -1691,6 +1845,8 @@ app.listen(PORT, () => {
   console.log(`  离线包托管:      http://localhost:${PORT}/bundles/<id>/manifest.json`);
   console.log(`  后台登录:        账号 ${DEFAULT_USER} / 密码 ${DEFAULT_PASS}  (首登后可在后台改;或用 ADMIN_USER/ADMIN_PASS 环境变量)`);
   if (MASTER_TOKEN) console.log(`  主令牌已开启:    X-Admin-Token: <ADMIN_TOKEN>(脚本用)`);
-  startAutoUpdateScheduler(); // 启动定时自动更新
-  startConfigJsonSyncScheduler(); // 启动每天中午 configJson 同步
+  if (process.env.DISABLE_SCHEDULERS !== '1') {
+    startAutoUpdateScheduler(); // 启动定时自动更新
+    startConfigJsonSyncScheduler(); // 启动每天中午 configJson 同步
+  }
 });

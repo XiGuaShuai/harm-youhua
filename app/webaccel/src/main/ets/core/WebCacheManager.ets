@@ -1120,7 +1120,8 @@ class WebCacheManager {
    * @param manifestUrl 后台 manifest 全地址(如 http://server:8787/bundles/<id>/manifest.json)
    */
   async loadRemoteBundle(siteUrl: string, manifestUrl: string, bundleVersion: string = '',
-    appId: string = '', region: string = '', scope: string = 'app', configJson: string = ''): Promise<void> {
+    appId: string = '', region: string = '', scope: string = 'app', configJson: string = '',
+    configJsonAuthoritative: boolean = false): Promise<void> {
     const om = siteUrl.match(/^https?:\/\/[^\/]+/);
     const origin: string = om ? om[0] : '';
     if (origin.length === 0 || manifestUrl.length === 0) {
@@ -1141,7 +1142,7 @@ class WebCacheManager {
     // 版本门:已应用版本 == 当前下发版本 → 离线包无变化,直接用本地(连清单都不拉)
     const applied: BundleState | undefined = this.bundleState.get(bundleKey);
     if (bundleVersion.length > 0 && applied !== undefined && applied.version === bundleVersion) {
-      this.updateAppliedConfigJsonIfChanged(bundleKey, applied, configJson);
+      this.updateAppliedConfigJsonIfChanged(bundleKey, applied, configJson, configJsonAuthoritative);
       this.warmCompressedDiskEntriesForUrls(applied.urls);
       hilog.info(DOMAIN, TAG, 'bundle already applied key=%{public}s id=%{public}s origin=%{public}s region=%{public}s scope=%{public}s ver=%{public}s urls=%{public}d configJsonBytes=%{public}d',
         bundleKey,
@@ -1168,12 +1169,12 @@ class WebCacheManager {
           hilog.info(DOMAIN, TAG, 'bundle version pending until current download completes: %{public}s', bundleVersion);
           return;
         } else {
-          this.updateAppliedConfigJsonIfChanged(bundleKey, current, configJson);
+          this.updateAppliedConfigJsonIfChanged(bundleKey, current, configJson, configJsonAuthoritative);
           return;
         }
       } else {
         if (applied !== undefined) {
-          this.updateAppliedConfigJsonIfChanged(bundleKey, applied, configJson);
+          this.updateAppliedConfigJsonIfChanged(bundleKey, applied, configJson, configJsonAuthoritative);
         }
         return;
       }
@@ -1270,7 +1271,9 @@ class WebCacheManager {
     const pendingVersion: string | undefined = this.pendingBundleVersionByKey.get(bundleKey);
     const effectiveVersion: string = bundleVersion.length > 0 ? bundleVersion : (pendingVersion !== undefined ? pendingVersion : '');
     this.pendingBundleVersionByKey.delete(bundleKey);
-    const finalConfigJson: string = manifestConfigJson.length > 0 ? manifestConfigJson : configJson;
+    const finalConfigJson: string = configJsonAuthoritative
+      ? configJson
+      : (configJson.length > 0 ? configJson : manifestConfigJson);
     this.bundleState.set(bundleKey, {
       key: bundleKey,
       id: owner.bundleId,
@@ -1317,15 +1320,16 @@ class WebCacheManager {
     });
   }
 
-  private updateAppliedConfigJsonIfChanged(bundleKey: string, state: BundleState, configJson: string): void {
-    if (!configJson || configJson.length === 0) {
+  private updateAppliedConfigJsonIfChanged(bundleKey: string, state: BundleState, configJson: string,
+    authoritative: boolean = false): void {
+    if ((!configJson || configJson.length === 0) && !authoritative) {
       return;
     }
     const oldConfig: string = state.configJson && state.configJson.length > 0 ? state.configJson : '';
     if (oldConfig === configJson) {
       return;
     }
-    state.configJson = configJson;
+    state.configJson = configJson.length > 0 ? configJson : undefined;
     this.bundleState.set(bundleKey, state);
     this.saveBundleState();
     hilog.info(DOMAIN, TAG, 'bundle configJson refreshed key=%{public}s origin=%{public}s bytes=%{public}d',

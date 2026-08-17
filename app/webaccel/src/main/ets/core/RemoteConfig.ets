@@ -44,6 +44,7 @@ export interface RemoteApp {
   bundleExtraUrls?: string[]; // 后台构建离线包时手动纳入的固定静态资源 URL(如跨域固定背景图)
   bundleExcludeUrls?: string[]; // 后台构建离线包时排除的静态资源 URL(用于控制沙箱占用)
   configJson?: string;       // 该网址对应的 H5 配置 JSON。可随离线包一起下发,供宿主离线兜底注入
+  configEnvironment?: string; // 服务端已按 test/pre/prod 选择 JSON；即使为空也不得回退到其它环境的旧 manifest JSON
   extraBlockHosts?: string[]; // 每应用额外黑名单:只对本应用生效,叠加在全局 blockHosts 之上
   prefetchChunks?: boolean;   // 每应用 chunk 预取开关:覆盖全局 settings.prefetchChunks(不下发=用全局)
   preconnectHosts?: string[]; // 每应用额外预连接域:开机提前对这些CDN/接口域做DNS+TLS握手,点进去时资源直连不等握手。
@@ -137,6 +138,41 @@ function fallbackConfig(): RemoteConfigData {
   };
 }
 
+export interface ConfigRefreshOptions {
+  reason?: string;
+}
+
+export interface ConfigRefreshResult {
+  requestId: number;
+  status: string; // success / failed / cancelled / superseded
+  success: boolean;
+  message: string;
+  startedAt: number;
+  finishedAt: number;
+}
+
+export interface ConfigRefreshState {
+  requestId: number;
+  status: string; // idle / running / success / failed / cancelled / superseded
+  running: boolean;
+  reason: string;
+  startedAt: number;
+  finishedAt: number;
+}
+
+interface HttpTextResult {
+  status: string;
+  text: string;
+  message: string;
+}
+
+interface ActiveHttpRequest {
+  requestId: number;
+  client: http.HttpRequest;
+  settled: boolean;
+  resolve: (result: HttpTextResult) => void;
+}
+
 /**
  * 远程配置管理器(单例)。
  *  configure():由 WebAccel.init 注入后台地址 / 直供列表 / 黑名单 / 设置(在 load 之前调用);
@@ -153,6 +189,8 @@ class RemoteConfigManager {
   private server: string = (BuildProfile.CONFIG_SERVER || '').replace(/\/+$/, '');
   private source: string = 'fallback'; // 当前配置来源:server / cache / fallback(调试用)
   private appHandlers: AppsHandler[] = [];
+  private latestRequestId: number = 0;
+  private activeHttpRequest: ActiveHttpRequest | null = null;
 
   /** 注入配置(在 load 之前调用)。默认用 SDK 自带后台地址;传 configServer 可覆盖 */
   configure(opt?: ConfigureOptions): void {
@@ -213,35 +251,60 @@ class RemoteConfigManager {
     hilog.info(DOMAIN, TAG, 'loaded (cached) apps=%{public}d', this.data.apps.length);
   }
 
-  /** 异步拉服务器最新配置;成功返回 true。未配置 server 时直接返回 false(纯直供/本地模式) */
-  async refresh(): Promise<boolean> {
+  /** 异步拉服务器最新配置；requestId 用于阻止被取消/被替代的旧请求写入全局状态。 */
+  async refresh(requestId: number, startedAt: number): Promise<ConfigRefreshResult> {
+    this.latestRequestId = requestId;
     if (this.server.length === 0) {
       hilog.info(DOMAIN, TAG, 'refresh: no configServer, skip (direct/local mode)');
-      return false;
+      return this.refreshResult(requestId, 'failed', 'configServer is empty', startedAt);
     }
-    const txt: string = await this.httpGetText(this.server + '/api/config');
-    if (txt.length === 0) {
-      hilog.warn(DOMAIN, TAG, 'refresh: server unreachable, keep cached');
-      return false;
+    const response: HttpTextResult = await this.httpGetText(this.server + '/api/config', requestId);
+    if (response.status !== 'success') {
+      return this.refreshResult(requestId, response.status, response.message, startedAt);
+    }
+    if (requestId !== this.latestRequestId) {
+      return this.refreshResult(requestId, 'superseded', 'newer refresh exists', startedAt);
     }
     try {
-      const next = JSON.parse(txt) as RemoteConfigData;
+      const next = JSON.parse(response.text) as RemoteConfigData;
       if (!next || !Array.isArray(next.apps)) {
-        return false;
+        return this.refreshResult(requestId, 'failed', 'invalid config response', startedAt);
+      }
+      if (requestId !== this.latestRequestId) {
+        return this.refreshResult(requestId, 'superseded', 'newer refresh exists', startedAt);
       }
       this.data = next;
       this.mergeDirectAppMetadata();
       this.source = 'server'; // 本次成功从后台拉到
-      this.saveCache(txt);
+      this.saveCache(response.text);
       this.publishApps();
       hilog.info(DOMAIN, TAG, 'refreshed apps=%{public}d block=%{public}d',
         this.data.apps.length, this.data.blockHosts ? this.data.blockHosts.length : 0);
-      return true;
+      return this.refreshResult(requestId, 'success', '', startedAt);
     } catch (e) {
       const er = e as BusinessError;
       hilog.error(DOMAIN, TAG, 'refresh parse failed: %{public}s', er.message);
+      return this.refreshResult(requestId, 'failed', er.message, startedAt);
+    }
+  }
+
+  /** 真正终止当前 HTTP 请求，并让等待中的 Promise 立即得到取消/替代结果。 */
+  cancelRefresh(requestId: number, status: string = 'cancelled'): boolean {
+    if (requestId === this.latestRequestId) {
+      this.latestRequestId = requestId + 1;
+    }
+    const active: ActiveHttpRequest | null = this.activeHttpRequest;
+    if (!active || active.requestId !== requestId || active.settled) {
       return false;
     }
+    active.settled = true;
+    this.activeHttpRequest = null;
+    try {
+      active.client.destroy();
+    } catch (_e) {
+    }
+    active.resolve({ status, text: '', message: status });
+    return true;
   }
 
   getApps(): RemoteApp[] { return this.data.apps || []; }
@@ -328,9 +391,23 @@ class RemoteConfigManager {
     }
   }
 
-  private httpGetText(url: string): Promise<string> {
-    return new Promise<string>((resolve) => {
+  private refreshResult(requestId: number, status: string, message: string,
+    startedAt: number): ConfigRefreshResult {
+    return {
+      requestId,
+      status,
+      success: status === 'success',
+      message,
+      startedAt,
+      finishedAt: Date.now()
+    };
+  }
+
+  private httpGetText(url: string, requestId: number): Promise<HttpTextResult> {
+    return new Promise<HttpTextResult>((resolve) => {
       const client = http.createHttp();
+      const active: ActiveHttpRequest = { requestId, client, settled: false, resolve };
+      this.activeHttpRequest = active;
       const header: Record<string, string> = { 'Accept': 'application/json,text/plain,*/*' };
       const options: http.HttpRequestOptions = {
         method: http.RequestMethod.GET,
@@ -340,12 +417,23 @@ class RemoteConfigManager {
         readTimeout: 30000
       };
       client.request(url, options, (err: BusinessError, data: http.HttpResponse) => {
-        let out: string = '';
+        if (active.settled) {
+          return;
+        }
+        active.settled = true;
+        if (this.activeHttpRequest === active) {
+          this.activeHttpRequest = null;
+        }
+        let result: HttpTextResult = { status: 'failed', text: '', message: '' };
         if (!err && data && data.responseCode === 200 && typeof data.result === 'string') {
-          out = data.result as string;
+          result = { status: 'success', text: data.result as string, message: '' };
+        } else if (err) {
+          result.message = err.message;
+        } else if (data) {
+          result.message = `HTTP ${data.responseCode}`;
         }
         client.destroy();
-        resolve(out);
+        resolve(result);
       });
     });
   }

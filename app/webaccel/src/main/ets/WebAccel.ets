@@ -5,7 +5,18 @@ import { hilog } from '@kit.PerformanceAnalysisKit';
 import { BusinessError } from '@kit.BasicServicesKit';
 import { webCache, CacheStats, BundleProgress } from './core/WebCacheManager';
 import { webPool, WebNode } from './core/WebPreRender';
-import { remoteConfig, RemoteApp, ConfigureOptions, remoteAppMatchesRegion, remoteAppRegions } from './core/RemoteConfig';
+import {
+  remoteConfig,
+  RemoteApp,
+  ConfigureOptions,
+  ConfigRefreshOptions,
+  ConfigRefreshResult,
+  ConfigRefreshState,
+  remoteAppMatchesRegion,
+  remoteAppRegions
+} from './core/RemoteConfig';
+
+export { ConfigRefreshOptions, ConfigRefreshResult, ConfigRefreshState } from './core/RemoteConfig';
 
 const TAG: string = 'WebAccel';
 const DOMAIN: number = 0x0001;
@@ -35,8 +46,18 @@ export interface WebAccelOptions extends ConfigureOptions {
  */
 export class WebAccel {
   private static refreshTimerId: number = -1;
-  private static refreshInFlight: boolean = false;
   private static refreshSecOverride: number = -1;
+  private static refreshRequestSequence: number = 0;
+  private static activeRefreshRequestId: number = 0;
+  private static refreshTask: Promise<ConfigRefreshResult> | null = null;
+  private static refreshState: ConfigRefreshState = {
+    requestId: 0,
+    status: 'idle',
+    running: false,
+    reason: '',
+    startedAt: 0,
+    finishedAt: 0
+  };
 
   /**
    * 开机初始化(在 UIAbility.onCreate 调用一次)。内部:
@@ -213,6 +234,11 @@ export class WebAccel {
     return remoteConfig.getApps();
   }
 
+  /** 当前实际使用的配置服务器；宿主解析相对 manifest 地址时必须使用该值。 */
+  static getConfigServer(): string {
+    return remoteConfig.getServer();
+  }
+
   /** 返回应用配置的全部地区 ID。兼容旧配置中的单值 region。 */
   static getAppRegions(app: RemoteApp): string[] {
     return remoteAppRegions(app);
@@ -228,16 +254,36 @@ export class WebAccel {
     remoteConfig.setApps(apps);
   }
 
-  /** 手动拉一次后台最新配置(成功后自动重注入黑名单/设置)。未配置后台返回 false */
-  static async refreshConfig(): Promise<boolean> {
-    if (WebAccel.refreshInFlight) {
-      hilog.info(DOMAIN, TAG, 'refreshConfig skipped: previous refresh still running');
-      return false;
+  /**
+   * 手动拉一次后台最新配置。并发调用会复用同一任务；结果明确区分成功、失败、取消和被替代。
+   */
+  static refreshConfig(options?: ConfigRefreshOptions): Promise<ConfigRefreshResult> {
+    if (WebAccel.refreshTask !== null && WebAccel.refreshState.running) {
+      hilog.info(DOMAIN, TAG, 'refreshConfig deduped: reuse request=%{public}d',
+        WebAccel.refreshState.requestId);
+      return WebAccel.refreshTask;
     }
-    WebAccel.refreshInFlight = true;
+    const requestId: number = ++WebAccel.refreshRequestSequence;
+    const startedAt: number = Date.now();
+    WebAccel.activeRefreshRequestId = requestId;
+    WebAccel.refreshState = {
+      requestId,
+      status: 'running',
+      running: true,
+      reason: options && options.reason ? options.reason : '',
+      startedAt,
+      finishedAt: 0
+    };
+    const task: Promise<ConfigRefreshResult> = WebAccel.executeConfigRefresh(requestId, startedAt);
+    WebAccel.refreshTask = task;
+    return task;
+  }
+
+  private static async executeConfigRefresh(requestId: number, startedAt: number): Promise<ConfigRefreshResult> {
+    let result: ConfigRefreshResult;
     try {
-      const ok: boolean = await remoteConfig.refresh();
-      if (ok) {
+      result = await remoteConfig.refresh(requestId, startedAt);
+      if (result.success && requestId === WebAccel.activeRefreshRequestId) {
         webCache.setBlockHosts(remoteConfig.getBlockHosts());
         webCache.applySettings(remoteConfig.getSettings());
         webCache.applyApps(remoteConfig.getApps(), remoteConfig.getServer()); // 每应用精细配置按 origin 生效
@@ -246,10 +292,70 @@ export class WebAccel {
         webPool.reloadOpenedBundles();
         WebAccel.startConfigAutoRefresh();
       }
-      return ok;
-    } finally {
-      WebAccel.refreshInFlight = false;
+    } catch (e) {
+      const error = e as BusinessError;
+      result = {
+        requestId,
+        status: requestId === WebAccel.activeRefreshRequestId ? 'failed' : 'superseded',
+        success: false,
+        message: error.message,
+        startedAt,
+        finishedAt: Date.now()
+      };
     }
+    if (requestId === WebAccel.activeRefreshRequestId) {
+      WebAccel.refreshState = {
+        requestId,
+        status: result.status,
+        running: false,
+        reason: WebAccel.refreshState.reason,
+        startedAt,
+        finishedAt: result.finishedAt
+      };
+      WebAccel.refreshTask = null;
+    }
+    return result;
+  }
+
+  /** 取消当前全局配置刷新。只终止当前请求，不关闭后续定时刷新。 */
+  static cancelConfigRefresh(): boolean {
+    return WebAccel.cancelConfigRefreshWithStatus('cancelled');
+  }
+
+  /** 取消旧任务并立即创建一条新请求；旧任务结果不能写配置或触发离线包加载。 */
+  static restartConfigRefresh(): Promise<ConfigRefreshResult> {
+    WebAccel.cancelConfigRefreshWithStatus('superseded');
+    return WebAccel.refreshConfig({ reason: 'restart' });
+  }
+
+  static getConfigRefreshState(): ConfigRefreshState {
+    return {
+      requestId: WebAccel.refreshState.requestId,
+      status: WebAccel.refreshState.status,
+      running: WebAccel.refreshState.running,
+      reason: WebAccel.refreshState.reason,
+      startedAt: WebAccel.refreshState.startedAt,
+      finishedAt: WebAccel.refreshState.finishedAt
+    };
+  }
+
+  private static cancelConfigRefreshWithStatus(status: string): boolean {
+    if (WebAccel.refreshTask === null || !WebAccel.refreshState.running) {
+      return false;
+    }
+    const requestId: number = WebAccel.activeRefreshRequestId;
+    remoteConfig.cancelRefresh(requestId, status);
+    WebAccel.activeRefreshRequestId = ++WebAccel.refreshRequestSequence;
+    WebAccel.refreshState = {
+      requestId,
+      status,
+      running: false,
+      reason: WebAccel.refreshState.reason,
+      startedAt: WebAccel.refreshState.startedAt,
+      finishedAt: Date.now()
+    };
+    WebAccel.refreshTask = null;
+    return true;
   }
 
   /** 缓存统计快照(调试用) */

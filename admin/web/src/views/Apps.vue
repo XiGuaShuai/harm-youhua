@@ -17,10 +17,120 @@ const activeGroup = ref('top');
 const activeDialogTab = ref('base');
 const appQuery = ref('');
 const groupQuery = ref('');
+const CONFIG_ENVIRONMENT_OPTIONS = [
+  { id: 'test', name: '测试' },
+  { id: 'pre', name: '预发' },
+  { id: 'prod', name: '正式' }
+];
+const activeConfigEnvironment = ref('test');
+const activeConfigEnvironmentName = computed(() =>
+  CONFIG_ENVIRONMENT_OPTIONS.find((item) => item.id === activeConfigEnvironment.value)?.name || activeConfigEnvironment.value
+);
 const form = ref(emptyForm());
 const detecting = ref(false);
 
 const bundleMap = ref({});
+
+function emptyConfigEnvironment() {
+  return {
+    configJson: '',
+    configJsonFileName: '',
+    configJsonSyncedAt: '',
+    configJsonSync: {
+      enabled: false,
+      loginUrl: '',
+      loginMethod: 'POST',
+      loginHeaders: {},
+      loginBody: '',
+      configUrl: '',
+      configMethod: 'GET',
+      configHeaders: {},
+      configBody: '',
+      tokenPath: '',
+      tokenHeader: 'Authorization',
+      tokenPrefix: 'Bearer ',
+      configPath: ''
+    }
+  };
+}
+
+function configEnvironmentsOf(row) {
+  const source = row?.configJsonEnvironments || {};
+  const legacyTest = {
+    configJson: row?.configJson || '',
+    configJsonFileName: row?.configJsonFileName || '',
+    configJsonSyncedAt: row?.configJsonSyncedAt || '',
+    configJsonSync: row?.configJsonSync || {}
+  };
+  const result = {};
+  CONFIG_ENVIRONMENT_OPTIONS.forEach(({ id }) => {
+    const value = source[id] || (id === 'test' ? legacyTest : {});
+    result[id] = {
+      ...emptyConfigEnvironment(),
+      ...value,
+      configJsonSync: { ...emptyConfigEnvironment().configJsonSync, ...(value.configJsonSync || {}) }
+    };
+  });
+  return result;
+}
+
+function applyConfigEnvironment(environment) {
+  const value = form.value.configJsonEnvironments?.[environment] || emptyConfigEnvironment();
+  const sync = value.configJsonSync || {};
+  form.value.configJson = value.configJson || '';
+  form.value.configJsonFileName = value.configJsonFileName || '';
+  form.value.configJsonSyncEnabled = sync.enabled === true;
+  form.value.configJsonSyncLoginUrl = sync.loginUrl || '';
+  form.value.configJsonSyncLoginMethod = sync.loginMethod || 'POST';
+  form.value.configJsonSyncLoginHeadersText = stringifyObject(sync.loginHeaders);
+  form.value.configJsonSyncLoginBody = sync.loginBody || '';
+  form.value.configJsonSyncConfigUrl = sync.configUrl || '';
+  form.value.configJsonSyncConfigMethod = sync.configMethod || 'GET';
+  form.value.configJsonSyncConfigHeadersText = stringifyObject(sync.configHeaders);
+  form.value.configJsonSyncConfigBody = sync.configBody || '';
+  form.value.configJsonSyncTokenPath = sync.tokenPath || '';
+  form.value.configJsonSyncTokenHeader = sync.tokenHeader || 'Authorization';
+  form.value.configJsonSyncTokenPrefix = sync.tokenPrefix ?? 'Bearer ';
+  form.value.configJsonSyncConfigPath = sync.configPath || '';
+}
+
+function captureConfigEnvironment(environment = activeConfigEnvironment.value) {
+  if (!form.value.configJsonEnvironments) form.value.configJsonEnvironments = configEnvironmentsOf({});
+  form.value.configJsonEnvironments[environment] = {
+    configJson: (form.value.configJson || '').trim(),
+    configJsonFileName: (form.value.configJsonFileName || '').trim(),
+    configJsonSyncedAt: form.value.configJsonEnvironments[environment]?.configJsonSyncedAt || '',
+    configJsonSync: {
+      enabled: form.value.configJsonSyncEnabled,
+      loginUrl: (form.value.configJsonSyncLoginUrl || '').trim(),
+      loginMethod: form.value.configJsonSyncLoginMethod || 'POST',
+      loginHeaders: parseObjectText(form.value.configJsonSyncLoginHeadersText),
+      loginBody: form.value.configJsonSyncLoginBody || '',
+      configUrl: (form.value.configJsonSyncConfigUrl || '').trim(),
+      configMethod: form.value.configJsonSyncConfigMethod || 'GET',
+      configHeaders: parseObjectText(form.value.configJsonSyncConfigHeadersText),
+      configBody: form.value.configJsonSyncConfigBody || '',
+      tokenPath: (form.value.configJsonSyncTokenPath || '').trim(),
+      tokenHeader: (form.value.configJsonSyncTokenHeader || 'Authorization').trim(),
+      tokenPrefix: form.value.configJsonSyncTokenPrefix ?? 'Bearer ',
+      configPath: (form.value.configJsonSyncConfigPath || '').trim()
+    }
+  };
+}
+
+function changeConfigEnvironment(next) {
+  captureConfigEnvironment(activeConfigEnvironment.value);
+  activeConfigEnvironment.value = next;
+  applyConfigEnvironment(next);
+}
+
+function hasAnyConfigJson(row) {
+  return Object.values(configEnvironmentsOf(row)).some((value) => !!String(value.configJson || '').trim());
+}
+
+function hasAnyConfigSync(row) {
+  return Object.values(configEnvironmentsOf(row)).some((value) => value.configJsonSync?.enabled === true);
+}
 
 function regionIdsOf(row) {
   const values = Array.isArray(row?.regions) && row.regions.length > 0
@@ -134,7 +244,7 @@ const summary = computed(() => {
   apps.value.forEach((app) => {
     if ((app.scope || 'top') === 'region') regionIdsOf(app).forEach((id) => regionSet.add(id));
     if (app.bundle) bundleEnabled++;
-    if (app.configJson) jsonCount++;
+    if (hasAnyConfigJson(app)) jsonCount++;
     if (app.bundle && bundleMap.value[app.id]) readyCount++;
   });
   return {
@@ -184,6 +294,7 @@ function emptyForm(groupKey = activeGroup.value) {
     region = groupKey.slice('region:'.length);
     regionName = activeGroupInfo.value?.name || region;
   }
+  const configJsonEnvironments = configEnvironmentsOf({});
   return {
     id: '',
     name: '',
@@ -195,6 +306,7 @@ function emptyForm(groupKey = activeGroup.value) {
     regionNames: region ? { [region]: regionName || region } : {},
     configJson: '',
     configJsonFileName: '',
+    configJsonEnvironments,
     configJsonSyncEnabled: false,
     configJsonSyncLoginUrl: '',
     configJsonSyncLoginMethod: 'POST',
@@ -232,20 +344,26 @@ function emptyForm(groupKey = activeGroup.value) {
 function openAdd() {
   editing.value = null;
   activeDialogTab.value = 'base';
+  activeConfigEnvironment.value = 'test';
   form.value = emptyForm();
   dialog.value = true;
 }
 
 function openEdit(row) {
   const staticCache = row.staticCache || {};
-  const configJsonSync = row.configJsonSync || {};
+  const configJsonEnvironments = configEnvironmentsOf(row);
+  const configJsonSync = configJsonEnvironments.test.configJsonSync || {};
   editing.value = row.id;
   activeDialogTab.value = 'base';
+  activeConfigEnvironment.value = 'test';
   form.value = {
     ...emptyForm(),
     ...row,
     regions: regionIdsOf(row),
     regionNames: regionNamesOf(row),
+    configJsonEnvironments,
+    configJson: configJsonEnvironments.test.configJson || '',
+    configJsonFileName: configJsonEnvironments.test.configJsonFileName || '',
     routesText: (row.routes || []).join('\n'),
     extraBlockHostsText: (row.extraBlockHosts || []).join('\n'),
     preconnectHostsText: (row.preconnectHosts || []).join('\n'),
@@ -401,12 +519,22 @@ function bundleSizeText(row) {
 }
 
 function configTag(row) {
-  if (!row.configJson) return { type: 'info', text: '无 JSON' };
-  const state = inspectConfigJson(row.configJson, row.url);
-  return state.ok ? { type: 'success', text: 'JSON 正常' } : { type: 'danger', text: state.message };
+  const environments = configEnvironmentsOf(row);
+  let valid = 0;
+  let invalid = 0;
+  CONFIG_ENVIRONMENT_OPTIONS.forEach(({ id }) => {
+    const text = environments[id].configJson;
+    if (!text) return;
+    if (inspectConfigJson(text, row.url).ok) valid++;
+    else invalid++;
+  });
+  if (invalid > 0) return { type: 'danger', text: `${invalid} 个环境异常` };
+  if (valid === 0) return { type: 'info', text: '无 JSON' };
+  return { type: valid === 3 ? 'success' : 'warning', text: `JSON ${valid}/3` };
 }
 
 async function submit() {
+  captureConfigEnvironment();
   if (!form.value.id || !form.value.url) {
     ElMessage.warning('ID 和 URL 必填');
     return;
@@ -424,16 +552,22 @@ async function submit() {
     ElMessage.warning('地区应用必须至少填写一个地区 ID');
     return;
   }
-  if (form.value.bundle && !form.value.configJson.trim() && !form.value.configJsonSyncEnabled) {
-    ElMessage.warning('启用离线包时请填写或导入 websdk 配置 JSON');
+  const configJsonEnvironments = configEnvironmentsOf(form.value);
+  if (form.value.bundle && !hasAnyConfigJson(form.value) && !hasAnyConfigSync(form.value)) {
+    ElMessage.warning('启用离线包时请至少配置一个环境的 websdk JSON 或自动同步');
     activeDialogTab.value = 'json';
     return;
   }
-  const jsonState = inspectConfigJson(form.value.configJson, form.value.url);
-  if (form.value.configJson.trim() && !jsonState.ok) {
-    ElMessage.warning(jsonState.message);
-    activeDialogTab.value = 'json';
-    return;
+  for (const option of CONFIG_ENVIRONMENT_OPTIONS) {
+    const text = configJsonEnvironments[option.id].configJson;
+    const jsonState = inspectConfigJson(text, form.value.url);
+    if (text.trim() && !jsonState.ok) {
+      ElMessage.warning(`${option.name}环境：${jsonState.message}`);
+      activeConfigEnvironment.value = option.id;
+      applyConfigEnvironment(option.id);
+      activeDialogTab.value = 'json';
+      return;
+    }
   }
 
   const scope = form.value.scope === 'region' ? 'region' : 'top';
@@ -452,23 +586,7 @@ async function submit() {
     regionNames: scope === 'region' ? regionNames : {},
     region: scope === 'region' ? (selectedRegions[0] || '') : '',
     regionName: scope === 'region' && selectedRegions[0] ? regionNames[selectedRegions[0]] : '',
-    configJson: (form.value.configJson || '').trim(),
-    configJsonFileName: (form.value.configJsonFileName || '').trim(),
-    configJsonSync: {
-      enabled: form.value.configJsonSyncEnabled,
-      loginUrl: (form.value.configJsonSyncLoginUrl || '').trim(),
-      loginMethod: form.value.configJsonSyncLoginMethod || 'POST',
-      loginHeaders: parseObjectText(form.value.configJsonSyncLoginHeadersText),
-      loginBody: form.value.configJsonSyncLoginBody || '',
-      configUrl: (form.value.configJsonSyncConfigUrl || '').trim(),
-      configMethod: form.value.configJsonSyncConfigMethod || 'GET',
-      configHeaders: parseObjectText(form.value.configJsonSyncConfigHeadersText),
-      configBody: form.value.configJsonSyncConfigBody || '',
-      tokenPath: (form.value.configJsonSyncTokenPath || '').trim(),
-      tokenHeader: (form.value.configJsonSyncTokenHeader || 'Authorization').trim(),
-      tokenPrefix: form.value.configJsonSyncTokenPrefix ?? 'Bearer ',
-      configPath: (form.value.configJsonSyncConfigPath || '').trim()
-    },
+    configJsonEnvironments,
     routes: splitLines(form.value.routesText),
     swrDoc: form.value.swrDoc,
     prerender: form.value.prerender,
@@ -608,11 +726,13 @@ async function syncConfigJson(row) {
   syncingJson.value = row.id;
   try {
     const { data } = await api.post('/api/admin/config-json-sync/run', { appId: row.id });
-    const item = data?.log?.results?.[0];
-    if (item && item.ok === false) {
-      ElMessage.error('JSON 同步失败:' + item.detail);
+    const results = data?.log?.results || [];
+    const failed = results.filter((item) => item.ok === false);
+    const changed = results.filter((item) => item.changed === true);
+    if (failed.length > 0) {
+      ElMessage.error(`JSON 同步失败 ${failed.length} 个环境：` + failed.map((item) => `${item.environmentName}:${item.detail}`).join('；'));
     } else {
-      ElMessage.success(item?.changed ? 'JSON 已同步并更新' : 'JSON 已同步，无变化');
+      ElMessage.success(changed.length > 0 ? `JSON 已更新 ${changed.length} 个环境` : '三环境 JSON 已检查，无变化');
       await store.load();
     }
   } catch (e) {
@@ -723,9 +843,7 @@ async function syncConfigJson(row) {
           <el-table-column label="websdk 配置" width="160">
             <template #default="{ row }">
               <el-tag size="small" :type="configTag(row).type" effect="plain">{{ configTag(row).text }}</el-tag>
-              <el-tag v-if="row.configJsonSync?.enabled" size="small" type="warning" effect="plain" class="json-sync-tag">自动同步</el-tag>
-              <div v-if="row.configJsonFileName" class="table-sub">{{ row.configJsonFileName }}</div>
-              <div v-if="row.configJsonSyncedAt" class="table-sub">{{ String(row.configJsonSyncedAt).slice(0, 16).replace('T', ' ') }}</div>
+              <el-tag v-if="hasAnyConfigSync(row)" size="small" type="warning" effect="plain" class="json-sync-tag">多环境同步</el-tag>
             </template>
           </el-table-column>
           <el-table-column label="离线包" width="160">
@@ -742,7 +860,7 @@ async function syncConfigJson(row) {
             <template #default="{ row }">
               <div class="tag-row">
                 <el-tag v-if="row.bundle" size="small" type="success">离线包</el-tag>
-                <el-tag v-if="row.configJsonSync?.enabled" size="small" type="warning" effect="plain">JSON 同步</el-tag>
+                <el-tag v-if="hasAnyConfigSync(row)" size="small" type="warning" effect="plain">JSON 同步</el-tag>
                 <el-tag v-if="row.preconnectHosts?.length" size="small" type="info" effect="plain">预连接 {{ row.preconnectHosts.length }}</el-tag>
               </div>
             </template>
@@ -758,7 +876,7 @@ async function syncConfigJson(row) {
                     <el-dropdown-menu>
                       <el-dropdown-item command="check">检查资源更新</el-dropdown-item>
                       <el-dropdown-item command="update">增量更新离线包</el-dropdown-item>
-                      <el-dropdown-item v-if="row.configJsonSync?.enabled" command="sync">立即同步 JSON</el-dropdown-item>
+                      <el-dropdown-item v-if="hasAnyConfigSync(row)" command="sync">同步三环境 JSON</el-dropdown-item>
                       <el-dropdown-item command="build" divided>强制重建离线包</el-dropdown-item>
                       <el-dropdown-item command="manifest">重新生成清单</el-dropdown-item>
                       <el-dropdown-item command="delete" divided class="danger-menu-item">删除应用</el-dropdown-item>
@@ -829,6 +947,15 @@ async function syncConfigJson(row) {
 
           <el-tab-pane label="websdk JSON" name="json">
             <div class="json-toolbar">
+              <b>配置环境</b>
+              <el-radio-group :model-value="activeConfigEnvironment" @change="changeConfigEnvironment">
+                <el-radio-button v-for="option in CONFIG_ENVIRONMENT_OPTIONS" :key="option.id" :label="option.id">
+                  {{ option.name }}
+                </el-radio-button>
+              </el-radio-group>
+              <span class="muted">离线包资源共用；这里只切换各环境独立的 configJson 与拉取账号。</span>
+            </div>
+            <div class="json-toolbar">
               <el-upload accept=".json,application/json" :auto-upload="false" :show-file-list="false" :on-change="importConfigJson">
                 <el-button :icon="Upload">导入 JSON 文件</el-button>
               </el-upload>
@@ -842,7 +969,7 @@ async function syncConfigJson(row) {
             </el-form-item>
             <div class="sync-panel">
               <div class="sync-title">
-                <b>每天 12:00 自动同步</b>
+                <b>{{ activeConfigEnvironmentName }}环境：每天 12:00 自动同步</b>
                 <el-switch v-model="form.configJsonSyncEnabled" active-text="开启" inactive-text="关闭" />
               </div>
               <div v-if="form.configJsonSyncEnabled">

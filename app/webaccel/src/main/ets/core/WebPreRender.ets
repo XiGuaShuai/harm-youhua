@@ -177,7 +177,7 @@ export class WebPool {
       manifestUrl = server + (manifestUrl.startsWith('/') ? manifestUrl : '/' + manifestUrl);
     }
     webCache.loadRemoteBundle(app.url, manifestUrl, version, app.id, ownerRegion, scope,
-      app.configJson ? app.configJson : '');
+      app.configJson ? app.configJson : '', !!app.configEnvironment);
   }
 
   goBack(url: string): boolean {

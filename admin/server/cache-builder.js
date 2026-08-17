@@ -187,7 +187,9 @@ function sha256(data) {
 }
 
 function configJsonText(appCfg) {
-  return appCfg && typeof appCfg.configJson === 'string' ? appCfg.configJson.trim() : '';
+  // configJson 按 test/pre/prod 环境下发，不能再写入三环境共享的离线包与 manifest。
+  // 端侧从对应环境的 /api/config 获取并保存 JSON；旧 manifest 中的 configJson 仅作兼容兜底。
+  return '';
 }
 
 function configJsonFileName(appCfg) {

@@ -7,6 +7,7 @@
   "scripts": {
     "start": "node index.js",
     "dev": "node --watch index.js",
+    "test": "node --test test/*.test.js",
     "cache:check": "node cache-builder.js check",
     "cache:update": "node cache-builder.js update",
     "cache:build": "node cache-builder.js build",

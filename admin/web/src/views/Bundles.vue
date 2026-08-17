@@ -22,6 +22,12 @@ const configDialog = ref(false);
 const configText = ref('');
 const configFileName = ref('');
 const configSaving = ref(false);
+const configEnvironment = ref('test');
+const configEnvironmentOptions = [
+  { id: 'test', name: '测试' },
+  { id: 'pre', name: '预发' },
+  { id: 'prod', name: '正式' }
+];
 
 const autoLog = ref(null);
 const autoRunning = ref(false);
@@ -253,13 +259,15 @@ function openImportDialog() {
   importDialog.value = true;
 }
 
-function configMeta(row) {
-  return row?.config || row || {};
+function configMeta(row, environment = 'test') {
+  const base = row?.config || row || {};
+  return base.configJsonEnvironments?.[environment] || row?.configJsonEnvironments?.[environment] || base;
 }
 
 function openConfigDialog() {
   if (!selected.value) return;
-  const meta = configMeta(selected.value);
+  configEnvironment.value = 'test';
+  const meta = configMeta(selected.value, configEnvironment.value);
   configText.value = '';
   configFileName.value = meta.configJsonFileName || selected.value.configJsonFileName || `${selected.value.id}.json`;
   configDialog.value = true;
@@ -295,6 +303,7 @@ async function saveConfigJson() {
   try {
     const { data } = await api.put(`/api/admin/bundles/${selected.value.id}/config-json`, {
       configJson: text,
+      environment: configEnvironment.value,
       fileName: safeJsonFileName(configFileName.value || `${selected.value.id}.json`)
     });
     if (data?.bundle) {
@@ -304,7 +313,7 @@ async function saveConfigJson() {
       await load();
     }
     configDialog.value = false;
-    ElMessage.success('配置 JSON 已写入离线包');
+    ElMessage.success('配置 JSON 已保存到对应环境（离线资源未重建）');
   } catch (e) {
     const data = e.response?.data;
     ElMessage.error('保存失败:' + (data?.error || e.message));
@@ -514,6 +523,14 @@ function importStatusText(row) {
         <el-form-item label="目标网站">
           <el-input :model-value="selected ? `${selected.name || selected.id} (${selected.id})` : ''" disabled />
         </el-form-item>
+        <el-form-item label="配置环境">
+          <el-radio-group v-model="configEnvironment">
+            <el-radio-button v-for="option in configEnvironmentOptions" :key="option.id" :label="option.id">
+              {{ option.name }}
+            </el-radio-button>
+          </el-radio-group>
+          <div class="muted">三个环境共用当前离线包；这里只保存所选环境的 configJson。</div>
+        </el-form-item>
         <el-form-item label="静态资源 URL">
           <el-input v-model="importText" type="textarea" :rows="8"
             placeholder="每行一个完整 URL,例如 https://cdn.example.com/app.bundle.js" />
@@ -561,7 +578,7 @@ function importStatusText(row) {
       </el-form>
       <template #footer>
         <el-button @click="configDialog = false">关闭</el-button>
-        <el-button type="primary" :loading="configSaving" @click="saveConfigJson">保存到离线包</el-button>
+        <el-button type="primary" :loading="configSaving" @click="saveConfigJson">保存环境 JSON</el-button>
       </template>
     </el-dialog>
   </div>
