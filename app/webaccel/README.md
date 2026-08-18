@@ -187,7 +187,7 @@ const apps: RemoteApp[] = [
 5. 切香港到英国时,SDK 会让香港未完成任务失效,删除香港 `scope=region` 缓存,再拉英国包。
 6. `scope: "app"`: 不自动拉,宿主可用 `WebAccel.loadBundleForApp(app)` 或打开页面时触发。
 7. `configJson` 可放在 `/api/config` 的 app 字段里;新版 SDK 也兼容 manifest 对象格式 `{ "configJson": "...", "resources": [...] }`。
-8. 如果后台开启了 `configJsonSync`,该字段会由 admin 定时从第三方后台同步,端侧仍然只看 `/api/config`,不需要额外新增接入 API。
+8. 如果后台开启了 `configJsonSync`,该字段会由 admin 按每个应用/环境独立定时从第三方后台同步（每 60 秒，单请求 20 秒超时）,端侧仍然只看对应环境 `/api/config`,不需要额外新增接入 API。
 
 ## 离线包规则
 

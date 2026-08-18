@@ -33,7 +33,7 @@ npm run dev
 | 应用管理 | `WebAccel.getApps()` / launcher 列表 | 增删网页应用、每个 app 的加速开关、路由列表 |
 | 过滤黑名单 | SDK 注入的 `blockHosts` | 被墙第三方域名,端侧命中即秒拒 |
 | 离线包 | 下载进接入方应用沙箱(不打进 HAP) | 服务端构建/手动导入静态资源,生成 manifest 并托管给端侧 |
-| configJson 自动同步 | 第三方后台登录 + 配置接口 | 启动时立即执行，之后每 60 秒分别登录各环境并把最新 `configJson` 写回对应配置 |
+| configJson 自动同步 | 第三方后台登录 + 配置接口 | 启动时立即执行，之后每 60 秒按 `appId + environment` 独立登录并写回对应配置，单请求 20 秒超时 |
 | 全局设置 | 沙箱上限 / 离线包下载并发等 | (`字节码开关` 字段在元服务被忽略,平台不支持) |
 
 ## 关键接口
@@ -75,7 +75,7 @@ npm run dev
 
 3. `getWebNameList` 不是 configJson 来源,它只是应用列表接口。
 
-4. 后台启动时立即执行同步，之后每 60 秒自动执行一次;当前已配置同步源的应用会按测试、预发、正式环境分别刷新 `configJson`。也可以手动调 `POST /api/admin/config-json-sync/run` 立即刷新。
+4. 后台启动时立即执行同步，之后每 60 秒为每个应用/环境独立执行一次;当前已配置同步源的应用会按测试、预发、正式环境分别刷新 `configJson`，单个失败不阻塞其它应用。也可以手动调 `POST /api/admin/config-json-sync/run` 立即刷新。
 
 5. 同步结果可从 `GET /api/admin/config-json-sync/log` 查看。
 
