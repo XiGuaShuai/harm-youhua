@@ -575,6 +575,7 @@ function runCacheBuilder(mode, appId, requestedEnvironment = LEGACY_BUNDLE_ENVIR
 const AUTO_UPDATE_INTERVAL_MS = 24 * 60 * 60 * 1000; // 一天一次
 const AUTO_UPDATE_FIRST_DELAY_MS = 60 * 1000;        // 服务启动 1 分钟后先跑一次
 const AUTO_UPDATE_LOG = path.join(DATA_DIR, 'auto-update-log.json');
+const CONFIG_JSON_SYNC_INTERVAL_MS = 60 * 1000; // 每分钟从各环境业务后台同步 configJson
 const CONFIG_JSON_SYNC_LOG = path.join(DATA_DIR, 'config-json-sync-log.json');
 let autoUpdateRunning = false;
 let autoUpdateLiveLog = null;
@@ -2194,28 +2195,17 @@ function startAutoUpdateScheduler() {
 }
 
 function startConfigJsonSyncScheduler() {
-  const scheduleNext = () => {
-    if (configJsonSyncTimer) clearTimeout(configJsonSyncTimer);
-    configJsonSyncTimer = setTimeout(() => {
-      runConfigJsonSyncOnce('daily-noon').catch((e) => {
-        console.warn('[ConfigJsonSync] daily sync failed:', e && e.message);
-      }).finally(() => {
-        scheduleNext();
-      });
-    }, msUntilNextShanghaiNoon());
-  };
-  const now = new Date();
-  const sh = shanghaiDateParts(now);
-  if (Number(sh.hour) === 12 && Number(sh.minute) === 0) {
-    runConfigJsonSyncOnce('daily-noon-startup').catch((e) => {
-      console.warn('[ConfigJsonSync] startup sync failed:', e && e.message);
-    }).finally(() => {
-      scheduleNext();
+  if (configJsonSyncTimer) clearInterval(configJsonSyncTimer);
+  // 启动时先同步一次，之后每分钟同步测试/预发/正式各自配置。
+  runConfigJsonSyncOnce('startup').catch((e) => {
+    console.warn('[ConfigJsonSync] startup sync failed:', e && e.message);
+  });
+  configJsonSyncTimer = setInterval(() => {
+    runConfigJsonSyncOnce('every-minute').catch((e) => {
+      console.warn('[ConfigJsonSync] minute sync failed:', e && e.message);
     });
-  } else {
-    scheduleNext();
-  }
-  console.log('[ConfigJsonSync] 定时器已启动:每天 12:00 (Asia/Shanghai) 自动同步 configJson');
+  }, CONFIG_JSON_SYNC_INTERVAL_MS);
+  console.log('[ConfigJsonSync] 定时器已启动:每 60 秒分别同步测试/预发/正式 configJson');
 }
 
 initDb(); // 后台连 MySQL 并建表(不阻塞;配置/离线包接口走文件,不依赖 DB)
@@ -2227,6 +2217,6 @@ app.listen(PORT, () => {
   if (MASTER_TOKEN) console.log(`  主令牌已开启:    X-Admin-Token: <ADMIN_TOKEN>(脚本用)`);
   if (process.env.DISABLE_SCHEDULERS !== '1') {
     startAutoUpdateScheduler(); // 启动定时自动更新
-    startConfigJsonSyncScheduler(); // 启动每天中午 configJson 同步
+    startConfigJsonSyncScheduler(); // 启动每分钟 configJson 同步
   }
 });
