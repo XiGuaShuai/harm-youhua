@@ -47,7 +47,7 @@
 做法是:
 
 1. 在 admin 里给该 app 配好 `configJsonSync`。只要填了登录/配置接口，后台会自动纳入定时同步。
-2. 后台默认每天 12:00 (Asia/Shanghai) 自动登录第三方管理系统。
+2. 后台启动时立即登录第三方管理系统，之后每 60 秒按测试、预发、正式环境分别自动同步。
 3. 先拿登录 token,再调配置接口,把返回里的 `data.records[0].configJson` 写回后台 app 配置。
 4. 端侧按 `configRefreshSec` 周期拉 `/api/config`,或者手动调用 `WebAccel.refreshConfig()` 后就能拿到新 JSON。
 
