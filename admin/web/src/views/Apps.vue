@@ -22,6 +22,24 @@ const CONFIG_ENVIRONMENT_OPTIONS = [
   { id: 'pre', name: '预发' },
   { id: 'prod', name: '正式' }
 ];
+// 旧配置中的部分地区名称曾以 "??" 保存。显示层统一用已知地区名或可读的 ID 兜底，不能把问号直接展示给运营人员。
+const REGION_NAME_FALLBACKS = {
+  '100003': '泰国',
+  '100004': '中国香港',
+  '100006': '韩国',
+  '100009': '中国澳门',
+  '100014': '马来西亚',
+  '100016': '新加坡',
+  '100017': '日本',
+  '100106': '越南',
+  '100253': '阿联酋',
+  '100296': '西班牙',
+  '100452': '俄罗斯',
+  '2007696801692241922': '菲律宾',
+  '1988526837953462273': '印度尼西亚',
+  '2037443812888760321': '美国',
+  '2046772885148901377': '美国'
+};
 const activeConfigEnvironment = ref('test');
 const activeConfigEnvironmentName = computed(() =>
   CONFIG_ENVIRONMENT_OPTIONS.find((item) => item.id === activeConfigEnvironment.value)?.name || activeConfigEnvironment.value
@@ -146,7 +164,9 @@ function regionNamesOf(row) {
 }
 
 function regionNameOf(row, id) {
-  return regionNamesOf(row)[id] || id;
+  const name = String(regionNamesOf(row)[id] || '').trim();
+  if (name && !/^[?\s._()（）-]+$/.test(name)) return name;
+  return REGION_NAME_FALLBACKS[id] || `地区 ${id}`;
 }
 
 const regionOptions = computed(() => {
