@@ -581,6 +581,7 @@ let autoUpdateRunning = false;
 let autoUpdateLiveLog = null;
 let configJsonSyncRunning = false;
 let configJsonSyncTimer = null;
+const configJsonSyncKeys = new Set();
 
 // ——————————————— Express ———————————————
 const app = express();
@@ -1224,6 +1225,78 @@ async function syncConfigJsonForApp(appCfg, requestedEnvironment) {
     configJson: configText,
     bytes: Buffer.byteLength(configText, 'utf8')
   };
+}
+
+// 独立任务：每个 app/environment 单独轮询，不能被其它站点的慢请求阻塞。
+async function runConfigJsonSyncTarget(trigger, appId, environment) {
+  const key = `${environment}:${appId}`;
+  if (configJsonSyncKeys.has(key)) {
+    return { id: appId, environment, ok: true, skipped: true, detail: '上一次任务仍在执行' };
+  }
+  configJsonSyncKeys.add(key);
+  const item = { id: appId, environment, ok: true, changed: false, detail: '' };
+  try {
+    const cfg = loadConfig();
+    const source = (cfg.apps || []).find((a) => a.id === appId);
+    if (!source) {
+      item.ok = false;
+      item.detail = '应用不存在';
+      return item;
+    }
+    const synced = await syncConfigJsonForApp(source, environment);
+    if (synced.skipped) {
+      item.detail = synced.reason ? `跳过: ${synced.reason}` : '跳过';
+      return item;
+    }
+    const latest = loadConfig();
+    const idx = (latest.apps || []).findIndex((a) => a.id === appId);
+    if (idx >= 0) {
+      const normalized = normalizeAppConfig(latest.apps[idx]);
+      const envConfig = normalized.configJsonEnvironments[environment];
+      if (envConfig.configJson !== synced.configJson) {
+        envConfig.configJson = synced.configJson;
+        envConfig.configJsonFileName = envConfig.configJsonFileName || `${appId}-${environment}.json`;
+        envConfig.configJsonSyncedAt = new Date().toISOString();
+        latest.apps[idx] = normalized;
+        saveConfig(latest);
+        item.changed = true;
+      }
+    }
+    item.detail = `同步 ${synced.bytes} bytes`;
+    return item;
+  } catch (e) {
+    item.ok = false;
+    item.detail = String(e && e.message || e);
+    return item;
+  } finally {
+    configJsonSyncKeys.delete(key);
+  }
+}
+
+async function runIndependentConfigJsonSync(trigger) {
+  const cfg = loadConfig();
+  const targets = [];
+  for (const environment of CONFIG_ENVIRONMENTS) {
+    for (const appCfg of (cfg.apps || [])) {
+      const app = normalizeAppConfig(appCfg);
+      if (hasConfigJsonSyncSource(app.configJsonEnvironments[environment].configJsonSync || {})) {
+        targets.push([app.id, environment]);
+      }
+    }
+  }
+  const settled = await Promise.all(targets.map(([appId, environment]) =>
+    runConfigJsonSyncTarget(trigger, appId, environment)
+  ));
+  const log = {
+    startedAt: new Date().toISOString(),
+    finishedAt: new Date().toISOString(),
+    trigger,
+    independent: true,
+    changed: settled.some((item) => item.changed),
+    results: settled
+  };
+  try { fs.writeFileSync(CONFIG_JSON_SYNC_LOG, JSON.stringify(log, null, 2), 'utf8'); } catch {}
+  return log;
 }
 
 async function runConfigJsonSyncOnce(trigger = 'scheduled', onlyAppId = '', onlyEnvironment = '') {
@@ -2201,16 +2274,16 @@ function startAutoUpdateScheduler() {
 
 function startConfigJsonSyncScheduler() {
   if (configJsonSyncTimer) clearInterval(configJsonSyncTimer);
-  // 启动时先同步一次，之后每分钟同步测试/预发/正式各自配置。
-  runConfigJsonSyncOnce('startup').catch((e) => {
+  // 启动时先同步一次，之后每分钟为每个 app/environment 独立执行。
+  runIndependentConfigJsonSync('startup').catch((e) => {
     console.warn('[ConfigJsonSync] startup sync failed:', e && e.message);
   });
   configJsonSyncTimer = setInterval(() => {
-    runConfigJsonSyncOnce('every-minute').catch((e) => {
+    runIndependentConfigJsonSync('every-minute').catch((e) => {
       console.warn('[ConfigJsonSync] minute sync failed:', e && e.message);
     });
   }, CONFIG_JSON_SYNC_INTERVAL_MS);
-  console.log('[ConfigJsonSync] 定时器已启动:每 60 秒分别同步测试/预发/正式 configJson');
+  console.log('[ConfigJsonSync] 定时器已启动:每 60 秒独立同步每个 app/environment configJson');
 }
 
 initDb(); // 后台连 MySQL 并建表(不阻塞;配置/离线包接口走文件,不依赖 DB)
