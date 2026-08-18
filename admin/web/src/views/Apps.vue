@@ -164,9 +164,17 @@ const regionOptions = computed(() => {
 
 async function loadBundles() {
   try {
-    const { data } = await api.get('/api/admin/bundles');
+    const responses = await Promise.all(CONFIG_ENVIRONMENT_OPTIONS.map(({ id }) =>
+      api.get('/api/admin/bundles', { params: { environment: id } })
+    ));
     const m = {};
-    (data || []).forEach((b) => { m[b.id] = b; });
+    responses.forEach(({ data }) => {
+      (data || []).forEach((b) => {
+        if (!b.builtAt) return;
+        const app = apps.value.find((item) => item.id === b.id);
+        if (app && bundleEnvironmentOf(app) === b.environment) m[b.id] = b;
+      });
+    });
     bundleMap.value = m;
   } catch (e) {
     ElMessage.warning('离线包状态刷新失败');
@@ -280,8 +288,13 @@ function regionTooltip(row) {
   return regionItems(row).map((item) => `${item.name} (${item.id})`).join('、');
 }
 
+function bundleEnvironmentOf(row) {
+  const environments = Array.isArray(row?.bundleEnvironments) ? row.bundleEnvironments : [];
+  return environments[0] || 'prod';
+}
+
 function openBundle(row) {
-  router.push({ path: '/bundles', query: { app: row.id } });
+  router.push({ path: '/bundles', query: { app: row.id, environment: bundleEnvironmentOf(row) } });
 }
 
 function emptyForm(groupKey = activeGroup.value) {
@@ -325,6 +338,7 @@ function emptyForm(groupKey = activeGroup.value) {
     prerender: true,
     codeCache: true,
     bundle: true,
+    bundleEnvironments: ['test'],
     prefetchChunks: true,
     extraBlockHostsText: '',
     preconnectHostsText: '',
@@ -558,6 +572,11 @@ async function submit() {
     activeDialogTab.value = 'json';
     return;
   }
+  if (form.value.bundle && (!Array.isArray(form.value.bundleEnvironments) || form.value.bundleEnvironments.length === 0)) {
+    ElMessage.warning('启用离线包时必须至少选择一个离线包环境');
+    activeDialogTab.value = 'base';
+    return;
+  }
   for (const option of CONFIG_ENVIRONMENT_OPTIONS) {
     const text = configJsonEnvironments[option.id].configJson;
     const jsonState = inspectConfigJson(text, form.value.url);
@@ -592,6 +611,7 @@ async function submit() {
     prerender: form.value.prerender,
     codeCache: form.value.codeCache,
     bundle: form.value.bundle,
+    bundleEnvironments: form.value.bundle ? [...form.value.bundleEnvironments] : [],
     prefetchChunks: form.value.prefetchChunks,
     bundleMaxSizeKB: Number(form.value.bundleMaxSizeKB || 0),
     extraBlockHosts: splitLines(form.value.extraBlockHostsText),
@@ -617,7 +637,7 @@ async function submit() {
 
   try {
     apps.value = list;
-    const autoBuilding = await store.saveApps();
+    const autoBuilding = await store.saveApp(item, editing.value || item.id);
     activeGroup.value = groupOf(item);
     dialog.value = false;
     if (autoBuilding && autoBuilding.includes(item.id)) {
@@ -638,7 +658,7 @@ async function remove(row) {
   const previous = [...apps.value];
   try {
     apps.value = apps.value.filter((a) => a.id !== row.id);
-    await store.saveApps();
+    await store.deleteApp(row.id);
     ElMessage.success('已删除');
   } catch (e) {
     apps.value = previous;
@@ -668,7 +688,7 @@ function handleRowCommand(command, row) {
 async function checkUpdate(row) {
   checking.value = row.id;
   try {
-    const { data } = await api.post(`/api/admin/bundles/${row.id}/check`);
+    const { data } = await api.post(`/api/admin/bundles/${row.id}/check`, { environment: bundleEnvironmentOf(row) });
     if (data.changed) {
       const home = data.homeChanged ? '首页已变化' : '首页未变化';
       ElMessage.warning(`${home}; 新增 ${data.addedCount}, 移除 ${data.removedCount}, 缺失 ${data.missingFileCount}`);
@@ -685,7 +705,7 @@ async function checkUpdate(row) {
 async function updateCache(row) {
   updating.value = row.id;
   try {
-    const { data } = await api.post(`/api/admin/bundles/${row.id}/update`);
+    const { data } = await api.post(`/api/admin/bundles/${row.id}/update`, { environment: bundleEnvironmentOf(row) });
     ElMessage.success(`已增量更新: 下载 ${data.downloaded}, 跳过 ${data.skipped}, 共 ${data.count}`);
     loadBundles().catch(() => {});
   } catch (e) {
@@ -699,7 +719,7 @@ async function buildCache(row) {
   await ElMessageBox.confirm('强制重建会访问目标站并清空旧缓存目录,确认继续?', '确认强制重建', { type: 'warning' });
   building.value = row.id;
   try {
-    const { data } = await api.post(`/api/admin/bundles/${row.id}/build`);
+    const { data } = await api.post(`/api/admin/bundles/${row.id}/build`, { environment: bundleEnvironmentOf(row) });
     ElMessage.success(`已构建 ${data.count} 个缓存资源`);
     loadBundles().catch(() => {});
   } catch (e) {
@@ -712,7 +732,7 @@ async function buildCache(row) {
 async function generateManifest(row) {
   generating.value = row.id;
   try {
-    const { data } = await api.post(`/api/admin/bundles/${row.id}/manifest`);
+    const { data } = await api.post(`/api/admin/bundles/${row.id}/manifest`, { environment: bundleEnvironmentOf(row) });
     ElMessage.success(`已生成 ${data.count} 个缓存资源`);
     loadBundles().catch(() => {});
   } catch (e) {
@@ -930,7 +950,7 @@ async function syncConfigJson(row) {
                 </el-select>
               </el-form-item>
             </div>
-            <div v-if="form.scope === 'region'" class="field-hint">同一网址只保存一份离线包；切换到任一已选地区时，SDK 都会加载该离线包。</div>
+            <div v-if="form.scope === 'region'" class="field-hint">同一环境内的多个地区可共用该环境离线包；测试、预发、正式仍分别保存和下发。</div>
             <el-form-item label="路由">
               <el-input v-model="form.routesText" type="textarea" :rows="3" placeholder="每行一个路径,例如 /" />
             </el-form-item>
@@ -943,6 +963,14 @@ async function syncConfigJson(row) {
                 <el-checkbox v-model="form.prefetchChunks">chunk 预取</el-checkbox>
               </div>
             </el-form-item>
+            <el-form-item v-if="form.bundle" label="离线包环境">
+              <el-checkbox-group v-model="form.bundleEnvironments">
+                <el-checkbox v-for="option in CONFIG_ENVIRONMENT_OPTIONS" :key="option.id" :label="option.id">
+                  {{ option.name }}
+                </el-checkbox>
+              </el-checkbox-group>
+              <div class="field-hint">仅所选环境会下发该应用的 manifest，资源文件也存放在独立环境目录。</div>
+            </el-form-item>
           </el-tab-pane>
 
           <el-tab-pane label="websdk JSON" name="json">
@@ -953,7 +981,7 @@ async function syncConfigJson(row) {
                   {{ option.name }}
                 </el-radio-button>
               </el-radio-group>
-              <span class="muted">离线包资源共用；这里只切换各环境独立的 configJson 与拉取账号。</span>
+              <span class="muted">configJson 与离线包都按环境隔离；此处维护所选环境的 configJson 与拉取账号。</span>
             </div>
             <div class="json-toolbar">
               <el-upload accept=".json,application/json" :auto-upload="false" :show-file-list="false" :on-change="importConfigJson">

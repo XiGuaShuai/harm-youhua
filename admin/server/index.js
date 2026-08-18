@@ -38,10 +38,16 @@ const DEFAULT_PASS = process.env.ADMIN_PASS || 'admin123';
 const SESSION_TTL_MS = 7 * 24 * 3600 * 1000; // 登录态有效期 7 天
 const CONFIG_ENVIRONMENTS = ['test', 'pre', 'prod'];
 const CONFIG_ENVIRONMENT_LABELS = { test: '测试', pre: '预发', prod: '正式' };
-const DEFAULT_CONFIG_ENVIRONMENT = normalizeConfigEnvironment(process.env.DEFAULT_CONFIG_ENV, 'test');
+// 无环境前缀的旧客户端按正式环境处理，防止正式用户误拉测试离线包。
+const DEFAULT_CONFIG_ENVIRONMENT = normalizeConfigEnvironment(process.env.DEFAULT_CONFIG_ENV, 'prod');
+// 老配置没有 bundleEnvironments 时按正式环境处理，避免升级后线上用户误拉测试包。
+const LEGACY_BUNDLE_ENVIRONMENT = normalizeConfigEnvironment(process.env.LEGACY_BUNDLE_ENV, 'prod');
 
 fs.mkdirSync(path.dirname(DATA_FILE), { recursive: true });
 fs.mkdirSync(BUNDLES_DIR, { recursive: true });
+for (const environment of CONFIG_ENVIRONMENTS) {
+  fs.mkdirSync(path.join(BUNDLES_DIR, environment), { recursive: true });
+}
 
 // ——————————————— 账号 / 密码 / 会话 ———————————————
 // 密码用 scrypt 加盐哈希,存 data/users.json;会话 token 存 data/sessions.json(重启不掉线)
@@ -227,6 +233,45 @@ function configEnvironmentLabel(environment) {
   return CONFIG_ENVIRONMENT_LABELS[env] || env;
 }
 
+function bundleRoot(environment) {
+  return path.join(BUNDLES_DIR, normalizeConfigEnvironment(environment, LEGACY_BUNDLE_ENVIRONMENT));
+}
+
+function normalizeBundleEnvironments(appCfg) {
+  const configured = Array.isArray(appCfg && appCfg.bundleEnvironments)
+    ? appCfg.bundleEnvironments
+    : (typeof (appCfg && appCfg.bundleEnvironments) === 'string'
+      ? String(appCfg.bundleEnvironments).split(/[\s,;]+/)
+      : null);
+  const source = configured === null
+    ? (appCfg && appCfg.bundle === true ? [LEGACY_BUNDLE_ENVIRONMENT] : [])
+    : configured;
+  const seen = new Set();
+  const result = [];
+  for (const value of source) {
+    const environment = normalizeConfigEnvironment(value, '');
+    if (environment && !seen.has(environment)) {
+      seen.add(environment);
+      result.push(environment);
+    }
+  }
+  return result;
+}
+
+function bundleEnabledInEnvironment(appCfg, environment) {
+  if (!appCfg || appCfg.bundle !== true) return false;
+  return normalizeBundleEnvironments(appCfg).includes(normalizeConfigEnvironment(environment, ''));
+}
+
+function enableBundleEnvironment(appCfg, environment) {
+  const target = normalizeConfigEnvironment(environment, '');
+  if (!appCfg || !target) return;
+  const enabled = new Set(normalizeBundleEnvironments(appCfg));
+  enabled.add(target);
+  appCfg.bundle = true;
+  appCfg.bundleEnvironments = Array.from(enabled);
+}
+
 function normalizeConfigJsonEnvironment(input, fallback = {}) {
   const raw = input && typeof input === 'object' && !Array.isArray(input) ? input : {};
   const legacy = fallback && typeof fallback === 'object' && !Array.isArray(fallback) ? fallback : {};
@@ -392,7 +437,14 @@ function publicAppConfig(appCfg, requestedEnvironment = 'test') {
   a.configJsonFileName = envConfig.configJsonFileName;
   a.configJsonSyncedAt = envConfig.configJsonSyncedAt;
   a.configEnvironment = environment;
+  a.bundleEnvironment = environment;
   delete a.configJsonEnvironments;
+  delete a.bundleEnvironments;
+  // 以下字段只供后台构建使用，端侧不需要。尤其不能把测试资源清单/体积统计下发给正式用户。
+  delete a.bundleExtraUrls;
+  delete a.bundleExcludeUrls;
+  delete a.bundleResourceMetrics;
+  delete a.bundleMaxSizeKB;
   return a;
 }
 
@@ -407,6 +459,7 @@ function normalizeAppConfig(appCfg) {
   // region/regionName remain for older SDK releases. New clients must use regions[].
   a.region = a.regions.length > 0 ? a.regions[0] : '';
   a.regionName = a.region ? (a.regionNames[a.region] || a.region) : '';
+  a.bundleEnvironments = normalizeBundleEnvironments(a);
   a.configJsonEnvironments = normalizeConfigJsonEnvironments(a);
   delete a.configJson;
   delete a.configJsonFileName;
@@ -487,13 +540,18 @@ function configRegions(apps) {
 }
 
 // ——————————————— 缓存构建程序触发 ———————————————
-function runCacheBuilder(mode, appId) {
+function runCacheBuilder(mode, appId, requestedEnvironment = LEGACY_BUNDLE_ENVIRONMENT) {
+  const environment = normalizeConfigEnvironment(requestedEnvironment, LEGACY_BUNDLE_ENVIRONMENT);
   return new Promise((resolve, reject) => {
     execFile(process.execPath, [CACHE_BUILDER, mode, appId], {
       cwd: __dirname,
       windowsHide: true,
       timeout: 10 * 60 * 1000,
-      maxBuffer: 10 * 1024 * 1024
+      maxBuffer: 10 * 1024 * 1024,
+      env: Object.assign({}, process.env, {
+        BUNDLES_DIR: bundleRoot(environment),
+        WEBACCEL_BUNDLE_ENVIRONMENT: environment
+      })
     }, (err, stdout, stderr) => {
       let parsed = null;
       const lines = String(stdout || '').trim().split(/\r?\n/).filter(Boolean);
@@ -519,13 +577,14 @@ const AUTO_UPDATE_FIRST_DELAY_MS = 60 * 1000;        // 服务启动 1 分钟后
 const AUTO_UPDATE_LOG = path.join(DATA_DIR, 'auto-update-log.json');
 const CONFIG_JSON_SYNC_LOG = path.join(DATA_DIR, 'config-json-sync-log.json');
 let autoUpdateRunning = false;
+let autoUpdateLiveLog = null;
 let configJsonSyncRunning = false;
 let configJsonSyncTimer = null;
 
 // ——————————————— Express ———————————————
 const app = express();
 app.use(cors());
-// 三套 configJson 会随管理配置一起提交；共享离线资源不重复，但 JSON 总量可能超过原 4MB。
+// 三套 configJson 和离线包环境配置会随管理配置一起提交，JSON 总量可能超过原 4MB。
 app.use(express.json({ limit: '16mb' }));
 
 // 同源托管管理界面(admin/web 构建产物):静态资源命中即返回,未命中则交给后续路由。
@@ -539,21 +598,31 @@ function requestConfigEnvironment(req) {
   );
 }
 
-// 鸿蒙 App 开机拉取(公开)。应用/离线包配置共享，只有 configJson 按环境覆盖。
-// 支持 /api/config?env=pre 和 /pre/api/config；无环境参数时兼容旧客户端，默认 test。
+function requestBundleEnvironment(req, fallback = DEFAULT_CONFIG_ENVIRONMENT) {
+  return normalizeConfigEnvironment(
+    req.params && req.params.environment || req.body && req.body.environment || req.query && req.query.environment ||
+      req.headers['x-webaccel-environment'],
+    fallback
+  );
+}
+
+// 鸿蒙 App 开机拉取(公开)。configJson 与离线包均按 test/pre/prod 隔离。
+// 支持 /api/config?env=pre 和 /pre/api/config；无环境参数时兼容旧客户端，默认 prod。
 function sendPublicConfig(req, res) {
   const environment = requestConfigEnvironment(req);
   const c = loadConfig();
   const apps = (c.apps || []).map((a) => {
     const appCfg = publicAppConfig(a, environment);
-    const mfPath = path.join(BUNDLES_DIR, appCfg.id, 'manifest.json');
-    const compressedMfPath = path.join(BUNDLES_DIR, appCfg.id, 'manifest.zz.json');
+    const environmentRoot = bundleRoot(environment);
+    const mfPath = path.join(environmentRoot, appCfg.id, 'manifest.json');
+    const compressedMfPath = path.join(environmentRoot, appCfg.id, 'manifest.zz.json');
     const hasBundle = fs.existsSync(mfPath);
+    const environmentEnabled = bundleEnabledInEnvironment(a, environment);
     const baseApp = Object.assign({}, appCfg, {
-      bundleConfigured: appCfg.bundle === true,
-      bundle: appCfg.bundle === true && hasBundle
+      bundleConfigured: environmentEnabled,
+      bundle: environmentEnabled && hasBundle
     });
-    if (appCfg.bundle && hasBundle) {
+    if (environmentEnabled && hasBundle) {
       // bundleVersion = 清单内容指纹:清单一变(资源增删改)它就变,设备据此判断"要不要更新离线包"
       let bundleVersion = '';
       let compressedBundleVersion = '';
@@ -575,7 +644,9 @@ function sendPublicConfig(req, res) {
   // 任务派发:把"待探索清单 + 共识阈值 K + 采样率"下发给设备(设备只对名单内 app 按采样率上报)
   const s = c.settings || {};
   const explore = {
-    apps: (c.apps || []).filter((a) => a.explore).map((a) => a.id), // 后台给某 app 设 explore:true 即入列
+    apps: (c.apps || [])
+      .filter((a) => a.explore && bundleEnabledInEnvironment(a, environment))
+      .map((a) => a.id), // 探索任务也按环境隔离，正式端不会采集测试包应用。
     k: s.exploreK || 3,
     sample: typeof s.exploreSample === 'number' ? s.exploreSample : 0.1
   };
@@ -585,10 +656,11 @@ function sendPublicConfig(req, res) {
 app.get('/api/config', sendPublicConfig);
 app.get('/:environment(test|pre|prod)/api/config', sendPublicConfig);
 
-// 离线包静态托管:App 从 /bundles/<id>/manifest.json 拉取
-app.use('/bundles', express.static(BUNDLES_DIR));
-// 环境路径只选择 configJson；离线资源仍指向同一个物理目录。
-app.use('/:environment(test|pre|prod)/bundles', express.static(BUNDLES_DIR));
+// 离线包静态托管：三个环境使用不同物理目录。根路径只兼容旧正式端，绝不指向测试包。
+app.use('/bundles', express.static(bundleRoot('prod')));
+for (const environment of CONFIG_ENVIRONMENTS) {
+  app.use(`/${environment}/bundles`, express.static(bundleRoot(environment)));
+}
 
 // ——————————————— 众包上报(设备探索结果)———————————————
 // 设备打开某 app 时,把加载到的静态资源 {url, hash, mime, size} 报上来(公开接口,带限频/校验)。
@@ -631,35 +703,41 @@ app.post('/api/report', async (req, res) => {
 // ——————————————— 端侧报错 → 后台离线包自愈 ———————————————
 // 端侧发现"离线包登记的资源实际读不出/坏了"时上报这里,后端立即重建该站离线包(自愈),
 // 不用等每天一次的定时检查。带防抖:同一站 5 分钟内只重建一次,避免大量上报打爆服务器。
-const selfHealLast = new Map();      // appId -> 上次自愈重建时刻
+const selfHealLast = new Map();      // environment|appId -> 上次自愈重建时刻
 const SELF_HEAL_COOLDOWN_MS = 5 * 60 * 1000;
-app.post('/api/report-error', (req, res) => {
+function handleBundleReportError(req, res) {
   const body = req.body || {};
   const appId = String(body.appId || '').trim();
   const reason = String(body.reason || 'bundle-resource-missing').slice(0, 64);
+  const environment = requestBundleEnvironment(req, LEGACY_BUNDLE_ENVIRONMENT);
   if (!appId) return res.status(400).json({ ok: false, error: 'bad request' });
   // 只对"配了离线包(bundle:true)"的站做自愈;动态站/未配离线包的站忽略(它们本就没离线包,无所谓坏)
   const app0 = (loadConfig().apps || []).find((a) => a.id === appId);
   if (!app0) return res.status(404).json({ ok: false, error: 'unknown app' });
-  if (app0.bundle !== true) return res.json({ ok: true, action: 'ignored', detail: '该站未配离线包,无需自愈' });
-  const now = Date.now();
-  const last = selfHealLast.get(appId) || 0;
-  if (now - last < SELF_HEAL_COOLDOWN_MS) {
-    return res.json({ ok: true, action: 'cooldown', detail: '近期已自愈,本次跳过' });
+  if (!bundleEnabledInEnvironment(app0, environment)) {
+    return res.json({ ok: true, environment, action: 'ignored', detail: '该环境未配离线包,无需自愈' });
   }
-  selfHealLast.set(appId, now);
+  const now = Date.now();
+  const healKey = `${environment}|${appId}`;
+  const last = selfHealLast.get(healKey) || 0;
+  if (now - last < SELF_HEAL_COOLDOWN_MS) {
+    return res.json({ ok: true, environment, action: 'cooldown', detail: '近期已自愈,本次跳过' });
+  }
+  selfHealLast.set(healKey, now);
   // 异步重建,立即返回(不阻塞端侧)
   (async () => {
     try {
-      console.log(`[self-heal] ${appId} 端侧报错(${reason}) → 立即重建离线包...`);
-      const bd = await buildWithRetry(appId);
-      console.log(`[self-heal] ${appId} 重建完成: ${bd && bd.count || 0} 个资源`);
+      console.log(`[self-heal] ${appId}[${environment}] 端侧报错(${reason}) → 立即重建离线包...`);
+      const bd = await buildWithRetry(appId, environment);
+      console.log(`[self-heal] ${appId}[${environment}] 重建完成: ${bd && bd.count || 0} 个资源`);
     } catch (e) {
-      console.warn(`[self-heal] ${appId} 重建失败:`, e && e.message);
+      console.warn(`[self-heal] ${appId}[${environment}] 重建失败:`, e && e.message);
     }
   })();
-  res.json({ ok: true, action: 'rebuilding', detail: '已触发离线包重建' });
-});
+  res.json({ ok: true, environment, action: 'rebuilding', detail: '已触发离线包重建' });
+}
+app.post('/api/report-error', handleBundleReportError);
+app.post('/:environment(test|pre|prod)/api/report-error', handleBundleReportError);
 
 // 登录:账号 + 密码 → 颁发会话 token
 app.post('/api/login', (req, res) => {
@@ -744,9 +822,10 @@ app.post('/api/admin/report/:id/build', async (req, res) => {
   const appCfg = (loadConfig().apps || []).find((a) => a.id === req.params.id);
   if (!appCfg) return res.status(404).json({ error: 'app not found' });
   const K = Math.max(1, parseInt(req.query.k || '2', 10));
+  const environment = requestBundleEnvironment(req);
   try {
-    const r = await buildFromConsensus(getPool(), appCfg, K, BUNDLES_DIR);
-    res.json(r);
+    const r = await buildFromConsensus(getPool(), appCfg, K, bundleRoot(environment));
+    res.json(Object.assign({ environment }, r));
   } catch (e) {
     res.status(500).json({ error: String(e && e.message || e) });
   }
@@ -806,35 +885,147 @@ app.put('/api/admin/apps', (req, res) => {
   // 保存前先算出"需要自动构建离线包"的站:bundle:true 且服务器上还没有离线包(manifest 不存在)。
   // 这样后台加一个新静态站(或把某站改成 bundle:true)保存后,离线包会自动在后台建好,
   // 用户第一次进入就能直接从离线包加载(首屏即快),不用再手动去 Bundles 页点构建。
-  const autoBuildIds = nextApps
-    .filter(a => a && a.id && a.bundle === true)
-    .filter(a => !fs.existsSync(path.join(BUNDLES_DIR, a.id, 'manifest.json')))
-    .map(a => a.id);
+  const autoBuildTargets = nextApps.flatMap((a) => {
+    if (!a || !a.id || a.bundle !== true) return [];
+    return normalizeBundleEnvironments(a)
+      .filter((environment) => !fs.existsSync(path.join(bundleRoot(environment), a.id, 'manifest.json')))
+      .map((environment) => ({ id: a.id, environment }));
+  });
   c.apps = nextApps;
   const saved = saveConfig(c);
   // 异步触发构建,不阻塞保存响应(构建可能要几十秒~几分钟)。逐个串行,避免并发抢网络。
-  if (autoBuildIds.length) {
+  if (autoBuildTargets.length) {
     (async () => {
-      for (const id of autoBuildIds) {
+      for (const target of autoBuildTargets) {
         try {
-          console.log(`[auto-build] 新静态站 ${id}: 自动构建离线包...`);
-          await runCacheBuilder('build', id);
-          console.log(`[auto-build] ${id} 离线包构建完成`);
+          console.log(`[auto-build] 新静态站 ${target.id}[${target.environment}]: 自动构建离线包...`);
+          await runCacheBuilder('build', target.id, target.environment);
+          console.log(`[auto-build] ${target.id}[${target.environment}] 离线包构建完成`);
         } catch (e) {
-          console.warn(`[auto-build] ${id} 构建失败(可去 Bundles 页手动重试):`, e && e.message);
+          console.warn(`[auto-build] ${target.id}[${target.environment}] 构建失败(可去 Bundles 页手动重试):`, e && e.message);
         }
       }
     })();
   }
-  res.json(Object.assign({}, saved, { autoBuilding: autoBuildIds }));
+  res.json(Object.assign({}, saved, { autoBuilding: autoBuildTargets }));
 });
-// 立即手动触发一次"自动检查更新所有站"(后台按钮用);异步执行,立即返回
+
+// 单应用保存：三环境 configJson 很大时，整表 PUT 会撞到反向代理请求体上限。
+// 此接口只保存应用元数据和同步规则，并始终保留服务器上的三套 configJson；
+// 前端随后通过 /bundles/:id/config-json 按环境逐份上传 JSON。
+app.put('/api/admin/apps/:id', (req, res) => {
+  const previousId = String(req.params.id || '').trim();
+  const raw = req.body && req.body.app;
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+    return res.status(400).json({ error: 'app 必须是对象' });
+  }
+  const c = loadConfig();
+  const apps = Array.isArray(c.apps) ? c.apps.map((item) => normalizeAppConfig(item)) : [];
+  const index = apps.findIndex((item) => item.id === previousId);
+  const previous = index >= 0 ? apps[index] : null;
+  const appCfg = normalizeAppConfig(raw);
+  if (!appCfg.id || !appCfg.url) {
+    return res.status(400).json({ error: 'ID 和 URL 必填' });
+  }
+  if (apps.some((item, itemIndex) => itemIndex !== index && item.id === appCfg.id)) {
+    return res.status(400).json({ error: `应用 ${appCfg.id}: ID 重复` });
+  }
+
+  const submittedEnvironments = normalizeConfigJsonEnvironments(raw);
+  const previousEnvironments = previous
+    ? normalizeConfigJsonEnvironments(previous)
+    : normalizeConfigJsonEnvironments({});
+  for (const environment of CONFIG_ENVIRONMENTS) {
+    const submittedSync = submittedEnvironments[environment].configJsonSync;
+    const previousSync = previousEnvironments[environment].configJsonSync;
+    if (submittedSync.loginBody === '******') submittedSync.loginBody = previousSync.loginBody;
+    if (submittedSync.configBody === '******') submittedSync.configBody = previousSync.configBody;
+    submittedSync.loginHeaders = mergeMaskedObject(submittedSync.loginHeaders, previousSync.loginHeaders);
+    submittedSync.configHeaders = mergeMaskedObject(submittedSync.configHeaders, previousSync.configHeaders);
+    // 单应用元数据请求不接收大 JSON，避免误清空已同步的环境配置。
+    submittedEnvironments[environment].configJson = previousEnvironments[environment].configJson;
+    submittedEnvironments[environment].configJsonFileName = previousEnvironments[environment].configJsonFileName;
+    submittedEnvironments[environment].configJsonSyncedAt = previousEnvironments[environment].configJsonSyncedAt;
+  }
+  appCfg.configJsonEnvironments = submittedEnvironments;
+  const error = validateAppConfigForWebsdk(appCfg);
+  if (error) return res.status(400).json({ error });
+
+  const autoBuildEnvironments = (!req.body || req.body.autoBuild !== false) && appCfg.bundle === true
+    ? normalizeBundleEnvironments(appCfg)
+      .filter((environment) => !fs.existsSync(path.join(bundleRoot(environment), appCfg.id, 'manifest.json')))
+    : [];
+  if (index >= 0) apps[index] = appCfg;
+  else apps.push(appCfg);
+  c.apps = apps;
+  const saved = saveConfig(c);
+  if (autoBuildEnvironments.length) {
+    (async () => {
+      for (const environment of autoBuildEnvironments) {
+        try {
+          console.log(`[auto-build] 单应用保存 ${appCfg.id}[${environment}]: 自动构建离线包...`);
+          await runCacheBuilder('build', appCfg.id, environment);
+          console.log(`[auto-build] ${appCfg.id}[${environment}] 离线包构建完成`);
+        } catch (e) {
+          console.warn(`[auto-build] ${appCfg.id}[${environment}] 构建失败(可去 Bundles 页手动重试):`, e && e.message);
+        }
+      }
+    })();
+  }
+  const responseApp = normalizeAppConfig(appCfg);
+  responseApp.configJsonEnvironments = redactConfigJsonEnvironments(responseApp);
+  res.json({
+    ok: true,
+    version: saved.version,
+    app: responseApp,
+    autoBuilding: autoBuildEnvironments.map((environment) => ({ id: appCfg.id, environment }))
+  });
+});
+
+// 删除单个应用配置，避免为了删除一行而重新上传全部三环境 JSON。
+app.delete('/api/admin/apps/:id', (req, res) => {
+  const id = String(req.params.id || '').trim();
+  const c = loadConfig();
+  const apps = Array.isArray(c.apps) ? c.apps : [];
+  const next = apps.filter((item) => String(item && item.id || '') !== id);
+  if (next.length === apps.length) return res.status(404).json({ error: 'app not found' });
+  c.apps = next;
+  const saved = saveConfig(c);
+  res.json({ ok: true, version: saved.version });
+});
+// 手动触发离线包检查/修复；异步执行，前端通过 log 接口持续轮询进度。
 app.post('/api/admin/auto-update/run', (req, res) => {
-  runAutoUpdateOnce('manual').catch(() => {});
-  res.json({ ok: true, message: '已触发自动检查更新(后台执行中,稍后查结果)' });
+  const appId = String(req.body && req.body.appId || '').trim();
+  const forceRebuild = req.body && req.body.forceRebuild === true;
+  const environment = requestBundleEnvironment(req);
+  if (autoUpdateRunning) {
+    return res.status(409).json({ ok: false, error: '已有离线包任务正在执行，请等待完成', log: autoUpdateLiveLog });
+  }
+  if (forceRebuild && !appId) {
+    return res.status(400).json({ ok: false, error: '强制重建必须指定 appId' });
+  }
+  if (appId) {
+    const appCfg = (loadConfig().apps || []).find((item) => item && item.id === appId);
+    if (!appCfg) return res.status(404).json({ ok: false, error: 'app not found' });
+    if (!bundleEnabledInEnvironment(appCfg, environment)) {
+      return res.status(400).json({ ok: false, error: '该应用未在所选环境启用离线包' });
+    }
+  }
+  runAutoUpdateOnce('manual', appId, forceRebuild, environment).catch((e) => {
+    console.error('[AutoUpdate] manual task failed:', e && e.message);
+  });
+  res.json({
+    ok: true,
+    environment,
+    message: appId ? '已触发当前网站离线包修复' : '已触发所选环境全部网站检查更新',
+    log: autoUpdateLiveLog
+  });
 });
-// 查上次自动更新结果
+// 查询实时任务或上次结果。
 app.get('/api/admin/auto-update/log', (req, res) => {
+  if (autoUpdateLiveLog) {
+    return res.json({ ok: true, running: autoUpdateRunning, log: autoUpdateLiveLog });
+  }
   try {
     const log = JSON.parse(fs.readFileSync(AUTO_UPDATE_LOG, 'utf8'));
     res.json({ ok: true, running: autoUpdateRunning, log });
@@ -1320,8 +1511,9 @@ function matchesAny(url, patterns) {
   return Array.isArray(patterns) && patterns.some((p) => matchesPattern(url, p));
 }
 
-function bundleInfo(id, appCfg) {
-  const dir = path.join(BUNDLES_DIR, id);
+function bundleInfo(id, appCfg, requestedEnvironment = DEFAULT_CONFIG_ENVIRONMENT) {
+  const environment = normalizeConfigEnvironment(requestedEnvironment, DEFAULT_CONFIG_ENVIRONMENT);
+  const dir = path.join(bundleRoot(environment), id);
   const mf = path.join(dir, 'manifest.json');
   if (!fs.existsSync(mf)) return null;
   const stat = fs.statSync(mf);
@@ -1432,6 +1624,7 @@ function bundleInfo(id, appCfg) {
   const cfgJsonEnvironments = appCfg ? configJsonEnvironmentInfo(appCfg) : {};
   return {
     id,
+    environment,
     name: appCfg && appCfg.name ? appCfg.name : id,
     url: appCfg && appCfg.url ? appCfg.url : '',
     scope: appCfg && appCfg.scope ? appCfg.scope : 'app',
@@ -1451,9 +1644,10 @@ function bundleInfo(id, appCfg) {
     bundleMaxSizeKB: appCfg && appCfg.bundleMaxSizeKB ? appCfg.bundleMaxSizeKB : 5120,
     configuredExtraCount: appCfg && Array.isArray(appCfg.bundleExtraUrls) ? appCfg.bundleExtraUrls.length : 0,
     builtAt: stat.mtime,
-    manifestUrl: `/bundles/${id}/manifest.json`,
+    manifestUrl: `/${environment}/bundles/${id}/manifest.json`,
     config: {
-      bundle: appCfg ? appCfg.bundle === true : false,
+      bundle: appCfg ? bundleEnabledInEnvironment(appCfg, environment) : false,
+      bundleEnvironments: appCfg ? normalizeBundleEnvironments(appCfg) : [],
       scope: appCfg && appCfg.scope ? appCfg.scope : 'app',
       region: appCfg && appCfg.region ? appCfg.region : '',
       regionName: appCfg && appCfg.regionName ? appCfg.regionName : '',
@@ -1487,15 +1681,18 @@ function bundleInfo(id, appCfg) {
 app.get('/api/admin/bundles', (req, res) => {
   const out = [];
   const cfg = loadConfig();
+  const environment = requestBundleEnvironment(req);
+  const environmentRoot = bundleRoot(environment);
   const seen = new Set();
   for (const appCfg of (cfg.apps || [])) {
     if (!appCfg || !appCfg.id) continue;
     seen.add(appCfg.id);
-    const info = bundleInfo(appCfg.id, appCfg);
+    const info = bundleInfo(appCfg.id, appCfg, environment);
     const cfgJson = configJsonInfo(appCfg);
     const cfgJsonEnvironments = configJsonEnvironmentInfo(appCfg);
     out.push(info || {
       id: appCfg.id,
+      environment,
       name: appCfg.name || appCfg.id,
       url: appCfg.url || '',
       scope: appCfg.scope || 'app',
@@ -1515,9 +1712,10 @@ app.get('/api/admin/bundles', (req, res) => {
       bundleMaxSizeKB: appCfg.bundleMaxSizeKB || 5120,
       configuredExtraCount: Array.isArray(appCfg.bundleExtraUrls) ? appCfg.bundleExtraUrls.length : 0,
       builtAt: null,
-      manifestUrl: `/bundles/${appCfg.id}/manifest.json`,
+      manifestUrl: `/${environment}/bundles/${appCfg.id}/manifest.json`,
       config: {
-        bundle: appCfg.bundle === true,
+        bundle: bundleEnabledInEnvironment(appCfg, environment),
+        bundleEnvironments: normalizeBundleEnvironments(appCfg),
         scope: appCfg.scope || 'app',
         region: appCfg.region || '',
         regionName: appCfg.regionName || '',
@@ -1537,10 +1735,10 @@ app.get('/api/admin/bundles', (req, res) => {
       resources: []
     });
   }
-  for (const id of fs.readdirSync(BUNDLES_DIR)) {
+  for (const id of fs.readdirSync(environmentRoot)) {
     if (seen.has(id) || id.startsWith('.')) continue;
     const appCfg = (cfg.apps || []).find((a) => a.id === id);
-    const info = bundleInfo(id, appCfg);
+    const info = bundleInfo(id, appCfg, environment);
     if (info) out.push(info);
   }
   res.json(out);
@@ -1569,7 +1767,6 @@ app.put('/api/admin/bundles/:id/config-json', async (req, res) => {
   envConfig.configJson = text;
   envConfig.configJsonFileName = fileName;
   envConfig.configJsonSyncedAt = new Date().toISOString();
-  if (text.length > 0 && req.body && req.body.enableBundle !== false) appCfg.bundle = true;
   c.apps[appIndex] = appCfg;
   saveConfig(c);
 
@@ -1577,10 +1774,10 @@ app.put('/api/admin/bundles/:id/config-json', async (req, res) => {
     ok: true,
     saved: true,
     environment,
-    // configJson 与离线资源解耦，更新 JSON 不再重建共享 manifest。
+    // configJson 与离线资源解耦，更新 JSON 不启用、也不重建任何环境的 manifest。
     manifest: null,
     configJson: configJsonInfo(appCfg, environment),
-    bundle: bundleInfo(appCfg.id, appCfg)
+    bundle: bundleInfo(appCfg.id, appCfg, environment)
   });
 });
 
@@ -1591,17 +1788,18 @@ app.put('/api/admin/bundles/:id/resource', async (req, res) => {
   if (!appCfg) return res.status(404).json({ error: 'app not found' });
   const url = String(req.body && req.body.url || '').trim();
   const enabled = req.body && req.body.enabled === true;
+  const environment = requestBundleEnvironment(req);
   if (!/^https?:\/\//.test(url)) return res.status(400).json({ error: 'bad url' });
   const list = Array.isArray(appCfg.bundleExcludeUrls) ? appCfg.bundleExcludeUrls.slice() : [];
   const next = enabled ? list.filter((x) => x !== url) : (list.includes(url) ? list : list.concat(url));
   appCfg.bundleExcludeUrls = next;
   saveConfig(c);
   try {
-    await runCacheBuilder('manifest', appCfg.id);
+    await runCacheBuilder('manifest', appCfg.id, environment);
   } catch (e) {
     return res.status(500).json({ error: String(e && e.message || e) });
   }
-  res.json({ ok: true, bundle: bundleInfo(appCfg.id, appCfg), bundleExcludeUrls: next });
+  res.json({ ok: true, environment, bundle: bundleInfo(appCfg.id, appCfg, environment), bundleExcludeUrls: next });
 });
 
 // 手动导入指定静态资源:适合真机发现的跨域大图/JS/CSS。
@@ -1610,10 +1808,11 @@ app.post('/api/admin/bundles/:id/import', async (req, res) => {
   const c = loadConfig();
   const appCfg = (c.apps || []).find((a) => a.id === req.params.id);
   if (!appCfg) return res.status(404).json({ error: 'app not found' });
+  const environment = requestBundleEnvironment(req);
   const imports = parseImportResources(req.body || {}, appCfg);
   if (!imports.length) return res.status(400).json({ error: '请填写至少一个 http(s) 静态资源 URL' });
 
-  const dir = path.join(BUNDLES_DIR, appCfg.id);
+  const dir = path.join(bundleRoot(environment), appCfg.id);
   fs.mkdirSync(dir, { recursive: true });
   const maxResourceKB = Math.max(0, Number(req.body && req.body.maxResourceKB || 0));
   const maxResourceBytes = maxResourceKB > 0 ? maxResourceKB * 1024 : 0;
@@ -1656,12 +1855,12 @@ app.post('/api/admin/bundles/:id/import', async (req, res) => {
     };
   }
   appCfg.bundleResourceMetrics = metrics;
-  if (req.body && req.body.enableBundle !== false) appCfg.bundle = true;
+  if (!req.body || req.body.enableBundle !== false) enableBundleEnvironment(appCfg, environment);
   saveConfig(c);
 
   let manifest = null;
   try {
-    manifest = await runCacheBuilder('manifest', appCfg.id);
+    manifest = await runCacheBuilder('manifest', appCfg.id, environment);
   } catch (e) {
     return res.status(500).json({
       ok: false,
@@ -1673,23 +1872,138 @@ app.post('/api/admin/bundles/:id/import', async (req, res) => {
   }
   res.json({
     ok: true,
+    environment,
     imported: imported.length,
     failed: results.length - imported.length,
     results,
     manifest,
-    bundle: bundleInfo(appCfg.id, appCfg),
+    bundle: bundleInfo(appCfg.id, appCfg, environment),
     bundleExtraUrls: appCfg.bundleExtraUrls
   });
 });
 
 // 检查源站是否有新资源:访问目标站并对比当前 manifest,不写缓存文件。
+// Import resource bodies captured by an authorized client/device. This is used
+// when the origin blocks the server IP but the resource loaded on the device.
+app.post('/api/admin/bundles/:id/import-content', async (req, res) => {
+  const c = loadConfig();
+  const appCfg = (c.apps || []).find((a) => a.id === req.params.id);
+  if (!appCfg) return res.status(404).json({ error: 'app not found' });
+  const environment = requestBundleEnvironment(req);
+
+  const input = Array.isArray(req.body && req.body.resources) ? req.body.resources.slice(0, 200) : [];
+  if (!input.length) return res.status(400).json({ error: 'resources is required' });
+
+  const maxResourceKB = Math.max(1, Number(req.body && req.body.maxResourceKB || 4096));
+  const maxResourceBytes = maxResourceKB * 1024;
+  const maxTotalBytes = 12 * 1024 * 1024;
+  const dir = path.join(bundleRoot(environment), appCfg.id);
+  fs.mkdirSync(dir, { recursive: true });
+
+  let totalBytes = 0;
+  const results = [];
+  const importedByUrl = new Map();
+  for (const item of input) {
+    const rawUrl = String(item && item.url || '').trim();
+    try {
+      const parsed = new URL(rawUrl);
+      if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') throw new Error('unsupported URL protocol');
+      const url = parsed.href;
+      const encoded = String(item && item.contentBase64 || '').replace(/\s+/g, '');
+      if (!encoded || !/^[A-Za-z0-9+/]*={0,2}$/.test(encoded)) throw new Error('invalid base64 content');
+      const buf = Buffer.from(encoded, 'base64');
+      if (!buf.length) throw new Error('empty content');
+      if (buf.length > maxResourceBytes) throw new Error(`resource exceeds ${maxResourceKB}KB limit`);
+      if (totalBytes + buf.length > maxTotalBytes) throw new Error('request exceeds 12MB decoded-content limit');
+
+      const file = fileNameForUrl(url);
+      const target = safeBundlePath(dir, file);
+      if (!target) throw new Error('bad target file');
+      fs.writeFileSync(target, buf);
+      totalBytes += buf.length;
+
+      const mime = String(item && item.mime || '').split(';')[0].trim().toLowerCase() || mimeOfPath(url);
+      const result = {
+        ok: true,
+        url,
+        file,
+        mime,
+        size: buf.length,
+        sizeKB: Math.round(buf.length / 102.4) / 10,
+        hash: crypto.createHash('sha256').update(buf).digest('hex')
+      };
+      results.push(result);
+      importedByUrl.set(url, { result, input: item || {} });
+    } catch (e) {
+      results.push({ ok: false, url: rawUrl, error: String(e && e.message || e) });
+    }
+  }
+
+  const imported = results.filter((r) => r.ok);
+  if (!imported.length) {
+    return res.status(400).json({ ok: false, imported: 0, failed: results.length, results });
+  }
+
+  const importedUrls = imported.map((r) => r.url);
+  const extra = new Set(Array.isArray(appCfg.bundleExtraUrls) ? appCfg.bundleExtraUrls : []);
+  for (const url of importedUrls) extra.add(url);
+  appCfg.bundleExtraUrls = Array.from(extra);
+  if (Array.isArray(appCfg.bundleExcludeUrls)) {
+    const importedSet = new Set(importedUrls);
+    appCfg.bundleExcludeUrls = appCfg.bundleExcludeUrls.filter((url) => !importedSet.has(url));
+  }
+
+  const metrics = appCfg.bundleResourceMetrics && typeof appCfg.bundleResourceMetrics === 'object'
+    ? Object.assign({}, appCfg.bundleResourceMetrics)
+    : {};
+  for (const [url, entry] of importedByUrl) {
+    const item = entry.input;
+    metrics[url] = {
+      size: entry.result.size,
+      measuredSize: Number(item.size) > 0 ? Number(item.size) : entry.result.size,
+      mime: entry.result.mime,
+      costMs: Number(item.costMs) > 0 ? Number(item.costMs) : 0,
+      source: String(item.source || 'device-content-import'),
+      measuredAt: new Date().toISOString()
+    };
+  }
+  appCfg.bundleResourceMetrics = metrics;
+  if (!req.body || req.body.enableBundle !== false) enableBundleEnvironment(appCfg, environment);
+  saveConfig(c);
+
+  try {
+    const manifest = await runCacheBuilder('manifest', appCfg.id, environment);
+    res.json({
+      ok: true,
+      environment,
+      imported: imported.length,
+      failed: results.length - imported.length,
+      totalBytes,
+      results,
+      manifest,
+      bundle: bundleInfo(appCfg.id, appCfg, environment),
+      bundleExtraUrls: appCfg.bundleExtraUrls
+    });
+  } catch (e) {
+    res.status(500).json({
+      ok: false,
+      imported: imported.length,
+      failed: results.length - imported.length,
+      totalBytes,
+      results,
+      error: String(e && e.message || e)
+    });
+  }
+});
+
 app.post('/api/admin/bundles/:id/check', async (req, res) => {
   const c = loadConfig();
   const appCfg = c.apps.find((a) => a.id === req.params.id);
   if (!appCfg) return res.status(404).json({ error: 'app not found' });
+  const environment = requestBundleEnvironment(req);
   try {
-    const r = await runCacheBuilder('check', appCfg.id);
-    res.json(r);
+    const r = await runCacheBuilder('check', appCfg.id, environment);
+    res.json(Object.assign({ environment }, r));
   } catch (e) {
     res.status(500).json({ error: String(e && e.message || e) });
   }
@@ -1700,9 +2014,10 @@ app.post('/api/admin/bundles/:id/update', async (req, res) => {
   const c = loadConfig();
   const appCfg = c.apps.find((a) => a.id === req.params.id);
   if (!appCfg) return res.status(404).json({ error: 'app not found' });
+  const environment = requestBundleEnvironment(req);
   try {
-    const r = await runCacheBuilder('update', appCfg.id);
-    res.json(r);
+    const r = await runCacheBuilder('update', appCfg.id, environment);
+    res.json(Object.assign({ environment }, r));
   } catch (e) {
     res.status(500).json({ error: String(e && e.message || e) });
   }
@@ -1713,9 +2028,10 @@ app.post('/api/admin/bundles/:id/build', async (req, res) => {
   const c = loadConfig();
   const appCfg = c.apps.find((a) => a.id === req.params.id);
   if (!appCfg) return res.status(404).json({ error: 'app not found' });
+  const environment = requestBundleEnvironment(req);
   try {
-    const r = await runCacheBuilder('build', appCfg.id);
-    res.json(r);
+    const r = await runCacheBuilder('build', appCfg.id, environment);
+    res.json(Object.assign({ environment }, r));
   } catch (e) {
     res.status(500).json({ error: String(e && e.message || e) });
   }
@@ -1726,85 +2042,149 @@ app.post('/api/admin/bundles/:id/manifest', async (req, res) => {
   const c = loadConfig();
   const appCfg = c.apps.find((a) => a.id === req.params.id);
   if (!appCfg) return res.status(404).json({ error: 'app not found' });
+  const environment = requestBundleEnvironment(req);
   try {
-    const r = await runCacheBuilder('manifest', appCfg.id);
-    res.json(r);
+    const r = await runCacheBuilder('manifest', appCfg.id, environment);
+    res.json(Object.assign({ environment }, r));
   } catch (e) {
     res.status(500).json({ error: String(e && e.message || e) });
   }
 });
 
-// SPA 兜底:非 /api、非 /bundles 的 GET 一律回 index.html,交给前端路由(刷新子页面不 404)
+// SPA 兜底:API 与三环境离线包路径不能误回管理页面 HTML。
 if (fs.existsSync(WEB_DIST)) {
   app.get('*', (req, res, next) => {
-    if (req.path.startsWith('/api') || req.path.startsWith('/bundles')) return next();
+    if (req.path.startsWith('/api') || req.path.startsWith('/bundles') ||
+      /^\/(test|pre|prod)\/bundles(?:\/|$)/.test(req.path)) return next();
     res.sendFile(path.join(WEB_DIST, 'index.html'));
   });
 }
 
-async function buildWithRetry(appId, maxRetries = 3) {
+async function buildWithRetry(appId, environment = LEGACY_BUNDLE_ENVIRONMENT, maxRetries = 3) {
   let lastErr = null;
   for (let i = 0; i < maxRetries; i++) {
     try {
-      return await runCacheBuilder('build', appId);
+      return await runCacheBuilder('build', appId, environment);
     } catch (e) {
       lastErr = e;
-      console.warn(`[AutoUpdate] ${appId} build 第 ${i + 1}/${maxRetries} 次失败: ${e.message}`);
+      console.warn(`[AutoUpdate] ${appId}[${environment}] build 第 ${i + 1}/${maxRetries} 次失败: ${e.message}`);
       if (i < maxRetries - 1) await new Promise((r) => setTimeout(r, 5000 * (i + 1))); // 5s/10s 退避
     }
   }
   throw lastErr;
 }
 
-async function runAutoUpdateOnce(trigger = 'scheduled') {
+function saveAutoUpdateLog(log) {
+  autoUpdateLiveLog = log;
+  try { fs.writeFileSync(AUTO_UPDATE_LOG, JSON.stringify(log, null, 2), 'utf8'); } catch {}
+}
+
+async function runAutoUpdateOnce(trigger = 'scheduled', onlyAppId = '', forceRebuild = false, onlyEnvironment = '') {
   const cfg = loadConfig();
-  if (trigger !== 'manual' && cfg.settings && cfg.settings.autoUpdate === false) {
-    console.log(`[AutoUpdate] disabled, skip ${trigger}`);
-    const log = { startedAt: new Date().toISOString(), finishedAt: new Date().toISOString(), trigger, skipped: true, reason: 'disabled', results: [] };
-    try { fs.writeFileSync(AUTO_UPDATE_LOG, JSON.stringify(log, null, 2), 'utf8'); } catch {}
-    return log;
-  }
   if (autoUpdateRunning) {
     console.log('[AutoUpdate] 上一轮还在进行,跳过本轮');
-    return;
+    return autoUpdateLiveLog;
+  }
+  if (trigger !== 'manual' && cfg.settings && cfg.settings.autoUpdate === false) {
+    console.log(`[AutoUpdate] disabled, skip ${trigger}`);
+    const now = new Date().toISOString();
+    const log = {
+      jobId: crypto.randomBytes(8).toString('hex'),
+      startedAt: now,
+      finishedAt: now,
+      trigger,
+      scope: 'all',
+      appId: '',
+      forceRebuild: false,
+      skipped: true,
+      reason: 'disabled',
+      total: 0,
+      completed: 0,
+      current: null,
+      results: []
+    };
+    saveAutoUpdateLog(log);
+    return log;
   }
   autoUpdateRunning = true;
   const startedAt = new Date().toISOString();
-  console.log(`[AutoUpdate] 开始自动检查更新 (${trigger}) ...`);
-  const apps = (cfg.apps || []).filter((a) => a.bundle === true);
-  const results = [];
-  for (const app of apps) {
-    const item = { id: app.id, name: app.name || app.id, action: 'none', ok: true, detail: '' };
-    try {
-      const chk = await runCacheBuilder('check', app.id);
-      if (chk && chk.changed) {
-        console.log(`[AutoUpdate] ${app.id} 有更新 → 增量更新`);
-        try {
-          const up = await runCacheBuilder('update', app.id);
-          item.action = 'update';
-          item.detail = `下载 ${up.downloaded || 0} 个新资源`;
-        } catch (upErr) {
-          console.warn(`[AutoUpdate] ${app.id} 增量更新失败,改为全量重建: ${upErr.message}`);
-          const bd = await buildWithRetry(app.id);
+  const selectedAppId = String(onlyAppId || '').trim();
+  const selectedEnvironment = normalizeConfigEnvironment(onlyEnvironment, '');
+  const targets = (cfg.apps || []).flatMap((app) => {
+    if (!app || app.bundle !== true || (selectedAppId && app.id !== selectedAppId)) return [];
+    return normalizeBundleEnvironments(app)
+      .filter((environment) => !selectedEnvironment || environment === selectedEnvironment)
+      .map((environment) => ({ app, environment }));
+  });
+  const log = {
+    jobId: crypto.randomBytes(8).toString('hex'),
+    startedAt,
+    finishedAt: '',
+    trigger,
+    scope: selectedAppId ? 'single' : 'all',
+    appId: selectedAppId,
+    environment: selectedEnvironment || 'all',
+    forceRebuild: forceRebuild === true,
+    skipped: false,
+    reason: '',
+    total: targets.length,
+    completed: 0,
+    current: null,
+    results: []
+  };
+  saveAutoUpdateLog(log);
+  console.log(`[AutoUpdate] 开始离线包任务 (${trigger}, ${selectedAppId || 'all'}) ...`);
+  try {
+    for (const target of targets) {
+      const app = target.app;
+      const environment = target.environment;
+      const item = { id: app.id, environment, name: app.name || app.id, action: 'none', ok: true, detail: '' };
+      log.current = { id: app.id, environment, name: app.name || app.id, index: log.completed + 1 };
+      saveAutoUpdateLog(log);
+      try {
+        if (forceRebuild === true) {
+          console.log(`[AutoUpdate] ${app.id}[${environment}] 用户触发强制重建`);
+          const rebuilt = await buildWithRetry(app.id, environment);
           item.action = 'rebuild';
-          item.detail = `重建 ${bd.count || 0} 个资源` + (bd.failed ? `(${bd.failed} 个失败)` : '');
+          item.detail = `重建 ${rebuilt.count || 0} 个资源` + (rebuilt.failed ? `(${rebuilt.failed} 个失败)` : '');
+        } else {
+          const chk = await runCacheBuilder('check', app.id, environment);
+          if (chk && chk.changed) {
+            console.log(`[AutoUpdate] ${app.id}[${environment}] 有更新 → 增量更新`);
+            try {
+              const up = await runCacheBuilder('update', app.id, environment);
+              item.action = 'update';
+              item.detail = `下载 ${up.downloaded || 0} 个新资源`;
+            } catch (upErr) {
+              console.warn(`[AutoUpdate] ${app.id}[${environment}] 增量更新失败,改为全量重建: ${upErr.message}`);
+              const bd = await buildWithRetry(app.id, environment);
+              item.action = 'rebuild';
+              item.detail = `重建 ${bd.count || 0} 个资源` + (bd.failed ? `(${bd.failed} 个失败)` : '');
+            }
+          } else {
+            item.action = 'no-change';
+            item.detail = '源站无更新';
+          }
         }
-      } else {
-        item.action = 'no-change';
-        item.detail = '源站无更新';
+      } catch (e) {
+        item.ok = false;
+        item.detail = '检查/构建失败: ' + e.message;
+        console.error(`[AutoUpdate] ${app.id}[${environment}] 失败: ${e.message}`);
       }
-    } catch (e) {
-      item.ok = false;
-      item.detail = '检查/构建失败: ' + e.message;
-      console.error(`[AutoUpdate] ${app.id} 失败: ${e.message}`);
+      log.results.push(item);
+      log.completed = log.results.length;
+      log.current = null;
+      saveAutoUpdateLog(log);
     }
-    results.push(item);
+    log.finishedAt = new Date().toISOString();
+    console.log(`[AutoUpdate] 完成,处理 ${log.results.length} 个站`);
+    return log;
+  } finally {
+    if (!log.finishedAt) log.finishedAt = new Date().toISOString();
+    log.current = null;
+    saveAutoUpdateLog(log);
+    autoUpdateRunning = false;
   }
-  const log = { startedAt, finishedAt: new Date().toISOString(), trigger, results };
-  try { fs.writeFileSync(AUTO_UPDATE_LOG, JSON.stringify(log, null, 2), 'utf8'); } catch {}
-  autoUpdateRunning = false;
-  console.log(`[AutoUpdate] 完成,处理 ${results.length} 个站`);
-  return log;
 }
 
 function startAutoUpdateScheduler() {

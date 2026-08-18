@@ -54,7 +54,7 @@ interface WebAccelOptions {
   blockHosts?: string[];     // 可选黑名单
   settings?: RemoteSettings; // 沙箱容量、离线包并发等
   autoRefresh?: boolean;     // 是否启动后自动拉后台配置,默认 true
-  configRefreshSec?: number; // 后台应用 JSON 轮询间隔;默认 300 秒,0 表示关闭
+  configRefreshSec?: number; // 后台应用 JSON 轮询间隔；线上默认 60 秒，SDK 内置默认 300 秒，0 表示关闭
 }
 ```
 
@@ -198,7 +198,7 @@ const apps: RemoteApp[] = [
 5. 资源下载源是后台 `/bundles/<site>/...`,但本地命中 key 是网页原始 URL。
 6. 文本资源可用 `.zz` 压缩落盘;命中时端侧内存解压后返回原文给 WebView。
 7. 未进入离线包的资源直接走网络,不会被端侧运行时自动缓存。
-8. 后台更新应用 JSON 后,端侧启动会立即拉一次,前台会按 `configRefreshSec` 周期自动拉 `/api/config`;也可调用 `WebAccel.refreshConfig()` 立即刷新。
+8. 后台更新应用 JSON 后,端侧启动会立即拉一次,前台会按 `configRefreshSec` 周期自动拉 `/api/config`;当前线上三个环境均配置为 60 秒，也可调用 `WebAccel.refreshConfig()` 立即刷新。
 9. 后台更新自建网站的 `configJson` 后,端侧拉到新的 `/api/config` 会直接更新本地兜底 JSON,不要求离线包版本变化。
 10. 如果该站点的 `configJson` 由第三方后台自动同步,那么后台定时任务只是把最新 JSON 写进 `/api/config`;SDK 侧的使用方式不变。
 11. 后台更新静态资源离线包后,端侧拉到新 `bundleVersion` 会重新下载清单和新增/变更资源;刷新成功后 SDK 会自动检查 TOP、当前地区和当前会话已打开的网站。

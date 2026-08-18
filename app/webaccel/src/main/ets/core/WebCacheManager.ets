@@ -147,6 +147,8 @@ class WebCacheManager {
   private appScopeById: Map<string, string> = new Map();
   private appRegionById: Map<string, string> = new Map();
   private appRegionsById: Map<string, string[]> = new Map();
+  private enabledBundleIds: Set<string> = new Set();
+  private enabledBundleOrigins: Set<string> = new Set();
   private reportedSelfHeal: Set<string> = new Set();          // 已上报过自愈的 appId(本次会话只报一次,防刷)
   private serverBase: string = '';                            // 后端地址(applyApps 时由 remoteConfig.getServer() 注入,自愈上报用)
 
@@ -220,10 +222,14 @@ class WebCacheManager {
     this.appScopeById.clear();
     this.appRegionById.clear();
     this.appRegionsById.clear();
+    this.enabledBundleIds.clear();
+    this.enabledBundleOrigins.clear();
+    const configJsonById: Map<string, string> = new Map();
     if (server && server.length > 0) {
       this.serverBase = server.replace(/\/+$/, '');
     }
     if (!apps || apps.length === 0) {
+      this.reconcileConfiguredBundles();
       return;
     }
     for (let i = 0; i < apps.length; i++) {
@@ -286,12 +292,51 @@ class WebCacheManager {
       // 仅 bundle:true 的站记 origin→appId,用于"离线包资源实际读不出→上报后台自愈"
       if (app.bundle === true && app.id && app.id.length > 0) {
         this.bundleAppByOrigin.set(origin, app.id);
+        this.enabledBundleIds.add(app.id);
+        this.enabledBundleOrigins.add(origin);
+        if (app.appId && app.appId.length > 0) {
+          this.enabledBundleIds.add(app.appId);
+        }
       }
       if (app.id && app.id.length > 0) {
-        this.updateConfigJson(app.id, app.configJson ? app.configJson : '');
+        configJsonById.set(app.id, app.configJson ? app.configJson : '');
       }
     }
+    // 配置刷新后必须按当前环境做一次收敛。否则设备曾在旧版共享配置中下载过的包，
+    // 即使新配置已将 bundle 关闭，也仍可能继续从沙箱命中。
+    this.reconcileConfiguredBundles();
+    configJsonById.forEach((configJson: string, id: string) => {
+      this.updateConfigJson(id, configJson);
+    });
     hilog.info(DOMAIN, TAG, 'applyApps: %{public}d origins', this.mergedBlockByOrigin.size);
+  }
+
+  /** 删除当前配置已不再启用的离线资源；configJson 会由 applyApps 随后按本环境重新写入。 */
+  private reconcileConfiguredBundles(): void {
+    const staleIds: Set<string> = new Set();
+    this.bundleState.forEach((state: BundleState, key: string) => {
+      const id: string = state.id && state.id.length > 0 ? state.id : key;
+      const origin: string = state.origin ? state.origin : '';
+      const hasBundleResources: boolean = !!state.urls && state.urls.length > 0;
+      if (hasBundleResources && !this.enabledBundleIds.has(id) && !this.enabledBundleOrigins.has(origin)) {
+        staleIds.add(id);
+      }
+    });
+    this.diskIndex.forEach((entry: DiskEntry) => {
+      if (entry.source !== 'bundle' || !entry.bundleId || entry.bundleId.length === 0) {
+        return;
+      }
+      if (!this.enabledBundleIds.has(entry.bundleId) && !this.enabledBundleOrigins.has(entry.bundleId)) {
+        staleIds.add(entry.bundleId);
+      }
+    });
+    staleIds.forEach((id: string) => {
+      this.deleteBundle(id);
+    });
+    if (staleIds.size > 0) {
+      hilog.info(DOMAIN, TAG, 'reconcileConfiguredBundles removed=%{public}d enabled=%{public}d',
+        staleIds.size, this.enabledBundleIds.size);
+    }
   }
 
   /** 取某 URL 对应的合并黑名单(全局+该应用额外);无应用匹配时退回全局 */
@@ -414,12 +459,21 @@ class WebCacheManager {
       return;
     }
     const urls: string[] = [];
-    const state: BundleState | undefined = this.bundleState.get(id);
-    if (state && state.urls) {
-      for (let i = 0; i < state.urls.length; i++) {
-        urls.push(state.urls[i]);
+    const stateKeys: string[] = [];
+    this.bundleState.forEach((state: BundleState, key: string) => {
+      if (key !== id && state.id !== id && state.origin !== id) {
+        return;
       }
-    }
+      stateKeys.push(key);
+      if (state.urls) {
+        for (let i = 0; i < state.urls.length; i++) {
+          const disk: DiskEntry | undefined = this.diskIndex.get(state.urls[i]);
+          if ((!disk || !disk.bundleId || disk.bundleId === id) && urls.indexOf(state.urls[i]) < 0) {
+            urls.push(state.urls[i]);
+          }
+        }
+      }
+    });
     this.diskIndex.forEach((v: DiskEntry, k: string) => {
       if (v.bundleId === id) {
         if (urls.indexOf(k) < 0) {
@@ -430,10 +484,15 @@ class WebCacheManager {
     for (let i = 0; i < urls.length; i++) {
       this.removeCached(urls[i]);
     }
-    this.bundleState.delete(id);
-    this.bundleProgress.delete(id);
-    this.bundleErrors.delete(id);
-    this.loadedBundles.delete(id);
+    for (let i = 0; i < stateKeys.length; i++) {
+      const key: string = stateKeys[i];
+      this.bundleState.delete(key);
+      this.bundleProgress.delete(key);
+      this.bundleErrors.delete(key);
+      this.loadedBundles.delete(key);
+      this.pendingBundleVersionByKey.delete(key);
+    }
+    this.cancelBundleQueue(id, stateKeys);
     this.saveDiskIndex();
     this.saveBundleState();
     hilog.info(DOMAIN, TAG, 'deleteBundle %{public}s urls=%{public}d', id, urls.length);
@@ -602,6 +661,10 @@ class WebCacheManager {
     if (!owner) {
       return false;
     }
+    if (owner.bundleId.length > 0 && !this.enabledBundleIds.has(owner.bundleId) &&
+      !this.enabledBundleOrigins.has(owner.bundleId) && !this.enabledBundleOrigins.has(owner.origin)) {
+      return true;
+    }
     if (owner.scope === 'region') {
       if (owner.region.length > 0 && owner.region !== this.activeRegion) {
         return true;
@@ -611,6 +674,30 @@ class WebCacheManager {
       }
     }
     return false;
+  }
+
+  private cancelBundleQueue(id: string, stateKeys: string[]): void {
+    if (this.bundleQueue.length === 0) {
+      return;
+    }
+    const next: RawEntry[] = [];
+    let removed: number = 0;
+    for (let i = 0; i < this.bundleQueue.length; i++) {
+      const entry: RawEntry = this.bundleQueue[i];
+      const owner: BundleResourceOwner | undefined = this.bundleQueueOwners.get(entry.url);
+      const keyMatches: boolean = !!owner && stateKeys.indexOf(owner.bundleKey) >= 0;
+      if (owner && (owner.bundleId === id || owner.origin === id || keyMatches)) {
+        this.bundleQueueSources.delete(entry.url);
+        this.bundleQueueOwners.delete(entry.url);
+        removed++;
+      } else {
+        next.push(entry);
+      }
+    }
+    this.bundleQueue = next;
+    if (removed > 0) {
+      hilog.info(DOMAIN, TAG, 'cancelBundleQueue %{public}s removed=%{public}d', id, removed);
+    }
   }
 
   private cancelRegionQueue(region: string): void {
@@ -659,7 +746,8 @@ class WebCacheManager {
       let done: number = 0;
       for (let i = 0; i < state.urls.length; i++) {
         const u: string = state.urls[i];
-        if (this.diskIndex.has(u)) {
+        const disk: DiskEntry | undefined = this.diskIndex.get(u);
+        if (disk !== undefined && disk.source === 'bundle') {
           done++;
         }
       }
@@ -688,9 +776,14 @@ class WebCacheManager {
         });
       }
     }
-    if (!state) {
-      return false;
-    }
+    return this.isBundleStateReady(state, bundleVersion);
+  }
+
+  /**
+   * 版本号相同还不等于离线包真的可用：旧的 runtime 缓存可能占用了同一个 URL，
+   * 或磁盘文件已丢失。只有索引中的每一项都明确属于 bundle，才允许命中版本门。
+   */
+  private isBundleStateReady(state: BundleState | undefined, bundleVersion: string = ''): boolean {
     if (!state || !state.urls || state.urls.length === 0) {
       return false;
     }
@@ -698,8 +791,8 @@ class WebCacheManager {
       return false;
     }
     for (let i = 0; i < state.urls.length; i++) {
-      const u: string = state.urls[i];
-      if (!this.diskIndex.has(u)) {
+      const disk: DiskEntry | undefined = this.diskIndex.get(state.urls[i]);
+      if (disk === undefined || disk.source !== 'bundle') {
         return false;
       }
     }
@@ -793,6 +886,8 @@ class WebCacheManager {
     const disk: DiskEntry | undefined = this.diskIndex.get(cacheKey);
     if (disk) {
       if (disk.source !== 'bundle') {
+        hilog.warn(DOMAIN, TAG, 'offline entry has invalid source=%{public}s, remove %{public}s',
+          disk.source && disk.source.length > 0 ? disk.source : '(none)', cacheKey);
         this.removeCached(cacheKey);
         this.saveDiskIndex();
         return null;
@@ -1142,17 +1237,21 @@ class WebCacheManager {
     // 版本门:已应用版本 == 当前下发版本 → 离线包无变化,直接用本地(连清单都不拉)
     const applied: BundleState | undefined = this.bundleState.get(bundleKey);
     if (bundleVersion.length > 0 && applied !== undefined && applied.version === bundleVersion) {
-      this.updateAppliedConfigJsonIfChanged(bundleKey, applied, configJson, configJsonAuthoritative);
-      this.warmCompressedDiskEntriesForUrls(applied.urls);
-      hilog.info(DOMAIN, TAG, 'bundle already applied key=%{public}s id=%{public}s origin=%{public}s region=%{public}s scope=%{public}s ver=%{public}s urls=%{public}d configJsonBytes=%{public}d',
-        bundleKey,
-        applied.id && applied.id.length > 0 ? applied.id : owner.bundleId,
-        applied.origin && applied.origin.length > 0 ? applied.origin : origin,
-        applied.region && applied.region.length > 0 ? applied.region : '(none)',
-        applied.scope && applied.scope.length > 0 ? applied.scope : owner.scope,
-        bundleVersion, applied.urls.length,
-        applied.configJson && applied.configJson.length > 0 ? applied.configJson.length : 0);
-      return;
+      if (this.isBundleStateReady(applied, bundleVersion)) {
+        this.updateAppliedConfigJsonIfChanged(bundleKey, applied, configJson, configJsonAuthoritative);
+        this.warmCompressedDiskEntriesForUrls(applied.urls);
+        hilog.info(DOMAIN, TAG, 'bundle already applied key=%{public}s id=%{public}s origin=%{public}s region=%{public}s scope=%{public}s ver=%{public}s urls=%{public}d configJsonBytes=%{public}d',
+          bundleKey,
+          applied.id && applied.id.length > 0 ? applied.id : owner.bundleId,
+          applied.origin && applied.origin.length > 0 ? applied.origin : origin,
+          applied.region && applied.region.length > 0 ? applied.region : '(none)',
+          applied.scope && applied.scope.length > 0 ? applied.scope : owner.scope,
+          bundleVersion, applied.urls.length,
+          applied.configJson && applied.configJson.length > 0 ? applied.configJson.length : 0);
+        return;
+      }
+      hilog.warn(DOMAIN, TAG, 'bundle state incomplete despite matching version, revalidate manifest key=%{public}s ver=%{public}s',
+        bundleKey, bundleVersion);
     }
     if (this.loadedBundles.has(bundleKey)) {
       if (applied !== undefined) {
@@ -1168,9 +1267,13 @@ class WebCacheManager {
           this.pendingBundleVersionByKey.set(bundleKey, bundleVersion);
           hilog.info(DOMAIN, TAG, 'bundle version pending until current download completes: %{public}s', bundleVersion);
           return;
-        } else {
+        } else if (this.isBundleStateReady(current, bundleVersion)) {
           this.updateAppliedConfigJsonIfChanged(bundleKey, current, configJson, configJsonAuthoritative);
           return;
+        } else {
+          this.loadedBundles.delete(bundleKey);
+          hilog.warn(DOMAIN, TAG, 'loaded bundle state incomplete, revalidate manifest key=%{public}s ver=%{public}s',
+            bundleKey, bundleVersion);
         }
       } else {
         if (applied !== undefined) {
@@ -1236,9 +1339,14 @@ class WebCacheManager {
         const haveEncoding: string = diskExisting.encoding && diskExisting.encoding.length > 0 ? diskExisting.encoding : '';
         const wantRawSize: number = e.rawSize && e.rawSize > 0 ? e.rawSize : 0;
         const wantSize: number = e.size && e.size > 0 ? e.size : 0;
-        if (wantEncoding !== haveEncoding ||
+        if (diskExisting.source !== 'bundle' ||
+          wantEncoding !== haveEncoding ||
           (wantRawSize > 0 && diskExisting.rawSize !== wantRawSize) ||
           (wantSize > 0 && diskExisting.size !== wantSize)) {
+          if (diskExisting.source !== 'bundle') {
+            hilog.warn(DOMAIN, TAG, 'replace non-bundle cache source=%{public}s url=%{public}s',
+              diskExisting.source && diskExisting.source.length > 0 ? diskExisting.source : '(none)', e.url);
+          }
           this.removeCached(e.url);
         } else {
           if (haveEncoding.length > 0) {

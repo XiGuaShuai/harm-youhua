@@ -7,7 +7,10 @@ import zlib from 'node:zlib';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const DATA_FILE = path.join(__dirname, 'data', 'config.json');
-const BUNDLES_DIR = path.join(__dirname, 'bundles');
+// 管理服务按 test/pre/prod 为每次构建注入独立目录；直接执行脚本时仍兼容旧目录。
+const BUNDLES_DIR = process.env.BUNDLES_DIR
+  ? path.resolve(process.env.BUNDLES_DIR)
+  : path.join(__dirname, 'bundles');
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36';
 
 function uaOf(appCfg) {
@@ -564,6 +567,26 @@ function atomicReplace(tmp, target) {
   fs.renameSync(tmp, target);
 }
 
+// 目录级替换先把旧包改名留在同一文件系统；新包就位失败时立即恢复旧包。
+// 避免 rm(old) 与 rename(new) 之间的窗口让线上 manifest 短暂或永久消失。
+function replaceBundleDirectory(tmpDir, outDir) {
+  const backupDir = `${outDir}.previous-${process.pid}-${Date.now()}`;
+  const hadOld = fs.existsSync(outDir);
+  if (hadOld) fs.renameSync(outDir, backupDir);
+  try {
+    fs.renameSync(tmpDir, outDir);
+    if (hadOld) fs.rmSync(backupDir, { recursive: true, force: true });
+  } catch (e) {
+    try {
+      if (fs.existsSync(outDir)) fs.rmSync(outDir, { recursive: true, force: true });
+      if (hadOld && fs.existsSync(backupDir)) fs.renameSync(backupDir, outDir);
+    } catch (restoreError) {
+      throw new Error(`新包替换失败且旧包恢复失败: ${e.message}; restore=${restoreError.message}`);
+    }
+    throw e;
+  }
+}
+
 function looksLikeHtml(buf) {
   const head = buf.subarray(0, Math.min(buf.length, 512)).toString('utf8').trim().toLowerCase();
   return head.startsWith('<!doctype html') || head.startsWith('<html') || head.includes('<iframe');
@@ -702,8 +725,7 @@ function buildConfigOnlyBundle(appCfg, reason = null) {
   writeManifest(tmpDir, appCfg, manifest);
   const compressed = writeCompressedManifest(tmpDir, manifest, appCfg);
   const compressedTotal = compressed.reduce((sum, entry) => sum + Number(entry.size || 0), 0);
-  fs.rmSync(outDir, { recursive: true, force: true });
-  fs.renameSync(tmpDir, outDir);
+  replaceBundleDirectory(tmpDir, outDir);
   return {
     id: appCfg.id,
     count: manifest.length,
@@ -742,6 +764,7 @@ async function buildServerCache(appCfg) {
 
   const outDir = path.join(BUNDLES_DIR, appCfg.id);
   const tmpDir = path.join(BUNDLES_DIR, `.${appCfg.id}.build-${process.pid}-${Date.now()}`);
+  const previousResourceCount = fs.existsSync(outDir) ? readManifestByFile(outDir).size : 0;
   fs.rmSync(tmpDir, { recursive: true, force: true });
   fs.mkdirSync(tmpDir, { recursive: true });
   const requiredUrls = configuredBundleUrls(appCfg);
@@ -762,6 +785,14 @@ async function buildServerCache(appCfg) {
   const BUDGET = bundleBudgetBytes(appCfg);
   let failed = 0, skipped = 0, skippedByPolicy = 0, skippedByConfig = 0;
   const requiredFailed = [];
+  const criticalFailed = [];
+  const recordFailure = (entry, error) => {
+    failed++;
+    const detail = { url: entry.url, error: String(error || '') };
+    if (requiredUrls.has(entry.url)) requiredFailed.push(detail);
+    const mime = String(entry.mime || '').toLowerCase();
+    if (mime.includes('javascript') || mime === 'text/css') criticalFailed.push(detail);
+  };
   for (const e of discovered.resources) {
     if (e.file === 'home.html') continue;
     if (isBundleExcluded(appCfg, e.url)) { skippedByConfig++; continue; }
@@ -769,16 +800,14 @@ async function buildServerCache(appCfg) {
       const started = Date.now();
       const res = await fetch(e.sourceUrl, { headers: { 'User-Agent': uaOf(appCfg) } });
       if (!res.ok) {
-        failed++;
-        if (requiredUrls.has(e.url)) requiredFailed.push({ url: e.url, error: `${res.status}` });
+        recordFailure(e, `${res.status}`);
         continue;
       }
       const len = parseInt(res.headers.get('content-length') || '0', 10);
       if (len > 0 && total + len > BUDGET) { skipped++; try { await res.body?.cancel(); } catch {} continue; }
       const buf = Buffer.from(await res.arrayBuffer());
       if (!buf.length) {
-        failed++;
-        if (requiredUrls.has(e.url)) requiredFailed.push({ url: e.url, error: 'empty response' });
+        recordFailure(e, 'empty response');
         continue;
       }
       validateDownloaded(e, res, buf);
@@ -789,21 +818,32 @@ async function buildServerCache(appCfg) {
       fs.writeFileSync(path.join(tmpDir, e.file), buf);
       manifest.push(manifestEntry(e, tmpDir, { size: buf.length, hash: sha256(buf), costMs }));
     } catch (err) {
-      failed++;
-      if (requiredUrls.has(e.url)) requiredFailed.push({ url: e.url, error: String(err && err.message || err) });
+      recordFailure(e, String(err && err.message || err));
     }
   }
   if (requiredFailed.length > 0) {
     fs.rmSync(tmpDir, { recursive: true, force: true });
     throw new Error(`关键固定资源下载失败,保留旧离线包: ${requiredFailed.slice(0, 3).map((e) => e.url).join(', ')}`);
   }
+  const successfulResourceCount = manifest.filter((entry) => entry.file !== 'home.html').length;
+  const attemptedResourceCount = successfulResourceCount + failed;
+  const failureRate = attemptedResourceCount > 0 ? failed / attemptedResourceCount : 0;
+  const severelyShrunk = previousResourceCount > 0 && failed > 0 &&
+    successfulResourceCount < Math.max(1, Math.ceil(previousResourceCount * 0.5));
+  if (previousResourceCount > 0 &&
+      (criticalFailed.length > 0 || failureRate > 0.25 || severelyShrunk)) {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+    const reason = criticalFailed.length > 0
+      ? `关键 JS/CSS 失败 ${criticalFailed.length} 个`
+      : `失败率 ${Math.round(failureRate * 100)}%，成功 ${successfulResourceCount}/${attemptedResourceCount}`;
+    throw new Error(`新包质量检查不通过(${reason}),保留旧离线包`);
+  }
   const configJsonBytes = syncConfigJsonResource(appCfg, tmpDir, manifest);
   total += configJsonBytes;
   writeManifest(tmpDir, appCfg, manifest);
   const compressed = writeCompressedManifest(tmpDir, manifest, appCfg);
   const compressedTotal = compressed.reduce((sum, entry) => sum + Number(entry.size || 0), 0);
-  fs.rmSync(outDir, { recursive: true, force: true });
-  fs.renameSync(tmpDir, outDir);
+  replaceBundleDirectory(tmpDir, outDir);
   const result = { id: appCfg.id, count: manifest.length, discovered: discovered.resources.length, failed, skipped, skippedByPolicy, skippedByConfig, kb: Math.round(total / 1024), compressedKB: Math.round(compressedTotal / 1024), builtAt: new Date().toISOString(), mode: 'server-cache' };
   if (discoveryWarning) result.warning = discoveryWarning;
   return result;

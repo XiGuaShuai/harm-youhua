@@ -1,5 +1,5 @@
 <script setup>
-import { ref, onMounted, computed, watch } from 'vue';
+import { ref, onMounted, onBeforeUnmount, computed, watch } from 'vue';
 import { useRoute } from 'vue-router';
 import { ElMessage } from 'element-plus';
 import { Search, Upload } from '@element-plus/icons-vue';
@@ -28,15 +28,25 @@ const configEnvironmentOptions = [
   { id: 'pre', name: '预发' },
   { id: 'prod', name: '正式' }
 ];
+const bundleEnvironment = ref(
+  ['test', 'pre', 'prod'].includes(String(route.query.environment || ''))
+    ? String(route.query.environment)
+    : 'test'
+);
+const bundleEnvironmentName = computed(() =>
+  configEnvironmentOptions.find((item) => item.id === bundleEnvironment.value)?.name || bundleEnvironment.value
+);
 
 const autoLog = ref(null);
 const autoRunning = ref(false);
 const triggering = ref(false);
+const triggeringScope = ref('');
+let autoPollTimer = 0;
 
 async function load() {
   loading.value = true;
   try {
-    const { data } = await api.get('/api/admin/bundles');
+    const { data } = await api.get('/api/admin/bundles', { params: { environment: bundleEnvironment.value } });
     bundles.value = Array.isArray(data) ? data : [];
     const requestedId = typeof route.query.app === 'string' ? route.query.app : '';
     if (requestedId && bundles.value.some((b) => b.id === requestedId)) {
@@ -47,14 +57,21 @@ async function load() {
   } finally {
     loading.value = false;
   }
-  loadAutoLog();
+  await loadAutoLog();
+  scheduleAutoPoll();
 }
 onMounted(load);
+onBeforeUnmount(() => stopAutoPoll());
 
 watch(() => route.query.app, (appId) => {
   if (typeof appId === 'string' && bundles.value.some((bundle) => bundle.id === appId)) {
     selectedId.value = appId;
   }
+});
+
+watch(bundleEnvironment, () => {
+  selectedId.value = '';
+  load();
 });
 
 watch(groupFilter, () => {
@@ -71,19 +88,63 @@ async function loadAutoLog() {
   } catch (e) { /* ignore */ }
 }
 
-async function runAutoUpdate() {
+function stopAutoPoll() {
+  if (autoPollTimer) {
+    window.clearTimeout(autoPollTimer);
+    autoPollTimer = 0;
+  }
+}
+
+function scheduleAutoPoll() {
+  stopAutoPoll();
+  if (!autoRunning.value) return;
+  autoPollTimer = window.setTimeout(async () => {
+    const wasRunning = autoRunning.value;
+    await loadAutoLog();
+    if (wasRunning && !autoRunning.value) {
+      const failed = (autoLog.value?.results || []).filter((item) => !item.ok).length;
+      if (failed > 0) ElMessage.warning(`离线包任务完成，失败 ${failed} 个，请查看红色结果`);
+      else ElMessage.success('离线包任务已完成');
+      await load();
+      return;
+    }
+    scheduleAutoPoll();
+  }, 2000);
+}
+
+async function runAutoUpdate(appId = '', forceRebuild = false) {
   triggering.value = true;
+  triggeringScope.value = appId || 'all';
   try {
-    await api.post('/api/admin/auto-update/run');
-    ElMessage.success('已触发后台检查');
+    const { data } = await api.post('/api/admin/auto-update/run', {
+      appId,
+      forceRebuild,
+      environment: bundleEnvironment.value
+    });
+    if (data?.log) autoLog.value = data.log;
+    ElMessage.success(appId ? '已触发当前网站重建，页面会持续监控' : '已触发全部网站检查更新，页面会持续监控');
     autoRunning.value = true;
-    setTimeout(() => { loadAutoLog(); load(); }, 6000);
+    scheduleAutoPoll();
   } catch (e) {
+    if (e.response?.status === 409 && e.response?.data?.log) {
+      autoLog.value = e.response.data.log;
+      autoRunning.value = true;
+      scheduleAutoPoll();
+    }
     ElMessage.error('触发失败:' + (e.response?.data?.error || e.message));
   } finally {
     triggering.value = false;
+    triggeringScope.value = '';
   }
 }
+
+const autoProgressText = computed(() => {
+  const log = autoLog.value || {};
+  const completed = Number(log.completed || 0);
+  const total = Number(log.total || 0);
+  const current = log.current?.name || log.current?.id || '';
+  return `${completed}/${total}${current ? ` · ${current}` : ''}`;
+});
 
 const selected = computed(() => bundles.value.find((b) => b.id === selectedId.value) || null);
 
@@ -237,7 +298,11 @@ async function setResourceEnabled(site, res, enabled) {
   const key = `${site.id}|${res.url}`;
   togglingKey.value = key;
   try {
-    const { data } = await api.put(`/api/admin/bundles/${site.id}/resource`, { url: res.url, enabled });
+    const { data } = await api.put(`/api/admin/bundles/${site.id}/resource`, {
+      url: res.url,
+      enabled,
+      environment: bundleEnvironment.value
+    });
     if (data?.bundle) {
       const idx = bundles.value.findIndex((x) => x.id === site.id);
       if (idx >= 0) bundles.value[idx] = data.bundle;
@@ -334,7 +399,10 @@ async function importResources() {
   }
   importing.value = true;
   try {
-    const { data } = await api.post(`/api/admin/bundles/${selected.value.id}/import`, { text: importText.value });
+    const { data } = await api.post(`/api/admin/bundles/${selected.value.id}/import`, {
+      text: importText.value,
+      environment: bundleEnvironment.value
+    });
     importResults.value = data.results || [];
     if (data?.bundle) {
       const idx = bundles.value.findIndex((x) => x.id === selected.value.id);
@@ -371,17 +439,24 @@ function importStatusText(row) {
         <div class="muted">按网站查看离线包配置、文件名、大小、耗时和沙箱占用</div>
       </div>
       <div class="head-actions">
+        <el-radio-group v-model="bundleEnvironment" size="small">
+          <el-radio-button v-for="option in configEnvironmentOptions" :key="option.id" :label="option.id">
+            {{ option.name }}
+          </el-radio-button>
+        </el-radio-group>
         <el-select v-model="groupFilter" size="small" style="width:160px">
           <el-option v-for="g in groupOptions" :key="g.value" :label="g.label" :value="g.value" />
         </el-select>
-        <el-tag v-if="autoRunning" type="warning" size="small">检查中</el-tag>
+        <el-tag v-if="autoRunning" type="warning" size="small">处理中 {{ autoProgressText }}</el-tag>
         <el-button :loading="loading" @click="load">刷新</el-button>
-        <el-button type="primary" :loading="triggering" @click="runAutoUpdate">检查更新</el-button>
+        <el-button type="primary" :loading="triggering && triggeringScope === 'all'" :disabled="autoRunning"
+          @click="runAutoUpdate('', false)">一键检查并更新全部</el-button>
       </div>
     </div>
 
     <div v-if="autoLog" class="auto-line">
-      <span class="muted">上次检查 {{ new Date(autoLog.finishedAt || autoLog.startedAt).toLocaleString() }}</span>
+      <span v-if="autoRunning" class="muted">本轮进度 {{ autoProgressText }}</span>
+      <span v-else class="muted">上次检查 {{ new Date(autoLog.finishedAt || autoLog.startedAt).toLocaleString() }}</span>
       <el-tag v-for="r in autoLog.results" :key="r.id" :type="r.ok ? (r.action === 'no-change' ? 'info' : 'success') : 'danger'" size="small">
         {{ r.name || r.id }}: {{ r.detail }}
       </el-tag>
@@ -424,6 +499,8 @@ function importStatusText(row) {
             <div class="resource-url">{{ selected.url }}</div>
           </div>
           <div class="resource-actions">
+            <el-button type="warning" :loading="triggering && triggeringScope === selected.id" :disabled="autoRunning"
+              @click="runAutoUpdate(selected.id, true)">重建并修复当前站</el-button>
             <el-button type="primary" :icon="Upload" @click="openImportDialog">导入资源</el-button>
             <el-button :icon="Upload" @click="openConfigDialog">导入配置 JSON</el-button>
             <el-button link type="primary" @click="copyManifest(selected)">复制 manifest</el-button>
@@ -461,6 +538,7 @@ function importStatusText(row) {
 
         <div class="config-strip">
           <el-tag size="small" :type="selected.config?.bundle ? 'success' : 'info'">{{ selected.config?.bundle ? '离线包开启' : '离线包关闭' }}</el-tag>
+          <el-tag size="small" type="warning">{{ bundleEnvironmentName }}环境</el-tag>
           <el-tag v-if="configMeta(selected).hasConfigJson" size="small" type="warning">
             JSON {{ configMeta(selected).configJsonFileName || selected.configJsonFileName }} {{ formatSize(configMeta(selected).configJsonBytes || selected.configJsonBytes) }}
           </el-tag>
@@ -523,13 +601,9 @@ function importStatusText(row) {
         <el-form-item label="目标网站">
           <el-input :model-value="selected ? `${selected.name || selected.id} (${selected.id})` : ''" disabled />
         </el-form-item>
-        <el-form-item label="配置环境">
-          <el-radio-group v-model="configEnvironment">
-            <el-radio-button v-for="option in configEnvironmentOptions" :key="option.id" :label="option.id">
-              {{ option.name }}
-            </el-radio-button>
-          </el-radio-group>
-          <div class="muted">三个环境共用当前离线包；这里只保存所选环境的 configJson。</div>
+        <el-form-item label="离线包环境">
+          <el-tag type="warning">{{ bundleEnvironmentName }}</el-tag>
+          <div class="muted">资源只导入当前环境目录，不会进入另外两个环境。</div>
         </el-form-item>
         <el-form-item label="静态资源 URL">
           <el-input v-model="importText" type="textarea" :rows="8"
