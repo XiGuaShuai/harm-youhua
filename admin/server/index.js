@@ -1167,7 +1167,12 @@ function cookieHeaderFromResponse(res) {
 }
 
 async function fetchForConfigSync(url, method, headers, bodyText) {
-  const init = { method, headers: Object.assign({ 'Accept': 'application/json,text/plain,*/*' }, headers || {}) };
+  const init = {
+    method,
+    headers: Object.assign({ 'Accept': 'application/json,text/plain,*/*' }, headers || {}),
+    // 单个业务后台异常不能阻塞三个环境的下一轮同步。
+    signal: AbortSignal.timeout(20 * 1000)
+  };
   if (method !== 'GET' && bodyText && bodyText.length > 0) {
     init.body = bodyText;
     if (!Object.keys(init.headers).some((k) => k.toLowerCase() === 'content-type')) {
