@@ -1,9 +1,10 @@
 <script setup>
 import { ref, onMounted, onBeforeUnmount, computed, watch } from 'vue';
 import { useRoute } from 'vue-router';
-import { ElMessage } from 'element-plus';
+import { ElMessage, ElMessageBox } from 'element-plus';
 import { Search, Upload } from '@element-plus/icons-vue';
 import api from '../api';
+import { displayRegionName } from '../regionCatalog';
 
 const route = useRoute();
 const bundles = ref([]);
@@ -14,6 +15,7 @@ const groupFilter = ref('all');
 const siteQuery = ref('');
 const resourceQuery = ref('');
 const togglingKey = ref('');
+const pausing = ref(false);
 const importDialog = ref(false);
 const importText = ref('');
 const importing = ref(false);
@@ -161,9 +163,10 @@ function regionIdsOf(row) {
 function regionNameOf(row, id) {
   const config = row?.config || {};
   const names = { ...(config.regionNames || {}), ...(row?.regionNames || {}) };
-  if (row?.region === id && row?.regionName) return row.regionName;
-  if (config.region === id && config.regionName) return config.regionName;
-  return names[id] || id;
+  const stored = names[id]
+    || (row?.region === id ? row?.regionName : '')
+    || (config.region === id ? config.regionName : '');
+  return displayRegionName(id, stored, { appName: row?.name || config.name });
 }
 
 function groupKeys(row) {
@@ -429,6 +432,47 @@ function importStatusType(row) {
 function importStatusText(row) {
   return row.ok ? '成功' : '失败';
 }
+
+function packConfigured(row) {
+  const environments = Array.isArray(row?.config?.bundleEnvironments) ? row.config.bundleEnvironments : [];
+  return environments.includes(bundleEnvironment.value);
+}
+
+function packPaused(row) {
+  return !!row?.config?.bundlePaused || (packConfigured(row) && row?.config?.bundle === false);
+}
+
+async function toggleSelectedPause(enabled) {
+  if (!selected.value) return;
+  const envName = bundleEnvironmentName.value;
+  if (!enabled) {
+    await ElMessageBox.confirm(
+      `暂停后，${envName}环境设备不再下载和命中「${selected.value.name || selected.value.id}」的离线包。服务器上的包文件保留，可随时恢复。`,
+      `暂停${envName}环境离线包`,
+      { type: 'warning', confirmButtonText: '暂停下发', cancelButtonText: '取消' }
+    );
+  }
+  pausing.value = true;
+  try {
+    const { data } = await api.put(`/api/admin/apps/${encodeURIComponent(selected.value.id)}/bundle-pause`, {
+      environment: bundleEnvironment.value,
+      paused: !enabled
+    });
+    if (selected.value.config) {
+      selected.value.config.bundle = data.enabled === true;
+      selected.value.config.bundlePaused = data.paused === true;
+      selected.value.config.bundlePausedEnvironments = data.app?.bundlePausedEnvironments || [];
+    }
+    ElMessage.success(enabled ? `已恢复${envName}环境离线包下发` : `已暂停${envName}环境离线包下发`);
+  } catch (e) {
+    if (e !== 'cancel' && e !== 'close') {
+      ElMessage.error((enabled ? '恢复失败:' : '暂停失败:') + (e.response?.data?.error || e.message));
+    }
+    await load();
+  } finally {
+    pausing.value = false;
+  }
+}
 </script>
 
 <template>
@@ -537,7 +581,18 @@ function importStatusText(row) {
         </div>
 
         <div class="config-strip">
-          <el-tag size="small" :type="selected.config?.bundle ? 'success' : 'info'">{{ selected.config?.bundle ? '离线包开启' : '离线包关闭' }}</el-tag>
+          <el-tag size="small" :type="selected.config?.bundle ? 'success' : (packPaused(selected) ? 'warning' : 'info')">
+            {{ selected.config?.bundle ? '离线包开启' : (packPaused(selected) ? '离线包已暂停' : '离线包关闭') }}
+          </el-tag>
+          <el-switch
+            v-if="packConfigured(selected)"
+            :model-value="selected.config?.bundle === true"
+            :loading="pausing"
+            inline-prompt
+            active-text="下发"
+            inactive-text="暂停"
+            @change="toggleSelectedPause"
+          />
           <el-tag size="small" type="warning">{{ bundleEnvironmentName }}环境</el-tag>
           <el-tag v-if="configMeta(selected).hasConfigJson" size="small" type="warning">
             JSON {{ configMeta(selected).configJsonFileName || selected.configJsonFileName }} {{ formatSize(configMeta(selected).configJsonBytes || selected.configJsonBytes) }}

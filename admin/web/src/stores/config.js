@@ -60,6 +60,17 @@ export const useConfigStore = defineStore('config', () => {
     const { data } = await api.delete(`/api/admin/apps/${encodeURIComponent(id)}`);
     version.value = data.version;
   }
+  async function pauseBundle(id, environment, paused) {
+    const { data } = await api.put(`/api/admin/apps/${encodeURIComponent(id)}/bundle-pause`, {
+      environment,
+      paused
+    });
+    version.value = data.version;
+    const idx = apps.value.findIndex((item) => item.id === id);
+    if (idx >= 0 && data.app) apps.value[idx] = data.app;
+    else await load();
+    return data;
+  }
   async function saveBlockHosts() {
     const { data } = await api.put('/api/admin/blockhosts', { blockHosts: blockHosts.value });
     version.value = data.version;
@@ -69,7 +80,7 @@ export const useConfigStore = defineStore('config', () => {
     version.value = data.version;
   }
 
-  return { apps, blockHosts, settings, version, loading, load, saveApps, saveApp, deleteApp, saveBlockHosts, saveSettings };
+  return { apps, blockHosts, settings, version, loading, load, saveApps, saveApp, deleteApp, pauseBundle, saveBlockHosts, saveSettings };
 });
 
 if (import.meta.hot) {

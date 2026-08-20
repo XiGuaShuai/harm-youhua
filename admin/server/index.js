@@ -18,6 +18,13 @@ import { fileURLToPath } from 'node:url';
 import { initDb, dbReady, getPool } from './db.js';
 import { buildFromConsensus } from './consensus-builder.js';
 import { detectSite } from './cache-builder.js';
+import {
+  displayRegionName,
+  ensureFifaEnvironmentRegions,
+  looksLikePlaceholderText,
+  resolveRegionName,
+  selectRegionIdsForEnvironment
+} from './region-catalog.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const DATA_DIR = process.env.DATA_DIR ? path.resolve(process.env.DATA_DIR) : path.join(__dirname, 'data');
@@ -172,6 +179,30 @@ function saveConfig(c) {
 }
 if (!fs.existsSync(DATA_FILE)) saveConfig(defaultConfig());
 
+function persistRepairedRegionNames() {
+  const current = loadConfig();
+  const before = JSON.stringify((current.apps || []).map((app) => ({
+    id: app.id,
+    regions: app.regions || [],
+    region: app.region || '',
+    regionName: app.regionName || '',
+    regionNames: app.regionNames || {}
+  })));
+  const repairedApps = (current.apps || []).map((app) => normalizeAppConfig(app));
+  const after = JSON.stringify(repairedApps.map((app) => ({
+    id: app.id,
+    regions: app.regions || [],
+    region: app.region || '',
+    regionName: app.regionName || '',
+    regionNames: app.regionNames || {}
+  })));
+  if (before === after) return false;
+  current.apps = repairedApps;
+  saveConfig(current);
+  console.log('[RegionCatalog] repaired region names and environment IDs in config.json');
+  return true;
+}
+
 function normalizeScope(scope) {
   const s = String(scope || '').trim();
   if (s === 'region') return 'region';
@@ -205,22 +236,17 @@ function normalizeRegionNames(appCfg, regionIds) {
     ? appCfg.regionNames
     : {};
   const names = {};
+  const extras = { appName: appCfg && appCfg.name };
   for (const id of regionIds) {
-    const name = String(source[id] || '').trim();
-    if (name) names[id] = name;
+    const resolved = resolveRegionName(id, source[id], extras);
+    if (resolved) names[id] = resolved;
   }
   const legacyRegion = String(appCfg && appCfg.region || '').trim();
-  const legacyName = String(appCfg && appCfg.regionName || '').trim();
+  const legacyName = resolveRegionName(legacyRegion, appCfg && appCfg.regionName, extras);
   if (legacyName && legacyRegion && regionIds.includes(legacyRegion) && !names[legacyRegion]) {
     names[legacyRegion] = legacyName;
   }
   return names;
-}
-
-function looksLikePlaceholderText(value) {
-  const s = String(value || '').trim();
-  if (!s) return true;
-  return /^[?\s._-]+$/.test(s);
 }
 
 function normalizeConfigEnvironment(value, fallback = DEFAULT_CONFIG_ENVIRONMENT || 'test') {
@@ -258,9 +284,46 @@ function normalizeBundleEnvironments(appCfg) {
   return result;
 }
 
-function bundleEnabledInEnvironment(appCfg, environment) {
+function normalizeBundlePausedEnvironments(appCfg) {
+  const configured = Array.isArray(appCfg && appCfg.bundlePausedEnvironments)
+    ? appCfg.bundlePausedEnvironments
+    : (typeof (appCfg && appCfg.bundlePausedEnvironments) === 'string'
+      ? String(appCfg.bundlePausedEnvironments).split(/[\s,;]+/)
+      : []);
+  const enabled = new Set(normalizeBundleEnvironments(appCfg));
+  const seen = new Set();
+  const result = [];
+  for (const value of configured) {
+    const environment = normalizeConfigEnvironment(value, '');
+    if (environment && enabled.has(environment) && !seen.has(environment)) {
+      seen.add(environment);
+      result.push(environment);
+    }
+  }
+  return result;
+}
+
+function appPublishedInEnvironment(appCfg, environment) {
   if (!appCfg || appCfg.bundle !== true) return false;
   return normalizeBundleEnvironments(appCfg).includes(normalizeConfigEnvironment(environment, ''));
+}
+
+function bundlePausedInEnvironment(appCfg, environment) {
+  return normalizeBundlePausedEnvironments(appCfg).includes(normalizeConfigEnvironment(environment, ''));
+}
+
+function bundleEnabledInEnvironment(appCfg, environment) {
+  return appPublishedInEnvironment(appCfg, environment) && !bundlePausedInEnvironment(appCfg, environment);
+}
+
+function setBundlePausedInEnvironment(appCfg, environment, paused) {
+  const target = normalizeConfigEnvironment(environment, '');
+  if (!appCfg || !target || !appPublishedInEnvironment(appCfg, target)) return false;
+  const next = new Set(normalizeBundlePausedEnvironments(appCfg));
+  if (paused) next.add(target);
+  else next.delete(target);
+  appCfg.bundlePausedEnvironments = Array.from(next);
+  return true;
 }
 
 function enableBundleEnvironment(appCfg, environment) {
@@ -328,21 +391,10 @@ function repairAppDisplayNames(appCfg) {
   const a = Object.assign({}, appCfg || {});
   const title = recoverConfigJsonTitle(a);
 
-  if (a.id === 'app_mdac') {
-    if (looksLikePlaceholderText(a.name)) a.name = '马来西亚电子入境卡(MDAC)';
-    if (a.scope === 'region') {
-      if (looksLikePlaceholderText(a.regionName)) a.regionName = '马来西亚';
-      if (!a.regionNames || typeof a.regionNames !== 'object' || Array.isArray(a.regionNames)) a.regionNames = {};
-      if (a.region && looksLikePlaceholderText(a.regionNames[a.region])) a.regionNames[a.region] = '马来西亚';
-    }
-    return a;
-  }
-
-  if (looksLikePlaceholderText(a.name) && title) {
+  if (a.id === 'app_mdac' && looksLikePlaceholderText(a.name)) {
+    a.name = '马来西亚电子入境卡(MDAC)';
+  } else if (looksLikePlaceholderText(a.name) && title) {
     a.name = title;
-  }
-  if (a.scope === 'region' && looksLikePlaceholderText(a.regionName) && title) {
-    a.regionName = title;
   }
   return a;
 }
@@ -438,8 +490,22 @@ function publicAppConfig(appCfg, requestedEnvironment = 'test') {
   a.configJsonSyncedAt = envConfig.configJsonSyncedAt;
   a.configEnvironment = environment;
   a.bundleEnvironment = environment;
+  if (a.scope === 'region') {
+    a.regions = selectRegionIdsForEnvironment(a.regions, environment, {
+      appName: a.name,
+      regionNames: a.regionNames
+    });
+    const names = {};
+    for (const id of a.regions) {
+      names[id] = resolveRegionName(id, a.regionNames[id], { appName: a.name }) || a.regionNames[id] || id;
+    }
+    a.regionNames = names;
+    a.region = a.regions[0] || '';
+    a.regionName = a.region ? (a.regionNames[a.region] || a.region) : '';
+  }
   delete a.configJsonEnvironments;
   delete a.bundleEnvironments;
+  delete a.bundlePausedEnvironments;
   // 以下字段只供后台构建使用，端侧不需要。尤其不能把测试资源清单/体积统计下发给正式用户。
   delete a.bundleExtraUrls;
   delete a.bundleExcludeUrls;
@@ -455,11 +521,15 @@ function normalizeAppConfig(appCfg) {
   a.url = String(a.url || '').trim();
   a.scope = normalizeScope(a.scope);
   a.regions = a.scope === 'region' ? normalizeRegionIds(a) : [];
+  if (a.id === 'app_fifaworldcup' && a.scope === 'region') {
+    a.regions = ensureFifaEnvironmentRegions(a.regions);
+  }
   a.regionNames = a.scope === 'region' ? normalizeRegionNames(a, a.regions) : {};
   // region/regionName remain for older SDK releases. New clients must use regions[].
   a.region = a.regions.length > 0 ? a.regions[0] : '';
   a.regionName = a.region ? (a.regionNames[a.region] || a.region) : '';
   a.bundleEnvironments = normalizeBundleEnvironments(a);
+  a.bundlePausedEnvironments = normalizeBundlePausedEnvironments(a);
   a.configJsonEnvironments = normalizeConfigJsonEnvironments(a);
   delete a.configJson;
   delete a.configJsonFileName;
@@ -524,13 +594,19 @@ function validateAppConfigForWebsdk(appCfg) {
   return '';
 }
 
-function configRegions(apps) {
+function configRegions(apps, environment = '') {
   const map = new Map();
   for (const appCfg of apps || []) {
     const a = normalizeAppConfig(appCfg);
     if (a.scope !== 'region') continue;
-    for (const region of a.regions) {
-      const name = a.regionNames[region] || region;
+    const regionIds = environment
+      ? selectRegionIdsForEnvironment(a.regions, environment, { appName: a.name, regionNames: a.regionNames })
+      : a.regions;
+    for (const region of regionIds) {
+      const name = displayRegionName(region, a.regionNames[region], {
+        appName: a.name,
+        viewEnvironment: environment
+      });
       if (!map.has(region) || (map.get(region).name === region && name !== region)) {
         map.set(region, { id: region, name });
       }
@@ -591,7 +667,12 @@ app.use(express.json({ limit: '16mb' }));
 
 // 同源托管管理界面(admin/web 构建产物):静态资源命中即返回,未命中则交给后续路由。
 // 本地用 vite(5174)代理调试时 WEB_DIST 不存在,此块自动跳过,不影响开发流程。
-if (fs.existsSync(WEB_DIST)) app.use(express.static(WEB_DIST));
+if (fs.existsSync(WEB_DIST)) {
+  app.use(express.static(WEB_DIST));
+  app.get(['/app', '/apps'], (_req, res) => {
+    res.sendFile(path.join(WEB_DIST, 'index.html'));
+  });
+}
 
 function requestConfigEnvironment(req) {
   return normalizeConfigEnvironment(
@@ -613,7 +694,7 @@ function requestBundleEnvironment(req, fallback = DEFAULT_CONFIG_ENVIRONMENT) {
 function sendPublicConfig(req, res) {
   const environment = requestConfigEnvironment(req);
   const c = loadConfig();
-  const apps = (c.apps || []).map((a) => {
+  const apps = (c.apps || []).filter((a) => appPublishedInEnvironment(a, environment)).map((a) => {
     const appCfg = publicAppConfig(a, environment);
     const environmentRoot = bundleRoot(environment);
     const mfPath = path.join(environmentRoot, appCfg.id, 'manifest.json');
@@ -653,7 +734,7 @@ function sendPublicConfig(req, res) {
     sample: typeof s.exploreSample === 'number' ? s.exploreSample : 0.1
   };
   res.set('X-WebAccel-Environment', environment);
-  res.json(Object.assign({}, c, { environment, apps, regions: configRegions(apps), explore }));
+  res.json(Object.assign({}, c, { environment, apps, regions: configRegions(apps, environment), explore }));
 }
 app.get('/api/config', sendPublicConfig);
 app.get('/:environment(test|pre|prod)/api/config', sendPublicConfig);
@@ -868,6 +949,9 @@ app.put('/api/admin/apps', (req, res) => {
     const prev = previousById.get(appCfg.id);
     if (prev) {
       appCfg.configJsonEnvironments = mergeMaskedConfigJsonEnvironments(appCfg, prev);
+      if (!Object.prototype.hasOwnProperty.call(a || {}, 'bundlePausedEnvironments')) {
+        appCfg.bundlePausedEnvironments = prev.bundlePausedEnvironments;
+      }
     }
     return appCfg;
   }).filter((a) => a.id && a.url);
@@ -926,6 +1010,9 @@ app.put('/api/admin/apps/:id', (req, res) => {
   const index = apps.findIndex((item) => item.id === previousId);
   const previous = index >= 0 ? apps[index] : null;
   const appCfg = normalizeAppConfig(raw);
+  if (previous && !Object.prototype.hasOwnProperty.call(raw, 'bundlePausedEnvironments')) {
+    appCfg.bundlePausedEnvironments = previous.bundlePausedEnvironments;
+  }
   if (!appCfg.id || !appCfg.url) {
     return res.status(400).json({ error: 'ID 和 URL 必填' });
   }
@@ -995,6 +1082,32 @@ app.delete('/api/admin/apps/:id', (req, res) => {
   const saved = saveConfig(c);
   res.json({ ok: true, version: saved.version });
 });
+
+// 按环境暂时停用/恢复离线包下发：不删服务器包文件，也不改应用地区配置。
+app.put('/api/admin/apps/:id/bundle-pause', (req, res) => {
+  const id = String(req.params.id || '').trim();
+  const environment = requestBundleEnvironment(req);
+  const paused = !(req.body && req.body.paused === false);
+  const c = loadConfig();
+  const apps = Array.isArray(c.apps) ? c.apps : [];
+  const appCfg = apps.find((item) => item && item.id === id);
+  if (!appCfg) return res.status(404).json({ error: 'app not found' });
+  if (!setBundlePausedInEnvironment(appCfg, environment, paused)) {
+    return res.status(400).json({ error: '该应用未在所选环境配置离线包，无法暂停' });
+  }
+  const saved = saveConfig(c);
+  const responseApp = normalizeAppConfig(appCfg);
+  responseApp.configJsonEnvironments = redactConfigJsonEnvironments(responseApp);
+  res.json({
+    ok: true,
+    version: saved.version,
+    environment,
+    paused: bundlePausedInEnvironment(responseApp, environment),
+    enabled: bundleEnabledInEnvironment(responseApp, environment),
+    app: responseApp
+  });
+});
+
 // 手动触发离线包检查/修复；异步执行，前端通过 log 接口持续轮询进度。
 app.post('/api/admin/auto-update/run', (req, res) => {
   const appId = String(req.body && req.body.appId || '').trim();
@@ -1727,6 +1840,8 @@ function bundleInfo(id, appCfg, requestedEnvironment = DEFAULT_CONFIG_ENVIRONMEN
     config: {
       bundle: appCfg ? bundleEnabledInEnvironment(appCfg, environment) : false,
       bundleEnvironments: appCfg ? normalizeBundleEnvironments(appCfg) : [],
+      bundlePaused: appCfg ? bundlePausedInEnvironment(appCfg, environment) : false,
+      bundlePausedEnvironments: appCfg ? normalizeBundlePausedEnvironments(appCfg) : [],
       scope: appCfg && appCfg.scope ? appCfg.scope : 'app',
       region: appCfg && appCfg.region ? appCfg.region : '',
       regionName: appCfg && appCfg.regionName ? appCfg.regionName : '',
@@ -1795,6 +1910,8 @@ app.get('/api/admin/bundles', (req, res) => {
       config: {
         bundle: bundleEnabledInEnvironment(appCfg, environment),
         bundleEnvironments: normalizeBundleEnvironments(appCfg),
+        bundlePaused: bundlePausedInEnvironment(appCfg, environment),
+        bundlePausedEnvironments: normalizeBundlePausedEnvironments(appCfg),
         scope: appCfg.scope || 'app',
         region: appCfg.region || '',
         regionName: appCfg.regionName || '',
@@ -2294,6 +2411,7 @@ app.listen(PORT, () => {
   console.log(`  后台登录:        账号 ${DEFAULT_USER} / 密码 ${DEFAULT_PASS}  (首登后可在后台改;或用 ADMIN_USER/ADMIN_PASS 环境变量)`);
   if (MASTER_TOKEN) console.log(`  主令牌已开启:    X-Admin-Token: <ADMIN_TOKEN>(脚本用)`);
   if (process.env.DISABLE_SCHEDULERS !== '1') {
+    persistRepairedRegionNames();
     startAutoUpdateScheduler(); // 启动定时自动更新
     startConfigJsonSyncScheduler(); // 启动每分钟 configJson 同步
   }

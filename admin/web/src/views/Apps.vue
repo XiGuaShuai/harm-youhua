@@ -1,10 +1,11 @@
 <script setup>
-import { ref, onMounted, computed } from 'vue';
+import { ref, onMounted, computed, watch } from 'vue';
 import { storeToRefs } from 'pinia';
 import { useRouter } from 'vue-router';
 import { ElMessage, ElMessageBox } from 'element-plus';
 import { Box, EditPen, MoreFilled, Plus, Refresh, Search, Upload } from '@element-plus/icons-vue';
 import api from '../api';
+import { displayRegionMeta, displayRegionName, resolveRegionName, selectRegionIdsForEnvironment } from '../regionCatalog';
 import { useConfigStore } from '../stores/config';
 
 const store = useConfigStore();
@@ -22,24 +23,8 @@ const CONFIG_ENVIRONMENT_OPTIONS = [
   { id: 'pre', name: '预发' },
   { id: 'prod', name: '正式' }
 ];
-// 旧配置中的部分地区名称曾以 "??" 保存。显示层统一用已知地区名或可读的 ID 兜底，不能把问号直接展示给运营人员。
-const REGION_NAME_FALLBACKS = {
-  '100003': '泰国',
-  '100004': '中国香港',
-  '100006': '韩国',
-  '100009': '中国澳门',
-  '100014': '马来西亚',
-  '100016': '新加坡',
-  '100017': '日本',
-  '100106': '越南',
-  '100253': '阿联酋',
-  '100296': '西班牙',
-  '100452': '俄罗斯',
-  '2007696801692241922': '菲律宾',
-  '1988526837953462273': '印度尼西亚',
-  '2037443812888760321': '美国',
-  '2046772885148901377': '美国'
-};
+// 地区名称按业务后台真实 ID 解析。美国/加拿大等在测试、预发、正式是三套不同 ID，显示时必须带环境后缀。
+const viewEnvironment = ref('test');
 const activeConfigEnvironment = ref('test');
 const activeConfigEnvironmentName = computed(() =>
   CONFIG_ENVIRONMENT_OPTIONS.find((item) => item.id === activeConfigEnvironment.value)?.name || activeConfigEnvironment.value
@@ -157,28 +142,52 @@ function regionIdsOf(row) {
   return [...new Set(values.map((id) => String(id || '').trim()).filter(Boolean))];
 }
 
+function viewRegionIdsOf(row, environment = viewEnvironment.value) {
+  return selectRegionIdsForEnvironment(regionIdsOf(row), environment, {
+    appName: row?.name,
+    regionNames: regionNamesOf(row)
+  });
+}
+
+function appInViewEnvironment(app, environment = viewEnvironment.value) {
+  const environments = Array.isArray(app?.bundleEnvironments) ? app.bundleEnvironments : [];
+  return environments.includes(environment);
+}
+
 function regionNamesOf(row) {
   const names = { ...(row?.regionNames || {}) };
   if (row?.region && row?.regionName && !names[row.region]) names[row.region] = row.regionName;
   return names;
 }
 
+function regionMetaOf(row, id) {
+  return displayRegionMeta(id, regionNamesOf(row)[id], {
+    appName: row?.name,
+    viewEnvironment: viewEnvironment.value
+  });
+}
+
 function regionNameOf(row, id) {
-  const name = String(regionNamesOf(row)[id] || '').trim();
-  if (name && !/^[?\s._()（）-]+$/.test(name)) return name;
-  return REGION_NAME_FALLBACKS[id] || `地区 ${id}`;
+  return regionMetaOf(row, id).title;
+}
+
+function storedRegionNameOf(row, id) {
+  return resolveRegionName(id, regionNamesOf(row)[id], { appName: row?.name }) || id;
 }
 
 const regionOptions = computed(() => {
   const map = new Map();
   apps.value.forEach((app) => {
     regionIdsOf(app).forEach((id) => {
-      const name = regionNameOf(app, id);
+      const name = storedRegionNameOf(app, id);
       if (!map.has(id) || map.get(id) === id) map.set(id, name);
     });
   });
   return Array.from(map.entries())
-    .map(([id, name]) => ({ id, name, label: name === id ? id : `${name} (${id})` }))
+    .map(([id, name]) => {
+      const labelName = displayRegionName(id, name);
+      return { id, name, label: labelName === id ? id : `${labelName} (${id})` };
+    })
     .sort((a, b) => String(a.name).localeCompare(String(b.name)));
 });
 
@@ -203,6 +212,13 @@ async function loadBundles() {
 
 onMounted(loadBundles);
 
+watch(viewEnvironment, (environment) => {
+  activeConfigEnvironment.value = environment;
+  if (!groupList.value.some((group) => group.key === activeGroup.value)) {
+    activeGroup.value = 'top';
+  }
+});
+
 function groupOf(row) {
   const scope = row?.scope || 'top';
   if (scope === 'top') return 'top';
@@ -213,29 +229,35 @@ function groupOf(row) {
 function appInGroup(app, groupKey) {
   if (groupKey === 'top') return (app?.scope || 'top') !== 'region';
   if (!groupKey?.startsWith('region:') || app?.scope !== 'region') return false;
-  return regionIdsOf(app).includes(groupKey.slice('region:'.length));
+  return viewRegionIdsOf(app).includes(groupKey.slice('region:'.length));
 }
+
+const environmentApps = computed(() =>
+  apps.value.filter((app) => appInViewEnvironment(app))
+);
 
 const groupList = computed(() => {
   const regionMap = new Map();
-  apps.value.forEach((app) => {
+  environmentApps.value.forEach((app) => {
     if ((app.scope || 'top') !== 'region') return;
-    regionIdsOf(app).forEach((id) => regionMap.set(id, regionNameOf(app, id)));
+    viewRegionIdsOf(app).forEach((id) => regionMap.set(id, regionMetaOf(app, id)));
   });
   const groups = [
     {
       key: 'top',
       name: 'TOP 常驻',
       desc: 'SDK 初始化后自动下载并长期保留',
-      count: apps.value.filter((a) => (a.scope || 'top') !== 'region').length
+      id: '',
+      count: environmentApps.value.filter((a) => (a.scope || 'top') !== 'region').length
     }
   ];
-  Array.from(regionMap.entries()).sort((a, b) => String(a[1]).localeCompare(String(b[1]))).forEach(([id, name]) => {
+  Array.from(regionMap.entries()).sort((a, b) => String(a[1].shortTitle).localeCompare(String(b[1].shortTitle))).forEach(([id, meta]) => {
     groups.push({
       key: `region:${id}`,
-      name: name || id,
-      desc: `地区 ${id}`,
-      count: apps.value.filter((a) => appInGroup(a, `region:${id}`)).length
+      name: meta.shortTitle || meta.name || id,
+      desc: '',
+      id,
+      count: environmentApps.value.filter((a) => appInGroup(a, `region:${id}`)).length
     });
   });
   return groups;
@@ -251,7 +273,7 @@ const visibleGroupList = computed(() => {
 });
 const filteredApps = computed(() => {
   const q = appQuery.value.trim().toLowerCase();
-  return apps.value.filter((app) => {
+  return environmentApps.value.filter((app) => {
     if (!appInGroup(app, activeGroup.value)) return false;
     if (!q) return true;
     return [
@@ -269,14 +291,14 @@ const summary = computed(() => {
   let bundleEnabled = 0;
   let jsonCount = 0;
   let readyCount = 0;
-  apps.value.forEach((app) => {
-    if ((app.scope || 'top') === 'region') regionIdsOf(app).forEach((id) => regionSet.add(id));
-    if (app.bundle) bundleEnabled++;
+  environmentApps.value.forEach((app) => {
+    if ((app.scope || 'top') === 'region') viewRegionIdsOf(app).forEach((id) => regionSet.add(id));
+    if (packDeliveringInView(app)) bundleEnabled++;
     if (hasAnyConfigJson(app)) jsonCount++;
-    if (app.bundle && bundleMap.value[app.id]) readyCount++;
+    if (packDeliveringInView(app) && bundleMap.value[app.id]) readyCount++;
   });
   return {
-    total: apps.value.length,
+    total: environmentApps.value.length,
     regions: regionSet.size,
     bundleEnabled,
     readyCount,
@@ -293,7 +315,10 @@ function scopeLabel(row) {
 }
 
 function regionItems(row) {
-  return regionIdsOf(row).map((id) => ({ id, name: regionNameOf(row, id) }));
+  return viewRegionIdsOf(row).map((id) => {
+    const meta = regionMetaOf(row, id);
+    return { id, name: meta.shortTitle || meta.name || id, title: meta.shortTitle || meta.name || id };
+  });
 }
 
 function visibleRegions(row) {
@@ -301,11 +326,11 @@ function visibleRegions(row) {
 }
 
 function hiddenRegionCount(row) {
-  return Math.max(0, regionIdsOf(row).length - 2);
+  return Math.max(0, viewRegionIdsOf(row).length - 2);
 }
 
 function regionTooltip(row) {
-  return regionItems(row).map((item) => `${item.name} (${item.id})`).join('、');
+  return regionItems(row).map((item) => item.name).join('、');
 }
 
 function bundleEnvironmentOf(row) {
@@ -325,7 +350,7 @@ function emptyForm(groupKey = activeGroup.value) {
   else if (groupKey && groupKey.startsWith('region:')) {
     scope = 'region';
     region = groupKey.slice('region:'.length);
-    regionName = activeGroupInfo.value?.name || region;
+    regionName = resolveRegionName(region, activeGroupInfo.value?.name) || region;
   }
   const configJsonEnvironments = configEnvironmentsOf({});
   return {
@@ -358,7 +383,8 @@ function emptyForm(groupKey = activeGroup.value) {
     prerender: true,
     codeCache: true,
     bundle: true,
-    bundleEnvironments: ['test'],
+    bundleEnvironments: [viewEnvironment.value],
+    bundlePausedEnvironments: [],
     prefetchChunks: true,
     extraBlockHostsText: '',
     preconnectHostsText: '',
@@ -614,7 +640,8 @@ async function submit() {
   selectedRegions.forEach((id) => {
     const existingName = String(form.value.regionNames?.[id] || '').trim();
     const option = regionOptions.value.find((item) => item.id === id);
-    regionNames[id] = existingName || option?.name || id;
+    regionNames[id] = resolveRegionName(id, existingName || option?.name, { appName: form.value.name })
+      || existingName || option?.name || id;
   });
   const item = {
     id: form.value.id.trim(),
@@ -632,6 +659,9 @@ async function submit() {
     codeCache: form.value.codeCache,
     bundle: form.value.bundle,
     bundleEnvironments: form.value.bundle ? [...form.value.bundleEnvironments] : [],
+    bundlePausedEnvironments: form.value.bundle
+      ? (Array.isArray(form.value.bundlePausedEnvironments) ? [...form.value.bundlePausedEnvironments] : [])
+      : [],
     prefetchChunks: form.value.prefetchChunks,
     bundleMaxSizeKB: Number(form.value.bundleMaxSizeKB || 0),
     extraBlockHosts: splitLines(form.value.extraBlockHostsText),
@@ -691,18 +721,59 @@ const updating = ref('');
 const building = ref('');
 const generating = ref('');
 const syncingJson = ref('');
+const pausing = ref('');
+
+function packConfiguredInView(row, environment = viewEnvironment.value) {
+  return !!row?.bundle && appInViewEnvironment(row, environment);
+}
+
+function packPausedInView(row, environment = viewEnvironment.value) {
+  const paused = Array.isArray(row?.bundlePausedEnvironments) ? row.bundlePausedEnvironments : [];
+  return packConfiguredInView(row, environment) && paused.includes(environment);
+}
+
+function packDeliveringInView(row, environment = viewEnvironment.value) {
+  return packConfiguredInView(row, environment) && !packPausedInView(row, environment);
+}
 
 function rowBusy(row) {
-  return [checking.value, updating.value, building.value, generating.value, syncingJson.value].includes(row.id);
+  return [checking.value, updating.value, building.value, generating.value, syncingJson.value, pausing.value].includes(row.id);
 }
 
 function handleRowCommand(command, row) {
   if (command === 'check') return checkUpdate(row);
   if (command === 'update') return updateCache(row);
   if (command === 'sync') return syncConfigJson(row);
+  if (command === 'pause') return toggleBundlePause(row, true);
+  if (command === 'resume') return toggleBundlePause(row, false);
   if (command === 'build') return buildCache(row);
   if (command === 'manifest') return generateManifest(row);
   if (command === 'delete') return remove(row);
+}
+
+async function toggleBundlePause(row, paused) {
+  if (!packConfiguredInView(row)) {
+    ElMessage.warning('当前环境未配置该应用离线包');
+    return;
+  }
+  const envName = CONFIG_ENVIRONMENT_OPTIONS.find((item) => item.id === viewEnvironment.value)?.name || viewEnvironment.value;
+  if (paused) {
+    await ElMessageBox.confirm(
+      `暂停后，${envName}环境设备不再下载和命中「${row.name || row.id}」的离线包。服务器上的包文件保留，可随时恢复。`,
+      `暂停${envName}环境离线包`,
+      { type: 'warning', confirmButtonText: '暂停下发', cancelButtonText: '取消' }
+    );
+  }
+  pausing.value = row.id;
+  try {
+    await store.pauseBundle(row.id, viewEnvironment.value, paused);
+    ElMessage.success(paused ? `已暂停${envName}环境离线包下发` : `已恢复${envName}环境离线包下发`);
+  } catch (e) {
+    if (e === 'cancel' || e === 'close') return;
+    ElMessage.error((paused ? '暂停失败:' : '恢复失败:') + (e.response?.data?.error || e.message));
+  } finally {
+    pausing.value = '';
+  }
 }
 
 async function checkUpdate(row) {
@@ -789,9 +860,14 @@ async function syncConfigJson(row) {
       <div>
         <div class="eyebrow">WebAccel 配置</div>
         <h2>应用管理</h2>
-        <p>按 TOP 和地区维护网址、websdk JSON、离线包资源清单。</p>
+        <p>测试、预发、正式分开查看。当前只显示该环境已启用的应用和地区。</p>
       </div>
       <div class="head-actions">
+        <el-radio-group v-model="viewEnvironment" size="default" class="env-switch">
+          <el-radio-button v-for="option in CONFIG_ENVIRONMENT_OPTIONS" :key="option.id" :label="option.id">
+            {{ option.name }}
+          </el-radio-button>
+        </el-radio-group>
         <el-input v-model="appQuery" class="search-input" clearable :prefix-icon="Search" placeholder="搜索 ID / 名称 / URL" />
         <el-button :icon="Refresh" @click="loadBundles">刷新状态</el-button>
         <el-button type="primary" :icon="Plus" @click="openAdd">新增网址</el-button>
@@ -808,7 +884,7 @@ async function syncConfigJson(row) {
         <b>{{ summary.regions }}</b>
       </div>
       <div class="summary-item">
-        <span>启用离线包</span>
+        <span>当前环境下发</span>
         <b>{{ summary.bundleEnabled }}</b>
       </div>
       <div class="summary-item">
@@ -826,7 +902,7 @@ async function syncConfigJson(row) {
         <div class="pane-title-row">
           <div>
             <div class="pane-title">地区分组</div>
-            <div class="pane-subtitle">选择地区查看关联应用</div>
+            <div class="pane-subtitle">{{ activeConfigEnvironmentName }}环境地区</div>
           </div>
           <span class="group-total">{{ groupList.length }}</span>
         </div>
@@ -837,7 +913,7 @@ async function syncConfigJson(row) {
             @click="activeGroup = g.key">
             <span>
               <b>{{ g.name }}</b>
-              <em>{{ g.desc }}</em>
+              <em v-if="g.desc">{{ g.desc }}</em>
             </span>
             <span class="group-count">{{ g.count }}</span>
           </button>
@@ -849,7 +925,7 @@ async function syncConfigJson(row) {
         <div class="group-head">
           <div>
             <div class="group-title">{{ activeGroupInfo?.name }}</div>
-            <div class="muted">{{ activeGroupInfo?.desc }}</div>
+            <div class="muted">{{ activeGroupInfo?.desc || (activeGroup === 'top' ? '' : '当前环境地区') }}</div>
           </div>
           <el-tag type="info" effect="plain">{{ filteredApps.length }} 个网址</el-tag>
         </div>
@@ -877,7 +953,7 @@ async function syncConfigJson(row) {
                 </el-tooltip>
               </div>
               <el-tag v-else size="small" type="info" effect="light">TOP 常驻</el-tag>
-              <div v-if="row.scope === 'region'" class="table-sub region-count-text">关联 {{ regionIdsOf(row).length }} 个地区</div>
+              <div v-if="row.scope === 'region'" class="table-sub region-count-text">关联 {{ viewRegionIdsOf(row).length }} 个地区</div>
             </template>
           </el-table-column>
           <el-table-column label="websdk 配置" width="160">
@@ -886,7 +962,7 @@ async function syncConfigJson(row) {
               <el-tag v-if="hasAnyConfigSync(row)" size="small" type="warning" effect="plain" class="json-sync-tag">多环境同步</el-tag>
             </template>
           </el-table-column>
-          <el-table-column label="离线包" width="160">
+          <el-table-column label="离线包" width="210">
             <template #default="{ row }">
               <template v-if="bundleOf(row)">
                 <el-tag size="small" type="success">已构建</el-tag>
@@ -894,12 +970,25 @@ async function syncConfigJson(row) {
               </template>
               <el-tag v-else-if="row.bundle" size="small" type="warning" effect="plain">待构建</el-tag>
               <el-tag v-else size="small" type="info" effect="plain">未启用</el-tag>
+              <div v-if="packConfiguredInView(row)" class="pause-row">
+                <el-switch
+                  :model-value="packDeliveringInView(row)"
+                  :loading="pausing === row.id"
+                  :disabled="rowBusy(row)"
+                  inline-prompt
+                  active-text="下发"
+                  inactive-text="暂停"
+                  @change="(enabled) => toggleBundlePause(row, !enabled)"
+                />
+                <span class="table-sub">{{ packPausedInView(row) ? '当前环境已暂停' : '当前环境下发中' }}</span>
+              </div>
             </template>
           </el-table-column>
           <el-table-column label="能力" width="170">
             <template #default="{ row }">
               <div class="tag-row">
-                <el-tag v-if="row.bundle" size="small" type="success">离线包</el-tag>
+                <el-tag v-if="packPausedInView(row)" size="small" type="warning">已暂停</el-tag>
+                <el-tag v-else-if="row.bundle" size="small" type="success">离线包</el-tag>
                 <el-tag v-if="hasAnyConfigSync(row)" size="small" type="warning" effect="plain">JSON 同步</el-tag>
                 <el-tag v-if="row.preconnectHosts?.length" size="small" type="info" effect="plain">预连接 {{ row.preconnectHosts.length }}</el-tag>
               </div>
@@ -916,6 +1005,8 @@ async function syncConfigJson(row) {
                     <el-dropdown-menu>
                       <el-dropdown-item command="check">检查资源更新</el-dropdown-item>
                       <el-dropdown-item command="update">增量更新离线包</el-dropdown-item>
+                      <el-dropdown-item v-if="packDeliveringInView(row)" command="pause">暂停当前环境离线包</el-dropdown-item>
+                      <el-dropdown-item v-else-if="packConfiguredInView(row)" command="resume">恢复当前环境离线包</el-dropdown-item>
                       <el-dropdown-item v-if="hasAnyConfigSync(row)" command="sync">同步三环境 JSON</el-dropdown-item>
                       <el-dropdown-item command="build" divided>强制重建离线包</el-dropdown-item>
                       <el-dropdown-item command="manifest">重新生成清单</el-dropdown-item>
@@ -970,7 +1061,7 @@ async function syncConfigJson(row) {
                 </el-select>
               </el-form-item>
             </div>
-            <div v-if="form.scope === 'region'" class="field-hint">同一环境内的多个地区可共用该环境离线包；测试、预发、正式仍分别保存和下发。</div>
+            <div v-if="form.scope === 'region'" class="field-hint">同一国家在测试、预发、正式可能是不同地区 ID。同名不同 ID 会显示成「美国 · 测试」「美国 · 正式」，不要当成同一个 ID。</div>
             <el-form-item label="路由">
               <el-input v-model="form.routesText" type="textarea" :rows="3" placeholder="每行一个路径,例如 /" />
             </el-form-item>
@@ -989,7 +1080,7 @@ async function syncConfigJson(row) {
                   {{ option.name }}
                 </el-checkbox>
               </el-checkbox-group>
-              <div class="field-hint">仅所选环境会下发该应用的 manifest，资源文件也存放在独立环境目录。</div>
+              <div class="field-hint">仅所选环境会配置该应用离线包。要暂时停掉某个环境的下发，用列表里的「暂停」开关，不会删包文件。</div>
             </el-form-item>
           </el-tab-pane>
 
@@ -1184,6 +1275,9 @@ async function syncConfigJson(row) {
 .search-input {
   width: 260px;
 }
+.env-switch {
+  flex: none;
+}
 .summary-grid {
   display: grid;
   grid-template-columns: repeat(5, minmax(120px, 1fr));
@@ -1377,7 +1471,7 @@ async function syncConfigJson(row) {
   flex-wrap: nowrap;
 }
 .region-tags .el-tag {
-  max-width: 78px;
+  max-width: 88px;
   overflow: hidden;
   text-overflow: ellipsis;
 }
@@ -1401,6 +1495,16 @@ async function syncConfigJson(row) {
 }
 .compact-actions .el-button + .el-button {
   margin-left: 0;
+}
+.pause-row {
+  margin-top: 8px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.pause-row .table-sub {
+  margin-top: 0;
 }
 .more-button {
   min-width: 70px;

@@ -105,24 +105,23 @@ test('isolates config overlays and offline bundles by environment', async (t) =>
   });
   await waitForServer(baseUrl, child);
 
-  const expected = { test: testJson, pre: preJson, prod: prodJson };
-  for (const environment of ['test', 'pre', 'prod']) {
+  const expected = { test: testJson, prod: prodJson };
+  for (const environment of ['test', 'prod']) {
     const body = await requestJson(`${baseUrl}/${environment}/api/config`);
     assert.equal(body.environment, environment);
+    assert.equal(body.apps.length, 1);
+    assert.equal(body.apps[0].id, 'sample');
     assert.equal(body.apps[0].configJson, expected[environment]);
     assert.equal(body.apps[0].configEnvironment, environment);
-    if (environment === 'pre') {
-      assert.equal(body.apps[0].bundle, false);
-      assert.equal(body.apps[0].bundleConfigured, false);
-      assert.equal(Object.hasOwn(body.apps[0], 'manifestUrl'), false);
-    } else {
-      assert.equal(body.apps[0].bundle, true);
-      assert.equal(body.apps[0].bundleConfigured, true);
-      assert.equal(body.apps[0].manifestUrl, '/bundles/sample/manifest.json');
-    }
+    assert.equal(body.apps[0].bundle, true);
+    assert.equal(body.apps[0].bundleConfigured, true);
+    assert.equal(body.apps[0].manifestUrl, '/bundles/sample/manifest.json');
     assert.equal(Object.hasOwn(body.apps[0], 'configJsonEnvironments'), false);
     assert.equal(Object.hasOwn(body.apps[0], 'configJsonSync'), false);
   }
+  const preBody = await requestJson(`${baseUrl}/pre/api/config`);
+  assert.equal(preBody.environment, 'pre');
+  assert.equal(preBody.apps.length, 0);
   const legacy = await requestJson(`${baseUrl}/api/config`);
   assert.equal(legacy.environment, 'prod');
   assert.equal(legacy.apps[0].configJson, prodJson);
@@ -142,6 +141,44 @@ test('isolates config overlays and offline bundles by environment', async (t) =>
   assert.equal(adminConfig.apps[0].configJsonEnvironments.test.configJsonSync.loginBody, '******');
   assert.equal(adminConfig.apps[0].configJsonEnvironments.test.configJsonSync.configBody, '******');
   assert.equal(adminConfig.apps[0].configJsonEnvironments.test.configJsonSync.tokenPrefix, 'Bearer ');
+  const fifaApp = {
+    id: 'app_fifaworldcup',
+    name: 'FIFA World Cup 2026',
+    url: 'https://www.fifa.com/',
+    scope: 'region',
+    bundle: true,
+    bundleEnvironments: ['test'],
+    regions: ['2046772885148901377', '2037443812888760321'],
+    regionNames: {
+      '2046772885148901377': '??',
+      '2037443812888760321': '??'
+    }
+  };
+  await requestJson(`${baseUrl}/api/admin/apps`, {
+    method: 'PUT',
+    headers: adminHeaders,
+    body: JSON.stringify({ apps: [adminConfig.apps[0], fifaApp] })
+  });
+  const fifaAdmin = await requestJson(`${baseUrl}/api/admin/config`, { headers: adminHeaders });
+  const savedFifa = fifaAdmin.apps.find((item) => item.id === 'app_fifaworldcup');
+  assert.ok(savedFifa.regions.includes('2039265040891826177'));
+  assert.equal(savedFifa.regionNames['2037443812888760321'], '美国');
+  assert.equal(savedFifa.regionNames['2046772885148901377'], '美国');
+  const fifaGroup = (fifaAdmin.regions || []).filter((item) => String(item.name || '').startsWith('美国'));
+  assert.equal(new Set(fifaGroup.map((item) => item.name)).size, fifaGroup.length);
+  assert.ok(fifaGroup.some((item) => item.id === '2037443812888760321' && item.name === '美国 · 测试 · 2037443812888760321'));
+  assert.ok(fifaGroup.some((item) => item.id === '2046772885148901377' && item.name === '美国 · 正式 · 2046772885148901377'));
+
+  const testPublic = await requestJson(`${baseUrl}/test/api/config`);
+  const testFifa = testPublic.apps.find((item) => item.id === 'app_fifaworldcup');
+  assert.ok(testFifa);
+  assert.deepEqual(testFifa.regions, ['2037443812888760321']);
+  assert.equal(testFifa.regionName, '美国');
+  assert.equal(testFifa.regionNames['2037443812888760321'], '美国');
+  assert.equal(testPublic.regions.filter((item) => String(item.name || '').includes('美国')).length, 1);
+  assert.equal(testPublic.regions.find((item) => item.id === '2037443812888760321').name, '美国');
+  assert.equal((await requestJson(`${baseUrl}/prod/api/config`)).apps.some((item) => item.id === 'app_fifaworldcup'), false);
+  assert.equal((await requestJson(`${baseUrl}/pre/api/config`)).apps.some((item) => item.id === 'app_fifaworldcup'), false);
 
   await requestJson(`${baseUrl}/api/admin/apps`, {
     method: 'PUT',
@@ -193,4 +230,115 @@ test('isolates config overlays and offline bundles by environment', async (t) =>
   });
   saved = JSON.parse(fs.readFileSync(path.join(dataDir, 'config.json'), 'utf8'));
   assert.equal(saved.apps.length, 0);
+});
+
+test('pauses offline bundle delivery without removing the app or pack files', async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'webaccel-pause-'));
+  const dataDir = path.join(root, 'data');
+  const bundlesDir = path.join(root, 'bundles');
+  const testBundleDir = path.join(bundlesDir, 'test', 'sample');
+  const prodBundleDir = path.join(bundlesDir, 'prod', 'sample');
+  fs.mkdirSync(dataDir, { recursive: true });
+  fs.mkdirSync(testBundleDir, { recursive: true });
+  fs.mkdirSync(prodBundleDir, { recursive: true });
+  const testJson = webConfig('https://example.com/app', 'test');
+  const prodJson = webConfig('https://example.com/app', 'prod');
+  fs.writeFileSync(path.join(dataDir, 'config.json'), JSON.stringify({
+    version: 'fixture',
+    apps: [{
+      id: 'sample',
+      name: 'Sample',
+      url: 'https://example.com/app',
+      scope: 'top',
+      bundle: true,
+      bundleEnvironments: ['test', 'prod'],
+      configJsonEnvironments: {
+        test: { configJson: testJson, configJsonFileName: 'test.json' },
+        prod: { configJson: prodJson, configJsonFileName: 'prod.json' }
+      }
+    }],
+    blockHosts: [],
+    settings: { configRefreshSec: 300 }
+  }, null, 2));
+  const testManifest = JSON.stringify([{ url: 'https://example.com/test.js', file: 'test.js', mime: 'application/javascript' }]);
+  const prodManifest = JSON.stringify([{ url: 'https://example.com/prod.js', file: 'prod.js', mime: 'application/javascript' }]);
+  fs.writeFileSync(path.join(testBundleDir, 'manifest.json'), testManifest);
+  fs.writeFileSync(path.join(testBundleDir, 'test.js'), 'console.log("test")');
+  fs.writeFileSync(path.join(prodBundleDir, 'manifest.json'), prodManifest);
+  fs.writeFileSync(path.join(prodBundleDir, 'prod.js'), 'console.log("prod")');
+
+  const port = 19000 + Math.floor(Math.random() * 1000);
+  const baseUrl = `http://127.0.0.1:${port}`;
+  const child = spawn(process.execPath, ['index.js'], {
+    cwd: path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..'),
+    env: {
+      ...process.env,
+      PORT: String(port),
+      DATA_DIR: dataDir,
+      BUNDLES_DIR: bundlesDir,
+      ADMIN_USER: 'admin',
+      ADMIN_PASS: 'admin123',
+      DISABLE_SCHEDULERS: '1',
+      DB_HOST: '127.0.0.1',
+      DB_PORT: '1'
+    },
+    stdio: 'ignore',
+    windowsHide: true
+  });
+  t.after(() => {
+    child.kill();
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+  await waitForServer(baseUrl, child);
+
+  const login = await requestJson(`${baseUrl}/api/login`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ username: 'admin', password: 'admin123' })
+  });
+  const adminHeaders = { 'content-type': 'application/json', 'x-admin-token': login.token };
+
+  const paused = await requestJson(`${baseUrl}/api/admin/apps/sample/bundle-pause`, {
+    method: 'PUT',
+    headers: adminHeaders,
+    body: JSON.stringify({ environment: 'test', paused: true })
+  });
+  assert.equal(paused.paused, true);
+  assert.equal(paused.enabled, false);
+  assert.deepEqual(paused.app.bundlePausedEnvironments, ['test']);
+
+  const testPublic = await requestJson(`${baseUrl}/test/api/config`);
+  const testApp = testPublic.apps.find((item) => item.id === 'sample');
+  assert.ok(testApp);
+  assert.equal(testApp.bundle, false);
+  assert.equal(testApp.bundleConfigured, false);
+  assert.equal(Object.hasOwn(testApp, 'bundlePausedEnvironments'), false);
+  assert.equal(testApp.configJson, testJson);
+  assert.equal(fs.existsSync(path.join(testBundleDir, 'manifest.json')), true);
+
+  const prodPublic = await requestJson(`${baseUrl}/prod/api/config`);
+  assert.equal(prodPublic.apps[0].bundle, true);
+  assert.equal(prodPublic.apps[0].bundleConfigured, true);
+
+  const metadataOnly = await requestJson(`${baseUrl}/api/admin/config`, { headers: adminHeaders });
+  const metadataApp = { ...metadataOnly.apps[0], name: 'Sample still paused' };
+  delete metadataApp.bundlePausedEnvironments;
+  await requestJson(`${baseUrl}/api/admin/apps/sample`, {
+    method: 'PUT',
+    headers: adminHeaders,
+    body: JSON.stringify({ app: metadataApp })
+  });
+  const saved = JSON.parse(fs.readFileSync(path.join(dataDir, 'config.json'), 'utf8'));
+  assert.deepEqual(saved.apps[0].bundlePausedEnvironments, ['test']);
+
+  const resumed = await requestJson(`${baseUrl}/api/admin/apps/sample/bundle-pause`, {
+    method: 'PUT',
+    headers: adminHeaders,
+    body: JSON.stringify({ environment: 'test', paused: false })
+  });
+  assert.equal(resumed.paused, false);
+  assert.equal(resumed.enabled, true);
+  const testAfter = await requestJson(`${baseUrl}/test/api/config`);
+  assert.equal(testAfter.apps[0].bundle, true);
+  assert.equal(testAfter.apps[0].bundleConfigured, true);
 });
