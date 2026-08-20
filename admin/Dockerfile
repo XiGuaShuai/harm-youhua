@@ -9,6 +9,7 @@ WORKDIR /web
 COPY web/package.json web/package-lock.json ./
 RUN npm ci
 COPY web/ ./
+COPY server/region-catalog.js /server/region-catalog.js
 RUN npm run build                     # 产出 /web/dist
 
 # ---------- 阶段 2:运行后端 ----------
