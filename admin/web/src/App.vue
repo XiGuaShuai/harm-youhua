@@ -8,6 +8,7 @@ import {
 } from '@element-plus/icons-vue';
 import { useConfigStore } from './stores/config';
 import { useAuthStore } from './stores/auth';
+import { adminShowsAll, adminViewLocked, defaultViewEnvironment, environmentLabel } from './adminPath';
 import LoginView from './components/LoginView.vue';
 import ChangePassword from './components/ChangePassword.vue';
 
@@ -18,6 +19,9 @@ const { version } = storeToRefs(store);
 const { authed, username } = storeToRefs(auth);
 
 const pwDialog = ref(false);
+const pathLocked = adminViewLocked();
+const pathShowsAll = adminShowsAll();
+const pathEnvName = environmentLabel(defaultViewEnvironment());
 
 const menus = [
   { path: '/dashboard', title: '概览', icon: Odometer },
@@ -60,6 +64,8 @@ onMounted(() => { if (authed.value) store.load(); });
           <div class="desc">{{ route.meta.desc }}</div>
         </div>
         <div class="right">
+          <el-tag v-if="pathShowsAll" size="small" type="warning" effect="plain" round>备份总览</el-tag>
+          <el-tag v-else-if="pathLocked" size="small" type="warning" effect="plain" round>{{ pathEnvName }}环境</el-tag>
           <el-tag size="small" type="info" effect="plain" round>
             配置版本 {{ version ? version.slice(0, 19).replace('T', ' ') : '-' }}
           </el-tag>

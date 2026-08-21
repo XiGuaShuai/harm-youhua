@@ -669,7 +669,7 @@ app.use(express.json({ limit: '16mb' }));
 // 本地用 vite(5174)代理调试时 WEB_DIST 不存在,此块自动跳过,不影响开发流程。
 if (fs.existsSync(WEB_DIST)) {
   app.use(express.static(WEB_DIST));
-  app.get(['/app', '/apps'], (_req, res) => {
+  app.get(['/app', '/apps', '/test', '/pre', '/prod'], (_req, res) => {
     res.sendFile(path.join(WEB_DIST, 'index.html'));
   });
 }

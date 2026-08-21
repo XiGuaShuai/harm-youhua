@@ -6,6 +6,13 @@ import { ElMessage, ElMessageBox } from 'element-plus';
 import { Box, EditPen, MoreFilled, Plus, Refresh, Search, Upload } from '@element-plus/icons-vue';
 import api from '../api';
 import { displayRegionMeta, displayRegionName, resolveRegionName, selectRegionIdsForEnvironment } from '../regionCatalog';
+import {
+  CONFIG_ENVIRONMENT_OPTIONS,
+  adminShowsAll,
+  adminViewLocked,
+  defaultViewEnvironment,
+  environmentLabel
+} from '../adminPath';
 import { useConfigStore } from '../stores/config';
 
 const store = useConfigStore();
@@ -18,13 +25,10 @@ const activeGroup = ref('top');
 const activeDialogTab = ref('base');
 const appQuery = ref('');
 const groupQuery = ref('');
-const CONFIG_ENVIRONMENT_OPTIONS = [
-  { id: 'test', name: '测试' },
-  { id: 'pre', name: '预发' },
-  { id: 'prod', name: '正式' }
-];
+const pathLocked = adminViewLocked();
+const pathShowsAll = adminShowsAll();
 // 地区名称按业务后台真实 ID 解析。美国/加拿大等在测试、预发、正式是三套不同 ID，显示时必须带环境后缀。
-const viewEnvironment = ref('test');
+const viewEnvironment = ref(defaultViewEnvironment());
 const activeConfigEnvironment = ref('test');
 const activeConfigEnvironmentName = computed(() =>
   CONFIG_ENVIRONMENT_OPTIONS.find((item) => item.id === activeConfigEnvironment.value)?.name || activeConfigEnvironment.value
@@ -143,6 +147,7 @@ function regionIdsOf(row) {
 }
 
 function viewRegionIdsOf(row, environment = viewEnvironment.value) {
+  if (pathShowsAll) return regionIdsOf(row);
   return selectRegionIdsForEnvironment(regionIdsOf(row), environment, {
     appName: row?.name,
     regionNames: regionNamesOf(row)
@@ -150,6 +155,7 @@ function viewRegionIdsOf(row, environment = viewEnvironment.value) {
 }
 
 function appInViewEnvironment(app, environment = viewEnvironment.value) {
+  if (pathShowsAll) return true;
   const environments = Array.isArray(app?.bundleEnvironments) ? app.bundleEnvironments : [];
   return environments.includes(environment);
 }
@@ -339,7 +345,8 @@ function bundleEnvironmentOf(row) {
 }
 
 function openBundle(row) {
-  router.push({ path: '/bundles', query: { app: row.id, environment: bundleEnvironmentOf(row) } });
+  const query = { app: row.id, environment: pathShowsAll ? bundleEnvironmentOf(row) : viewEnvironment.value };
+  router.push({ path: '/bundles', query });
 }
 
 function emptyForm(groupKey = activeGroup.value) {
@@ -860,10 +867,14 @@ async function syncConfigJson(row) {
       <div>
         <div class="eyebrow">WebAccel 配置</div>
         <h2>应用管理</h2>
-        <p>测试、预发、正式分开查看。当前只显示该环境已启用的应用和地区。</p>
+        <p v-if="pathShowsAll">备份总览：显示全部应用和三个环境状态。按环境查看请用 /test、/pre、/prod。</p>
+        <p v-else-if="pathLocked">当前只显示{{ environmentLabel(viewEnvironment) }}环境已配置的应用和地区。</p>
+        <p v-else>测试、预发、正式分开查看。当前只显示该环境已启用的应用和地区。</p>
       </div>
       <div class="head-actions">
-        <el-radio-group v-model="viewEnvironment" size="default" class="env-switch">
+        <el-tag v-if="pathShowsAll" type="warning" effect="plain">备份总览</el-tag>
+        <el-tag v-else-if="pathLocked" type="warning" effect="plain">{{ environmentLabel(viewEnvironment) }}环境</el-tag>
+        <el-radio-group v-else v-model="viewEnvironment" size="default" class="env-switch">
           <el-radio-button v-for="option in CONFIG_ENVIRONMENT_OPTIONS" :key="option.id" :label="option.id">
             {{ option.name }}
           </el-radio-button>
@@ -970,7 +981,18 @@ async function syncConfigJson(row) {
               </template>
               <el-tag v-else-if="row.bundle" size="small" type="warning" effect="plain">待构建</el-tag>
               <el-tag v-else size="small" type="info" effect="plain">未启用</el-tag>
-              <div v-if="packConfiguredInView(row)" class="pause-row">
+              <div v-if="pathShowsAll" class="pause-row">
+                <el-tag
+                  v-for="option in CONFIG_ENVIRONMENT_OPTIONS"
+                  :key="option.id"
+                  size="small"
+                  :type="packDeliveringInView(row, option.id) ? 'success' : (packConfiguredInView(row, option.id) ? 'warning' : 'info')"
+                  effect="plain"
+                >
+                  {{ option.name }}{{ packDeliveringInView(row, option.id) ? '下发' : (packConfiguredInView(row, option.id) ? '暂停' : '无') }}
+                </el-tag>
+              </div>
+              <div v-else-if="packConfiguredInView(row)" class="pause-row">
                 <el-switch
                   :model-value="packDeliveringInView(row)"
                   :loading="pausing === row.id"

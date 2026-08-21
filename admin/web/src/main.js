@@ -6,11 +6,9 @@ import * as ElementPlusIconsVue from '@element-plus/icons-vue';
 import './styles.css';
 import App from './App.vue';
 import router from './router';
+import { ensureAppsHash } from './adminPath';
 
-const adminPath = window.location.pathname.replace(/\/+$/, '') || '/';
-if ((adminPath === '/app' || adminPath === '/apps') && (!window.location.hash || window.location.hash === '#')) {
-  window.location.hash = '#/apps';
-}
+ensureAppsHash();
 
 const app = createApp(App);
 for (const [name, comp] of Object.entries(ElementPlusIconsVue)) app.component(name, comp);

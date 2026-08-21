@@ -5,6 +5,7 @@ import { ElMessage, ElMessageBox } from 'element-plus';
 import { Search, Upload } from '@element-plus/icons-vue';
 import api from '../api';
 import { displayRegionName } from '../regionCatalog';
+import { adminViewLocked, defaultViewEnvironment, environmentLabel } from '../adminPath';
 
 const route = useRoute();
 const bundles = ref([]);
@@ -30,10 +31,13 @@ const configEnvironmentOptions = [
   { id: 'pre', name: '预发' },
   { id: 'prod', name: '正式' }
 ];
+const pathLocked = adminViewLocked();
 const bundleEnvironment = ref(
-  ['test', 'pre', 'prod'].includes(String(route.query.environment || ''))
-    ? String(route.query.environment)
-    : 'test'
+  pathLocked
+    ? defaultViewEnvironment()
+    : (['test', 'pre', 'prod'].includes(String(route.query.environment || ''))
+      ? String(route.query.environment)
+      : defaultViewEnvironment())
 );
 const bundleEnvironmentName = computed(() =>
   configEnvironmentOptions.find((item) => item.id === bundleEnvironment.value)?.name || bundleEnvironment.value
@@ -483,7 +487,8 @@ async function toggleSelectedPause(enabled) {
         <div class="muted">按网站查看离线包配置、文件名、大小、耗时和沙箱占用</div>
       </div>
       <div class="head-actions">
-        <el-radio-group v-model="bundleEnvironment" size="small">
+        <el-tag v-if="pathLocked" type="warning" effect="plain">{{ environmentLabel(bundleEnvironment) }}环境</el-tag>
+        <el-radio-group v-else v-model="bundleEnvironment" size="small">
           <el-radio-button v-for="option in configEnvironmentOptions" :key="option.id" :label="option.id">
             {{ option.name }}
           </el-radio-button>
