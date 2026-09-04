@@ -1130,7 +1130,7 @@ async function syncConfigJson(row) {
             </el-form-item>
             <div class="sync-panel">
               <div class="sync-title">
-                <b>{{ activeConfigEnvironmentName }}环境：每天 12:00 自动同步</b>
+                <b>{{ activeConfigEnvironmentName }}环境：每 60 秒自动同步</b>
                 <el-switch v-model="form.configJsonSyncEnabled" active-text="开启" inactive-text="关闭" />
               </div>
               <div v-if="form.configJsonSyncEnabled">
