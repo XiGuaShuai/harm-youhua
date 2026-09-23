@@ -1,24 +1,8 @@
 {
   "app": {
-    "signingConfigs": [
-      {
-        "name": "default",
-        "type": "HarmonyOS",
-        "material": {
-          "certpath": "C:\\Users\\admin\\.ohos\\config\\default_pin2atm_yasifPaGMNePFt6v8COKQw5Bvm20KJ2ps4ReeGKCoas=.cer",
-          "keyAlias": "debugKey",
-          "keyPassword": "0000001BF91D3BA17BE2FBC088367FA1F937D32ABAC7086B2B3F3DA945214991A99AABFA7740DF713930CD",
-          "profile": "C:\\Users\\admin\\.ohos\\config\\default_pin2atm_yasifPaGMNePFt6v8COKQw5Bvm20KJ2ps4ReeGKCoas=.p7b",
-          "signAlg": "SHA256withECDSA",
-          "storeFile": "C:\\Users\\admin\\.ohos\\config\\default_pin2atm_yasifPaGMNePFt6v8COKQw5Bvm20KJ2ps4ReeGKCoas=.p12",
-          "storePassword": "0000001BDB96A8067984ABCE33D907334B7E974773751F5266AC0E680AB5D2AD8CE14B250B984D6C973EEB"
-        }
-      }
-    ],
     "products": [
       {
         "name": "default",
-        "signingConfig": "default",
         "targetSdkVersion": "5.0.3(15)",
         "compatibleSdkVersion": "5.0.3(15)",
         "runtimeOS": "HarmonyOS",

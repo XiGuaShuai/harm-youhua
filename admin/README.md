@@ -15,9 +15,9 @@ youhua-admin/
 # 1) 后端(端口 8787)
 cd server
 npm install
-npm start
+ADMIN_USER='<admin-name>' ADMIN_PASS='<strong-password>' npm start
 #   → http://localhost:8787/api/config      鸿蒙 App 拉这个
-#   → 后台登录:账号 admin / 密码 admin123  (登录后可在后台「修改密码」;或用环境变量 ADMIN_USER / ADMIN_PASS 改默认值)
+#   → 首次启动用 ADMIN_USER / ADMIN_PASS 创建账号；之后读取 data/users.json，不把账号密码写进仓库
 
 # 2) 后台界面(端口 5174,开发时自动代理到 8787)
 cd web
@@ -44,7 +44,9 @@ npm run dev
 - `POST /api/admin/bundles/<id>/import` —— 手动导入指定静态资源 URL,立即下载并重生成 manifest/压缩 manifest
 - `POST /api/login` —— 账号密码登录,返回会话 token;后续管理请求带 `X-Admin-Token: <token>` 头
 - `POST /api/admin/config-json-sync/run` —— 手动触发某个 app 的 `configJson` 同步(或全量同步)
-- `GET /api/admin/config-json-sync/log` —— 查看最近一次 `configJson` 同步结果
+- `GET /api/admin/config-json-sync/status` —— 当前同步健康状态（失败/卡住/过期）
+- `GET /config-json-sync.html` —— 浏览器查看同步状态，每 20 秒刷新
+- `GET /config-json-sync-banner.js` —— 管理页底部状态横条
 - 应用/黑名单/设置的增删改:`/api/admin/*`(需 `X-Admin-Token` 头);改密 `POST /api/admin/password`
 
 ## 鸿蒙端怎么接(已完成,经 webaccel SDK)
@@ -75,11 +77,11 @@ npm run dev
 
 3. `getWebNameList` 不是 configJson 来源,它只是应用列表接口。
 
-4. 后台启动时立即执行同步，之后每 60 秒为每个应用/环境独立执行一次;当前已配置同步源的应用会按测试、预发、正式环境分别刷新 `configJson`，单个失败不阻塞其它应用。也可以手动调 `POST /api/admin/config-json-sync/run` 立即刷新。
+4. 后台启动时立即执行同步，之后每 60 秒为每个应用/环境独立执行一次;当前已配置同步源的应用会按测试、预发、正式环境分别刷新 `configJson`，单个失败不阻塞其它应用。也可以手动调 `POST /api/admin/config-json-sync/run` 立即刷新。单目标 25 秒超时；并发 6；失败或卡住会自动再拉（单目标最多 3 次，整轮最多再跑 3 轮）。
 
-   线上环境必须使用服务器自身可访问的配置读取接口。2026-09-04 曾出现测试运营管理域名解析到不可达私网地址，造成定时器每分钟执行但测试目标全部 `fetch failed`；修复与验证过程见 [`后台运维记录-2026-09-04.md`](../后台运维记录-2026-09-04.md)。
+   线上环境必须使用服务器自身可访问的配置读取接口。2026-09-04 测试运营域名解析失败见 [`后台运维记录-2026-09-04.md`](../后台运维记录-2026-09-04.md)。2026-09-07 正式环境锁死跳过见 [`后台运维记录-2026-09-07.md`](../后台运维记录-2026-09-07.md)。
 
-5. 同步结果可从 `GET /api/admin/config-json-sync/log` 查看。
+5. 同步状态用 HTML，不要堆日志：`GET /config-json-sync.html`（需登录）。JSON：`GET /api/admin/config-json-sync/status`。详细 `config-json-sync-log.json` 每轮删除。
 
 6. 端侧不需要新增任何必须接入的 API,还是按 `/api/config` 和 `WebAccel.refreshConfig()` 这条链路拿到最新配置。
 
@@ -100,5 +102,8 @@ npm run dev
 
 - **登录鉴权**:从「单一 token」改为**账号 + 密码**登录。密码用 scrypt 加盐哈希存 `data/users.json`(不存明文);登录后颁发会话 token 存 `data/sessions.json`,有效期 7 天,服务重启不掉线。
 - **修改密码**:新增 `POST /api/admin/password`,登录后在后台右上角用户菜单即可改。
-- **默认账号**:`admin` / `admin123`(可用环境变量 `ADMIN_USER` / `ADMIN_PASS` 改);原 `ADMIN_TOKEN` 降级为可选的「脚本主令牌」,默认不开启。
+- **初始账号**:首次启动必须通过环境变量 `ADMIN_USER` / `ADMIN_PASS` 设置，密码仅以 scrypt 哈希写入运行数据；原 `ADMIN_TOKEN` 降级为可选的「脚本主令牌」，默认不开启。
 - **界面美化**:全新分栏登录页;新增「概览」仪表盘(统计卡 + 应用速览 + 系统信息);侧边栏改深色带图标、当前项渐变高亮;顶栏加配置版本标签与用户头像下拉(改密 / 退出);统一品牌主色与卡片样式。
+# 全环境备份入口（2026-09-21）
+
+测试、预发、生产全部应用配置和资源，连同本后台页面显示产物、账号、数据库和部署资料，统一备份到工作区本地 `bar/20260921-full-recovery`。服务器不额外生成运维备份副本。恢复范围、校验及新服务器操作见 [`../BACKUP_RESTORE.md`](../BACKUP_RESTORE.md)；旧五应用备份只作阶段快照。

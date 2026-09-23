@@ -4,6 +4,7 @@ import { common } from '@kit.AbilityKit';
 import { util } from '@kit.ArkTS';
 import { hilog } from '@kit.PerformanceAnalysisKit';
 import { BusinessError } from '@kit.BasicServicesKit';
+import { CacheFile } from './CacheFile';
 import BuildProfile from '../../../../BuildProfile'; // SDK 自己的生成文件(build-profile 按 debug/release 注入 CONFIG_SERVER)
 
 const TAG: string = 'RemoteConfig';
@@ -228,11 +229,10 @@ class RemoteConfigManager {
     this.cachePath = context.filesDir + '/remote-config.json';
     try {
       if (fs.accessSync(this.cachePath)) {
-        const size: number = fs.statSync(this.cachePath).size;
-        const buf: ArrayBuffer = new ArrayBuffer(size);
-        const f = fs.openSync(this.cachePath, fs.OpenMode.READ_ONLY);
-        fs.readSync(f.fd, buf);
-        fs.closeSync(f);
+        const buf: ArrayBuffer | null = CacheFile.read(this.cachePath);
+        if (!buf) {
+          throw new Error('cached configuration is unreadable');
+        }
         const txt: string = util.TextDecoder.create('utf-8').decodeToString(new Uint8Array(buf));
         if (txt.length > 0) {
           const parsed = JSON.parse(txt) as RemoteConfigData;
@@ -381,14 +381,7 @@ class RemoteConfigManager {
   }
 
   private saveCache(txt: string): void {
-    try {
-      const f = fs.openSync(this.cachePath, fs.OpenMode.READ_WRITE | fs.OpenMode.CREATE | fs.OpenMode.TRUNC);
-      fs.writeSync(f.fd, txt);
-      fs.closeSync(f);
-    } catch (e) {
-      const er = e as BusinessError;
-      hilog.error(DOMAIN, TAG, 'saveCache failed: %{public}s', er.message);
-    }
+    CacheFile.writeText(this.cachePath, txt);
   }
 
   private refreshResult(requestId: number, status: string, message: string,

@@ -3,7 +3,7 @@ import { ref, onMounted, computed, watch } from 'vue';
 import { storeToRefs } from 'pinia';
 import { useRouter } from 'vue-router';
 import { ElMessage, ElMessageBox } from 'element-plus';
-import { Box, EditPen, MoreFilled, Plus, Refresh, Search, Upload } from '@element-plus/icons-vue';
+import { Box, EditPen, MoreFilled, Plus, Refresh, RefreshRight, Search, Upload } from '@element-plus/icons-vue';
 import api from '../api';
 import { displayRegionMeta, displayRegionName, resolveRegionName, selectRegionIdsForEnvironment } from '../regionCatalog';
 import {
@@ -137,6 +137,18 @@ function hasAnyConfigJson(row) {
 
 function hasAnyConfigSync(row) {
   return Object.values(configEnvironmentsOf(row)).some((value) => value.configJsonSync?.enabled === true);
+}
+
+function hasConfigSyncSource(sync) {
+  return !!String(sync?.loginUrl || '').trim() && !!String(sync?.configUrl || '').trim();
+}
+
+function syncEnvironmentsOf(row) {
+  const environments = configEnvironmentsOf(row);
+  const ids = pathShowsAll
+    ? CONFIG_ENVIRONMENT_OPTIONS.map((item) => item.id)
+    : [viewEnvironment.value];
+  return ids.filter((id) => hasConfigSyncSource(environments[id]?.configJsonSync));
 }
 
 function regionIdsOf(row) {
@@ -841,20 +853,47 @@ async function generateManifest(row) {
 }
 
 async function syncConfigJson(row) {
+  const envIds = pathShowsAll
+    ? CONFIG_ENVIRONMENT_OPTIONS.map((item) => item.id)
+    : [viewEnvironment.value];
+  const envName = pathShowsAll
+    ? '三环境'
+    : (CONFIG_ENVIRONMENT_OPTIONS.find((item) => item.id === viewEnvironment.value)?.name || viewEnvironment.value);
+  if (syncEnvironmentsOf(row).length === 0) {
+    ElMessage.warning(`「${row.name || row.id}」${envName}未配置 JSON 同步地址，请先在编辑页填写登录/配置接口`);
+    return;
+  }
   syncingJson.value = row.id;
   try {
-    const { data } = await api.post('/api/admin/config-json-sync/run', { appId: row.id });
-    const results = data?.log?.results || [];
+    const payload = pathShowsAll
+      ? { appId: row.id }
+      : { appId: row.id, environment: viewEnvironment.value };
+    const { data } = await api.post('/api/admin/config-json-sync/run', payload);
+    if (data?.log?.skipped) {
+      ElMessage.warning(data.log.reason || '后台正在同步，请稍后再点');
+      return;
+    }
+    const results = (data?.log?.results || []).filter((item) => envIds.includes(item.environment));
     const failed = results.filter((item) => item.ok === false);
     const changed = results.filter((item) => item.changed === true);
+    const skipped = results.filter((item) => item.ok !== false && String(item.detail || '').startsWith('跳过'));
     if (failed.length > 0) {
-      ElMessage.error(`JSON 同步失败 ${failed.length} 个环境：` + failed.map((item) => `${item.environmentName}:${item.detail}`).join('；'));
-    } else {
-      ElMessage.success(changed.length > 0 ? `JSON 已更新 ${changed.length} 个环境` : '三环境 JSON 已检查，无变化');
-      await store.load();
+      ElMessage.error(`JSON 更新失败：` + failed.map((item) => `${item.environmentName || item.environment}:${item.detail}`).join('；'));
+      return;
     }
+    if (changed.length > 0) {
+      ElMessage.success(`「${row.name || row.id}」${envName} configJson 已更新`);
+      await store.load();
+      return;
+    }
+    if (skipped.length === results.length) {
+      ElMessage.warning(`「${row.name || row.id}」${envName}未拉取到 JSON：` + skipped.map((item) => item.detail).join('；'));
+      return;
+    }
+    ElMessage.success(`「${row.name || row.id}」${envName} configJson 已检查，无变化`);
+    await store.load();
   } catch (e) {
-    ElMessage.error('JSON 同步失败:' + (e.response?.data?.error || e.message));
+    ElMessage.error('JSON 更新失败:' + (e.response?.data?.error || e.message));
   } finally {
     syncingJson.value = '';
   }
@@ -1016,10 +1055,19 @@ async function syncConfigJson(row) {
               </div>
             </template>
           </el-table-column>
-          <el-table-column label="操作" width="270" fixed="right">
+          <el-table-column label="操作" width="360" fixed="right">
             <template #default="{ row }">
               <div class="op-row compact-actions">
                 <el-button size="small" type="primary" plain :icon="Box" @click="openBundle(row)">资源</el-button>
+                <el-button
+                  size="small"
+                  type="warning"
+                  plain
+                  :icon="RefreshRight"
+                  :loading="syncingJson === row.id"
+                  :disabled="rowBusy(row) && syncingJson !== row.id"
+                  @click="syncConfigJson(row)"
+                >更新 JSON</el-button>
                 <el-button size="small" :icon="EditPen" @click="openEdit(row)">编辑</el-button>
                 <el-dropdown trigger="click" :disabled="rowBusy(row)" @command="(command) => handleRowCommand(command, row)">
                   <el-button size="small" class="more-button" :loading="rowBusy(row)" :icon="MoreFilled">更多</el-button>
@@ -1513,7 +1561,7 @@ async function syncConfigJson(row) {
   gap: 6px;
 }
 .compact-actions {
-  flex-wrap: nowrap;
+  flex-wrap: wrap;
 }
 .compact-actions .el-button + .el-button {
   margin-left: 0;

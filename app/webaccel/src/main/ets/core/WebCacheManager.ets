@@ -6,11 +6,14 @@ import { WebNetErrorList, webview } from '@kit.ArkWeb';
 import { BusinessError, zlib } from '@kit.BasicServicesKit';
 import { hilog } from '@kit.PerformanceAnalysisKit';
 import { RemoteSettings, RemoteApp, remoteAppRegions } from './RemoteConfig';
+import { CacheFile, CacheWriteResult } from './CacheFile';
 
 const TAG: string = 'WebCache';
 const DOMAIN: number = 0x0001;
 const DISK_CAP_BYTES: number = 160 * 1024 * 1024;   // 沙箱离线包总量上限
 const BUNDLE_CONCURRENCY: number = 8;               // 远程离线包后台下载并发上限(可远程下发覆盖,上限 8)
+const CACHE_DIR_NAME: string = 'webcache-v2';
+const LEGACY_CACHE_DIR_NAME: string = 'webcache';
 
 /**
  * SDK 内置的极小「首启安全网」黑名单 —— **不是站点优化**。
@@ -107,12 +110,6 @@ interface BundleState {
   configJson?: string; // 该网址对应的 H5 配置 JSON,供宿主离线兜底注入
 }
 
-/** 离线包资源损坏 → 后台自愈上报体 */
-interface SelfHealBody {
-  appId: string;
-  reason: string;
-}
-
 interface BundleResourceOwner {
   bundleKey: string;
   bundleId: string;
@@ -149,7 +146,6 @@ class WebCacheManager {
   private appRegionsById: Map<string, string[]> = new Map();
   private enabledBundleIds: Set<string> = new Set();
   private enabledBundleOrigins: Set<string> = new Set();
-  private reportedSelfHeal: Set<string> = new Set();          // 已上报过自愈的 appId(本次会话只报一次,防刷)
   private serverBase: string = '';                            // 后端地址(applyApps 时由 remoteConfig.getServer() 注入,自愈上报用)
 
   private diskIndex: Map<string, DiskEntry> = new Map();
@@ -177,13 +173,18 @@ class WebCacheManager {
   private lastCacheAt: number = 0;                                // 最近一次"缓存成功"的时刻(判断是否真的还在缓存)
   private activeRegion: string = '';                              // 当前独占地区缓存
   private regionGeneration: number = 0;                            // 地区切换代号,旧任务回调用它判废
+  private lastWriteErrorCode: number = 0;
 
   /** 启动时调用一次(EntryAbility.onCreate) */
   init(context: common.UIAbilityContext): void {
     try {
-      this.cacheDir = context.filesDir + '/webcache';
+      this.cacheDir = context.filesDir + '/' + CACHE_DIR_NAME;
       this.indexPath = this.cacheDir + '/index.json';
       this.bundleStatePath = this.cacheDir + '/bundle-state.json';
+      // v1 could leave orphaned compressed files after a failed index write.
+      // Remove only the old SDK-owned flat cache directory. WebView cookies,
+      // local storage and login state live outside this directory.
+      this.removeLegacyCacheDir(context.filesDir + '/' + LEGACY_CACHE_DIR_NAME);
       if (!fs.accessSync(this.cacheDir)) {
         fs.mkdirSync(this.cacheDir, true);
       }
@@ -792,7 +793,8 @@ class WebCacheManager {
     }
     for (let i = 0; i < state.urls.length; i++) {
       const disk: DiskEntry | undefined = this.diskIndex.get(state.urls[i]);
-      if (disk === undefined || disk.source !== 'bundle') {
+      if (disk === undefined || disk.source !== 'bundle' ||
+        !CacheFile.hasSize(this.cacheDir + '/' + disk.file, disk.size)) {
         return false;
       }
     }
@@ -860,11 +862,17 @@ class WebCacheManager {
     }
     try {
       const response = new webview.WebSchemeHandlerResponse();
+      // setUrl() is only for redirect responses. Setting it to the request URL
+      // makes ArkWeb request the same URL again until ERR_TOO_MANY_REDIRECTS.
       response.setNetErrorCode(WebNetErrorList.NET_OK);
       response.setStatus(200);
       response.setStatusText('OK');
       response.setMimeType(hit.mime);
       response.setEncoding('utf-8');
+      response.setHeaderByName('Access-Control-Allow-Origin', '*', true);
+      response.setHeaderByName('Cross-Origin-Resource-Policy', 'cross-origin', true);
+      response.setHeaderByName('Cache-Control', 'max-age=31536000', true);
+      response.setHeaderByName('X-Offline-Cache', 'HIT', true);
       handler.didReceiveResponse(response);
       handler.didReceiveResponseBody(hit.body);
       handler.didFinish();
@@ -903,7 +911,7 @@ class WebCacheManager {
         return null;
       }
       const buf: ArrayBuffer | null = this.readFile(this.cacheDir + '/' + disk.file);
-      if (buf) {
+      if (buf && buf.byteLength === disk.size) {
         disk.atime = Date.now();
         this.hitDisk++;
         return { body: buf, mime: disk.mime };
@@ -1082,7 +1090,7 @@ class WebCacheManager {
   /** Download one manifest resource and store it under the original website URL. */
   private fetchAndStore(cacheKey: string, sourceUrl: string, mime: string,
     onDone: (ok: boolean) => void, contentEncoding: string,
-    rawSize: number, owner?: BundleResourceOwner): void {
+    rawSize: number, expectedSize: number, owner?: BundleResourceOwner): void {
     if (this.isOwnerCancelled(owner)) {
       if (onDone) {
         onDone(false);
@@ -1093,9 +1101,14 @@ class WebCacheManager {
       onDone(false);
       return;
     }
-    if (this.diskIndex.has(cacheKey)) {
-      onDone(true);
-      return;
+    const cached: DiskEntry | undefined = this.diskIndex.get(cacheKey);
+    if (cached !== undefined) {
+      if ((expectedSize < 0 || cached.size === expectedSize) &&
+        CacheFile.hasSize(this.cacheDir + '/' + cached.file, cached.size)) {
+        onDone(true);
+        return;
+      }
+      this.removeCached(cacheKey);
     }
     this.inflight.add(cacheKey);
     // 调试浮窗:一发起下载就记录"正在缓存的资源"(不等下完),并入最近列表(新→旧,留 12 条)
@@ -1126,9 +1139,27 @@ class WebCacheManager {
           ok = false;
         } else if (!err && data && data.responseCode === 200 && data.result instanceof ArrayBuffer) {
           const body: ArrayBuffer = data.result as ArrayBuffer;
+          if (expectedSize >= 0 && body.byteLength !== expectedSize) {
+            hilog.error(DOMAIN, TAG, 'bundle size mismatch expected=%{public}d actual=%{public}d %{public}s',
+              expectedSize, body.byteLength, cacheKey);
+            client.destroy();
+            onDone(false);
+            return;
+          }
           const file: string = this.fileNameFor(cacheKey);
           const finalMime: string = mime.length > 0 ? mime : this.pickMime(cacheKey, data.header);
-          this.writeBinary(this.cacheDir + '/' + file, body);
+          // Respect the configured cap before opening the destination file.
+          // Atomic-service sandboxes can also have a lower system quota than
+          // the remote cap; if that quota is reached, evict LRU entries and
+          // retry so a newly requested small bundle is not starved by older
+          // region bundles.
+          this.evictForIncoming(body.byteLength);
+          if (!this.writeBinaryWithRecovery(this.cacheDir + '/' + file, body)) {
+            hilog.error(DOMAIN, TAG, 'bundle STORE rejected: file write incomplete %{public}s', cacheKey);
+            client.destroy();
+            onDone(false);
+            return;
+          }
           const now: number = Date.now();
           const entry: DiskEntry = {
             url: cacheKey, file: file, mime: finalMime, size: body.byteLength,
@@ -1195,16 +1226,26 @@ class WebCacheManager {
       if (this.isOwnerCancelled(owner)) {
         continue;
       }
-      if (this.diskIndex.has(entry.url)) {
-        this.markBundleResource(entry.url);
-        continue;
+      const cached: DiskEntry | undefined = this.diskIndex.get(entry.url);
+      if (cached !== undefined) {
+        if ((entry.size === undefined || cached.size === entry.size) &&
+          CacheFile.hasSize(this.cacheDir + '/' + cached.file, cached.size)) {
+          this.markBundleResource(entry.url);
+          continue;
+        }
+        this.removeCached(entry.url);
       }
       this.activeBundleDownloads++;
       const rawSize: number = entry.rawSize && entry.rawSize > 0 ? entry.rawSize : 0;
-      this.fetchAndStore(entry.url, src, entry.mime, (_ok: boolean) => {
+      const expectedSize: number = entry.size === undefined ? -1 : entry.size;
+      this.fetchAndStore(entry.url, src, entry.mime, (ok: boolean) => {
         this.activeBundleDownloads--;
+        if (!ok && owner && !this.isOwnerCancelled(owner)) {
+          this.loadedBundles.delete(owner.bundleKey);
+          this.bundleErrors.set(owner.bundleKey, 'resource download or local write failed');
+        }
         this.pumpBundleQueue();
-      }, entry.encoding ? entry.encoding : '', rawSize, owner);
+      }, entry.encoding ? entry.encoding : '', rawSize, expectedSize, owner);
     }
   }
 
@@ -1338,11 +1379,12 @@ class WebCacheManager {
         const wantEncoding: string = e.encoding && e.encoding.length > 0 ? e.encoding : '';
         const haveEncoding: string = diskExisting.encoding && diskExisting.encoding.length > 0 ? diskExisting.encoding : '';
         const wantRawSize: number = e.rawSize && e.rawSize > 0 ? e.rawSize : 0;
-        const wantSize: number = e.size && e.size > 0 ? e.size : 0;
+        const wantSize: number = e.size === undefined ? -1 : e.size;
         if (diskExisting.source !== 'bundle' ||
+          !CacheFile.hasSize(this.cacheDir + '/' + diskExisting.file, diskExisting.size) ||
           wantEncoding !== haveEncoding ||
           (wantRawSize > 0 && diskExisting.rawSize !== wantRawSize) ||
-          (wantSize > 0 && diskExisting.size !== wantSize)) {
+          (wantSize >= 0 && diskExisting.size !== wantSize)) {
           if (diskExisting.source !== 'bundle') {
             hilog.warn(DOMAIN, TAG, 'replace non-bundle cache source=%{public}s url=%{public}s',
               diskExisting.source && diskExisting.source.length > 0 ? diskExisting.source : '(none)', e.url);
@@ -1449,27 +1491,46 @@ class WebCacheManager {
   /** 超过容量上限时按 LRU(最久未访问)逐个淘汰 */
   private evictIfNeeded(): void {
     while (this.totalBytes > this.diskCapBytes && this.diskIndex.size > 0) {
-      let oldestUrl: string = '';
-      let oldestAt: number = Number.MAX_SAFE_INTEGER;
-      this.diskIndex.forEach((v: DiskEntry, k: string) => {
-        if (v.atime < oldestAt) {
-          oldestAt = v.atime;
-          oldestUrl = k;
-        }
-      });
-      if (oldestUrl.length === 0) {
+      if (this.evictOldestEntry() <= 0) {
         break;
       }
-      const victim: DiskEntry | undefined = this.diskIndex.get(oldestUrl);
-      if (victim) {
-        this.removeFile(this.cacheDir + '/' + victim.file);
-        this.totalBytes -= victim.size;
-        this.diskIndex.delete(oldestUrl);
-        this.decodedMemory.delete(oldestUrl);
-        this.decoding.delete(oldestUrl);
-        hilog.info(DOMAIN, TAG, 'evict %{public}s', victim.file);
-      }
     }
+  }
+
+  /** Make room before writing, avoiding a temporary over-cap file. */
+  private evictForIncoming(incomingBytes: number): void {
+    let changed: boolean = false;
+    while (this.totalBytes + incomingBytes > this.diskCapBytes && this.diskIndex.size > 0) {
+      if (this.evictOldestEntry() <= 0) {
+        break;
+      }
+      changed = true;
+    }
+    if (changed) {
+      this.saveDiskIndex();
+    }
+  }
+
+  /** Evict one LRU cache file and return the number of bytes released. */
+  private evictOldestEntry(): number {
+    let oldestUrl: string = '';
+    let oldestAt: number = Number.MAX_SAFE_INTEGER;
+    this.diskIndex.forEach((v: DiskEntry, k: string) => {
+      if (v.atime < oldestAt) {
+        oldestAt = v.atime;
+        oldestUrl = k;
+      }
+    });
+    if (oldestUrl.length === 0) {
+      return 0;
+    }
+    const victim: DiskEntry | undefined = this.diskIndex.get(oldestUrl);
+    if (!victim) {
+      return 0;
+    }
+    this.removeCached(oldestUrl);
+    hilog.info(DOMAIN, TAG, 'evict %{public}s', victim.file);
+    return victim.size;
   }
 
   private pickMime(url: string, header: Object): string {
@@ -1505,29 +1566,68 @@ class WebCacheManager {
   }
 
   private readFile(path: string): ArrayBuffer | null {
-    try {
-      if (!fs.accessSync(path)) {
-        return null;
-      }
-      const size: number = fs.statSync(path).size;
-      const buf: ArrayBuffer = new ArrayBuffer(size);
-      const f = fs.openSync(path, fs.OpenMode.READ_ONLY);
-      fs.readSync(f.fd, buf);
-      fs.closeSync(f);
-      return buf;
-    } catch (e) {
-      return null;
-    }
+    return CacheFile.read(path);
   }
 
-  private writeBinary(path: string, buf: ArrayBuffer): void {
+  private writeBinary(path: string, buf: ArrayBuffer): boolean {
+    const result: CacheWriteResult = CacheFile.write(path, buf);
+    this.lastWriteErrorCode = result.code;
+    return result.ok;
+  }
+
+  /**
+   * A device can enforce an atomic-service quota below diskCapBytes. Recover
+   * from that condition by releasing old LRU bundle files in bounded batches.
+   */
+  private writeBinaryWithRecovery(path: string, buf: ArrayBuffer): boolean {
+    if (this.writeBinary(path, buf)) {
+      return true;
+    }
+    if (!CacheFile.isStoragePressure(this.lastWriteErrorCode)) {
+      return false;
+    }
+    const releaseTarget: number = Math.max(buf.byteLength, 512 * 1024);
+    let attempts: number = 0;
+    let releasedTotal: number = 0;
+    while (this.diskIndex.size > 0 && attempts < 16) {
+      let releasedBatch: number = 0;
+      while (this.diskIndex.size > 0 && releasedBatch < releaseTarget) {
+        const released: number = this.evictOldestEntry();
+        if (released <= 0) {
+          break;
+        }
+        releasedBatch += released;
+        releasedTotal += released;
+      }
+      if (releasedBatch <= 0) {
+        break;
+      }
+      this.saveDiskIndex();
+      attempts++;
+      if (this.writeBinary(path, buf)) {
+        hilog.warn(DOMAIN, TAG,
+          'writeBinary recovered after quota pressure released=%{public}d attempts=%{public}d',
+          releasedTotal, attempts);
+        return true;
+      }
+    }
+    return false;
+  }
+
+  private removeLegacyCacheDir(path: string): void {
     try {
-      const f = fs.openSync(path, fs.OpenMode.READ_WRITE | fs.OpenMode.CREATE | fs.OpenMode.TRUNC);
-      fs.writeSync(f.fd, buf);
-      fs.closeSync(f);
+      if (!fs.accessSync(path)) {
+        return;
+      }
+      const files: string[] = fs.listFileSync(path);
+      for (let i = 0; i < files.length; i++) {
+        this.removeFile(path + '/' + files[i]);
+      }
+      fs.rmdirSync(path);
+      hilog.info(DOMAIN, TAG, 'legacy offline cache removed files=%{public}d', files.length);
     } catch (e) {
       const er = e as BusinessError;
-      hilog.error(DOMAIN, TAG, 'writeBinary failed: %{public}s', er.message);
+      hilog.warn(DOMAIN, TAG, 'legacy offline cache cleanup failed: %{public}s', er.message);
     }
   }
 
@@ -1561,7 +1661,12 @@ class WebCacheManager {
       return;
     }
     const packed: ArrayBuffer | null = this.readFile(this.cacheDir + '/' + entry.file);
-    if (!packed) {
+    if (!packed || packed.byteLength !== entry.size) {
+      // Do not leave a zombie index entry behind. Otherwise the version gate
+      // treats the bundle as complete and never downloads the missing file.
+      this.removeCached(url);
+      this.saveDiskIndex();
+      this.reportBundleCorruptIfNeeded(url);
       return;
     }
     this.decoding.add(url);
@@ -1569,6 +1674,15 @@ class WebCacheManager {
     const zip: zlib.Zip = zlib.createZipSync();
     zip.uncompress(out, packed, packed.byteLength)
       .then((info: zlib.ZipOutputInfo) => {
+        if (info.destLen !== rawSize || this.diskIndex.get(url) !== entry) {
+          this.decoding.delete(url);
+          if (this.diskIndex.get(url) === entry) {
+            this.removeCached(url);
+            this.saveDiskIndex();
+            this.reportBundleCorruptIfNeeded(url);
+          }
+          return;
+        }
         const len: number = info.destLen > 0 && info.destLen <= out.byteLength ? info.destLen : out.byteLength;
         const decoded: ArrayBuffer = len === out.byteLength ? out : out.slice(0, len);
         this.decodedMemory.set(url, decoded);
@@ -1578,6 +1692,11 @@ class WebCacheManager {
       })
       .catch((e: BusinessError) => {
         this.decoding.delete(url);
+        if (this.diskIndex.get(url) === entry) {
+          this.removeCached(url);
+          this.saveDiskIndex();
+          this.reportBundleCorruptIfNeeded(url);
+        }
         hilog.warn(DOMAIN, TAG, 'cache DECODE failed %{public}s: %{public}s', url, e.message);
       });
   }
@@ -1597,16 +1716,19 @@ class WebCacheManager {
       if (!fs.accessSync(this.indexPath)) {
         return;
       }
-      const size: number = fs.statSync(this.indexPath).size;
-      const buf: ArrayBuffer = new ArrayBuffer(size);
-      const f = fs.openSync(this.indexPath, fs.OpenMode.READ_ONLY);
-      fs.readSync(f.fd, buf);
-      fs.closeSync(f);
+      const buf: ArrayBuffer | null = CacheFile.read(this.indexPath);
+      if (!buf) {
+        return;
+      }
       const txt: string = util.TextDecoder.create('utf-8').decodeToString(new Uint8Array(buf));
       if (txt && txt.length > 0) {
         const arr = JSON.parse(txt) as DiskEntry[];
         for (let i = 0; i < arr.length; i++) {
           const e: DiskEntry = arr[i];
+          if (!e || !e.file || e.file.indexOf('/') >= 0 || e.file.indexOf('\\') >= 0 ||
+            !CacheFile.hasSize(this.cacheDir + '/' + e.file, e.size)) {
+            continue;
+          }
           if (!e.version) {
             e.version = ''; // 兼容旧索引(无 version 字段)
           }
@@ -1627,9 +1749,7 @@ class WebCacheManager {
         arr.push(v);
       });
       const txt: string = JSON.stringify(arr);
-      const f = fs.openSync(this.indexPath, fs.OpenMode.READ_WRITE | fs.OpenMode.CREATE | fs.OpenMode.TRUNC);
-      fs.writeSync(f.fd, txt);
-      fs.closeSync(f);
+      CacheFile.writeText(this.indexPath, txt);
     } catch (e) {
       const er = e as BusinessError;
       hilog.error(DOMAIN, TAG, 'saveDiskIndex failed: %{public}s', er.message);
@@ -1645,6 +1765,16 @@ class WebCacheManager {
       this.diskIndex.delete(url);
       this.decodedMemory.delete(url);
       this.decoding.delete(url);
+      this.bundleState.forEach((state: BundleState, key: string) => {
+        if (state.urls.indexOf(url) >= 0) {
+          this.loadedBundles.delete(key);
+          const progress: BundleProgressEntry | undefined = this.bundleProgress.get(key);
+          if (progress && !progress.expected.has(url)) {
+            progress.expected.add(url);
+            progress.done = Math.max(0, progress.done - 1);
+          }
+        }
+      });
     }
   }
 
@@ -1654,11 +1784,10 @@ class WebCacheManager {
       if (!fs.accessSync(this.bundleStatePath)) {
         return;
       }
-      const size: number = fs.statSync(this.bundleStatePath).size;
-      const buf: ArrayBuffer = new ArrayBuffer(size);
-      const f = fs.openSync(this.bundleStatePath, fs.OpenMode.READ_ONLY);
-      fs.readSync(f.fd, buf);
-      fs.closeSync(f);
+      const buf: ArrayBuffer | null = CacheFile.read(this.bundleStatePath);
+      if (!buf) {
+        return;
+      }
       const txt: string = util.TextDecoder.create('utf-8').decodeToString(new Uint8Array(buf));
       if (txt && txt.length > 0) {
         const arr = JSON.parse(txt) as BundleState[];
@@ -1688,58 +1817,38 @@ class WebCacheManager {
     try {
       const arr: BundleState[] = [];
       this.bundleState.forEach((v: BundleState) => {
-        arr.push(v);
+        // remote-config.json already persists the complete one-minute public
+        // config, including every configJson. Duplicating those large strings
+        // in bundle-state.json wastes the atomic-service quota. Keep them in
+        // memory for getConfigJson(), but persist only bundle version metadata.
+        arr.push({
+          key: v.key,
+          id: v.id,
+          origin: v.origin,
+          region: v.region,
+          scope: v.scope,
+          version: v.version,
+          urls: v.urls,
+          configJson: undefined
+        });
       });
       const txt: string = JSON.stringify(arr);
-      const f = fs.openSync(this.bundleStatePath, fs.OpenMode.READ_WRITE | fs.OpenMode.CREATE | fs.OpenMode.TRUNC);
-      fs.writeSync(f.fd, txt);
-      fs.closeSync(f);
+      CacheFile.writeText(this.bundleStatePath, txt);
     } catch (e) {
       const er = e as BusinessError;
       hilog.error(DOMAIN, TAG, 'saveBundleState failed: %{public}s', er.message);
     }
   }
 
-  /**
-   * 离线包资源实际读不出(文件丢/坏)→ 上报后台自愈重建该站离线包。
-   * 仅当该 URL 属于某 bundle:true 站时才报;本会话每站只报一次,避免刷请求。
-   * 全程 fire-and-forget,不阻塞 intercept 热路径,上报失败也不影响用户(端侧已放行走网络兜底)。
-   */
+  /** A local read failure invalidates local state; it is not evidence of a bad server bundle. */
   private reportBundleCorruptIfNeeded(url: string): void {
-    if (this.serverBase.length === 0) {
-      return; // 无后端(纯本地/直供模式),不上报
-    }
-    const om: RegExpMatchArray | null = url.match(/^https?:\/\/[^\/]+/);
-    const origin: string = om ? om[0] : '';
-    if (origin.length === 0) {
-      return;
-    }
-    const appId: string | undefined = this.bundleAppByOrigin.get(origin);
-    if (appId === undefined || appId.length === 0) {
-      return; // 不是离线包站的资源,无需自愈
-    }
-    if (this.reportedSelfHeal.has(appId)) {
-      return; // 本会话已为该站报过,防刷
-    }
-    this.reportedSelfHeal.add(appId);
-    const body: SelfHealBody = { appId: appId, reason: 'bundle-resource-missing' };
-    const client = http.createHttp();
-    const header: Record<string, string> = { 'Content-Type': 'application/json' };
-    const options: http.HttpRequestOptions = {
-      method: http.RequestMethod.POST,
-      header: header,
-      extraData: JSON.stringify(body),
-      connectTimeout: 15000,
-      readTimeout: 30000
-    };
-    client.request(this.serverBase + '/api/report-error', options, (err: BusinessError, data: http.HttpResponse) => {
-      client.destroy();
-      if (!err && data) {
-        hilog.info(DOMAIN, TAG, 'self-heal report %{public}s code=%{public}d', appId, data.responseCode);
-      } else {
-        hilog.warn(DOMAIN, TAG, 'self-heal report failed %{public}s', appId);
+    this.bundleState.forEach((state: BundleState, key: string) => {
+      if (state.urls.indexOf(url) >= 0) {
+        this.loadedBundles.delete(key);
+        this.bundleErrors.set(key, 'local resource missing or incomplete');
       }
     });
+    hilog.warn(DOMAIN, TAG, 'local bundle invalidated; server rebuild skipped %{public}s', url);
   }
 
   /** 由完整 URL 生成文件系统安全的文件名(双 DJB2,够防碰撞) */

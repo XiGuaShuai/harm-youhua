@@ -25,6 +25,12 @@ import {
   resolveRegionName,
   selectRegionIdsForEnvironment
 } from './region-catalog.js';
+import {
+  buildConfigJsonSyncStatus,
+  renderConfigJsonSyncBannerJs,
+  renderConfigJsonSyncHtml,
+  renderConfigJsonSyncLoginHtml
+} from './config-json-sync-status.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const DATA_DIR = process.env.DATA_DIR ? path.resolve(process.env.DATA_DIR) : path.join(__dirname, 'data');
@@ -40,8 +46,8 @@ const FETCH_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (
 const IMPORT_TIMEOUT_MS = 60 * 1000;
 // 可选「主令牌」:仅当显式设置 ADMIN_TOKEN 时生效(给脚本/CI 用),默认不开,走账号密码登录
 const MASTER_TOKEN = process.env.ADMIN_TOKEN || '';
-const DEFAULT_USER = process.env.ADMIN_USER || 'admin';
-const DEFAULT_PASS = process.env.ADMIN_PASS || 'admin123';
+const INITIAL_ADMIN_USER = String(process.env.ADMIN_USER || '').trim();
+const INITIAL_ADMIN_PASS = String(process.env.ADMIN_PASS || '');
 const SESSION_TTL_MS = 7 * 24 * 3600 * 1000; // 登录态有效期 7 天
 const CONFIG_ENVIRONMENTS = ['test', 'pre', 'prod'];
 const CONFIG_ENVIRONMENT_LABELS = { test: '测试', pre: '预发', prod: '正式' };
@@ -71,8 +77,12 @@ function verifyPassword(pw, stored) {
 }
 function loadUsers() {
   try { return JSON.parse(fs.readFileSync(USERS_FILE, 'utf8')); }
-  catch {
-    const u = [{ username: DEFAULT_USER, password: hashPassword(DEFAULT_PASS), createdAt: new Date().toISOString() }];
+  catch (error) {
+    if (fs.existsSync(USERS_FILE)) throw error;
+    if (!INITIAL_ADMIN_USER || !INITIAL_ADMIN_PASS) {
+      throw new Error('ADMIN_USER and ADMIN_PASS are required for the first start');
+    }
+    const u = [{ username: INITIAL_ADMIN_USER, password: hashPassword(INITIAL_ADMIN_PASS), createdAt: new Date().toISOString() }];
     saveUsers(u);
     return u;
   }
@@ -652,12 +662,60 @@ const AUTO_UPDATE_INTERVAL_MS = 24 * 60 * 60 * 1000; // 一天一次
 const AUTO_UPDATE_FIRST_DELAY_MS = 60 * 1000;        // 服务启动 1 分钟后先跑一次
 const AUTO_UPDATE_LOG = path.join(DATA_DIR, 'auto-update-log.json');
 const CONFIG_JSON_SYNC_INTERVAL_MS = 60 * 1000; // 每分钟从各环境业务后台同步 configJson
+const CONFIG_JSON_SYNC_TARGET_TIMEOUT_MS = 25 * 1000;
+const CONFIG_JSON_SYNC_CONCURRENCY = 6;
+const CONFIG_JSON_SYNC_TARGET_RETRIES = 2;
+const CONFIG_JSON_SYNC_RETRY_DELAY_MS = 8 * 1000;
+const CONFIG_JSON_SYNC_MAX_AUTO_ROUNDS = 3;
 const CONFIG_JSON_SYNC_LOG = path.join(DATA_DIR, 'config-json-sync-log.json');
+const CONFIG_JSON_SYNC_STATUS = path.join(DATA_DIR, 'config-json-sync-status.json');
+const CONFIG_JSON_SYNC_LOG_TTL_MS = 6 * 60 * 60 * 1000;
 let autoUpdateRunning = false;
 let autoUpdateLiveLog = null;
 let configJsonSyncRunning = false;
 let configJsonSyncTimer = null;
+let configJsonSyncRetryTimer = null;
+let configJsonSyncAutoRound = 0;
+let configJsonSyncLiveLog = null;
+let configJsonSyncSkippedRound = null;
 const configJsonSyncKeys = new Set();
+
+function withTimeout(promise, ms, message) {
+  let timer = null;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error(message)), ms);
+  });
+  return Promise.race([promise, timeout]).finally(() => {
+    if (timer) clearTimeout(timer);
+  });
+}
+
+async function mapLimit(items, limit, worker) {
+  const results = new Array(items.length);
+  let next = 0;
+  const workerCount = Math.max(1, Math.min(limit, items.length));
+  async function runWorker() {
+    while (next < items.length) {
+      const current = next;
+      next += 1;
+      results[current] = await worker(items[current], current);
+    }
+  }
+  await Promise.all(Array.from({ length: workerCount }, () => runWorker()));
+  return results;
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function shouldRetryConfigJsonSyncItem(item) {
+  if (!item || (item.ok !== false && !item.skipped)) return false;
+  const detail = String(item.detail || '');
+  if (detail === '应用不存在') return false;
+  if (detail.startsWith('跳过: disabled') || detail.startsWith('跳过: no sync source')) return false;
+  return true;
+}
 
 // ——————————————— Express ———————————————
 const app = express();
@@ -829,7 +887,9 @@ app.post('/api/login', (req, res) => {
   if (!u || !verifyPassword(password, u.password)) {
     return res.status(401).json({ ok: false, error: '账号或密码不正确' });
   }
-  res.json({ ok: true, token: createSession(username), username });
+  const token = createSession(username);
+  res.setHeader('Set-Cookie', `admin_token=${encodeURIComponent(token)}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${Math.floor(SESSION_TTL_MS / 1000)}`);
+  res.json({ ok: true, token, username });
 });
 
 // 退出:作废当前会话 token
@@ -841,13 +901,17 @@ app.post('/api/logout', (req, res) => {
 
 // 从请求里取 token(优先 X-Admin-Token,兼容 Authorization: Bearer)
 function tokenOf(req) {
-  return req.headers['x-admin-token'] || String(req.headers.authorization || '').replace(/^Bearer\s+/i, '');
+  const header = req.headers['x-admin-token'] || String(req.headers.authorization || '').replace(/^Bearer\s+/i, '');
+  if (header) return header;
+  const cookie = String(req.headers.cookie || '');
+  const match = cookie.match(/(?:^|;\s*)admin_token=([^;]+)/);
+  return match ? decodeURIComponent(match[1]) : '';
 }
 
 // 后台鉴权:会话 token 或(显式开启的)主令牌
 function auth(req, res, next) {
   const t = tokenOf(req);
-  if (MASTER_TOKEN && t === MASTER_TOKEN) { req.user = DEFAULT_USER; return next(); }
+  if (MASTER_TOKEN && t === MASTER_TOKEN) { req.user = INITIAL_ADMIN_USER || 'token-admin'; return next(); }
   const user = sessionUser(t);
   if (!user) return res.status(401).json({ error: 'unauthorized' });
   req.user = user;
@@ -1157,7 +1221,14 @@ app.post('/api/admin/config-json-sync/run', async (req, res) => {
     return res.status(400).json({ ok: false, error: 'environment 必须是 test/pre/prod' });
   }
   try {
-    const log = await runConfigJsonSyncOnce(appId ? 'manual-app' : 'manual', appId, environment);
+    if (appId) {
+      const log = await runConfigJsonSyncForApp('manual-app', appId, environment);
+      if (log && log.error) {
+        return res.status(404).json({ ok: false, error: log.error });
+      }
+      return res.json({ ok: true, log });
+    }
+    const log = await runConfigJsonSyncOnce('manual', '', environment);
     res.json({ ok: true, log });
   } catch (e) {
     res.status(500).json({ ok: false, error: String(e && e.message || e) });
@@ -1165,12 +1236,33 @@ app.post('/api/admin/config-json-sync/run', async (req, res) => {
 });
 
 app.get('/api/admin/config-json-sync/log', (req, res) => {
+  if (configJsonSyncLiveLog) {
+    return res.json({ ok: true, running: configJsonSyncRunning, log: configJsonSyncLiveLog });
+  }
   try {
     const log = JSON.parse(fs.readFileSync(CONFIG_JSON_SYNC_LOG, 'utf8'));
     res.json({ ok: true, running: configJsonSyncRunning, log });
   } catch {
     res.json({ ok: true, running: configJsonSyncRunning, log: null });
   }
+});
+
+app.get('/api/admin/config-json-sync/status', (req, res) => {
+  res.json({ ok: true, ...currentConfigJsonSyncStatus() });
+});
+
+function sendConfigJsonSyncHtml(req, res) {
+  const token = tokenOf(req);
+  const authed = (MASTER_TOKEN && token === MASTER_TOKEN) || !!sessionUser(token);
+  if (!authed) {
+    res.status(401).type('html').send(renderConfigJsonSyncLoginHtml());
+    return;
+  }
+  res.type('html').send(renderConfigJsonSyncHtml(currentConfigJsonSyncStatus()));
+}
+app.get('/config-json-sync.html', sendConfigJsonSyncHtml);
+app.get('/config-json-sync-banner.js', (_req, res) => {
+  res.type('application/javascript').send(renderConfigJsonSyncBannerJs());
 });
 
 // 一键探测站点:填 URL → 自动返回 名称/类型/图标/建议加速参数,让新增应用更傻瓜。
@@ -1341,13 +1433,27 @@ async function syncConfigJsonForApp(appCfg, requestedEnvironment) {
 }
 
 // 独立任务：每个 app/environment 单独轮询，不能被其它站点的慢请求阻塞。
-async function runConfigJsonSyncTarget(trigger, appId, environment) {
+async function runConfigJsonSyncTargetOnce(appId, environment) {
   const key = `${environment}:${appId}`;
   if (configJsonSyncKeys.has(key)) {
-    return { id: appId, environment, ok: true, skipped: true, detail: '上一次任务仍在执行' };
+    return {
+      id: appId,
+      environment,
+      environmentName: configEnvironmentLabel(environment),
+      ok: false,
+      skipped: true,
+      detail: '上一次任务仍在执行'
+    };
   }
   configJsonSyncKeys.add(key);
-  const item = { id: appId, environment, ok: true, changed: false, detail: '' };
+  const item = {
+    id: appId,
+    environment,
+    environmentName: configEnvironmentLabel(environment),
+    ok: true,
+    changed: false,
+    detail: ''
+  };
   try {
     const cfg = loadConfig();
     const source = (cfg.apps || []).find((a) => a.id === appId);
@@ -1356,7 +1462,12 @@ async function runConfigJsonSyncTarget(trigger, appId, environment) {
       item.detail = '应用不存在';
       return item;
     }
-    const synced = await syncConfigJsonForApp(source, environment);
+    item.name = source.name || appId;
+    const synced = await withTimeout(
+      syncConfigJsonForApp(source, environment),
+      CONFIG_JSON_SYNC_TARGET_TIMEOUT_MS,
+      `${environment}:${appId} 同步超时`
+    );
     if (synced.skipped) {
       item.detail = synced.reason ? `跳过: ${synced.reason}` : '跳过';
       return item;
@@ -1386,30 +1497,156 @@ async function runConfigJsonSyncTarget(trigger, appId, environment) {
   }
 }
 
-async function runIndependentConfigJsonSync(trigger) {
-  const cfg = loadConfig();
-  const targets = [];
-  for (const environment of CONFIG_ENVIRONMENTS) {
-    for (const appCfg of (cfg.apps || [])) {
-      const app = normalizeAppConfig(appCfg);
-      if (hasConfigJsonSyncSource(app.configJsonEnvironments[environment].configJsonSync || {})) {
-        targets.push([app.id, environment]);
+async function runConfigJsonSyncTarget(trigger, appId, environment) {
+  let last = await runConfigJsonSyncTargetOnce(appId, environment);
+  if (!shouldRetryConfigJsonSyncItem(last)) return last;
+  for (let attempt = 2; attempt <= 1 + CONFIG_JSON_SYNC_TARGET_RETRIES; attempt++) {
+    await sleep(1000 * (attempt - 1));
+    last = await runConfigJsonSyncTargetOnce(appId, environment);
+    if (!shouldRetryConfigJsonSyncItem(last)) {
+      if (last.ok && !last.skipped) {
+        last.detail = `${last.detail}（第 ${attempt} 次自动拉取成功）`;
       }
+      return last;
     }
   }
-  const settled = await Promise.all(targets.map(([appId, environment]) =>
-    runConfigJsonSyncTarget(trigger, appId, environment)
-  ));
-  const log = {
-    startedAt: new Date().toISOString(),
+  last.detail = `${last.detail}（已自动重试 ${CONFIG_JSON_SYNC_TARGET_RETRIES} 次仍失败）`;
+  return last;
+}
+
+function currentConfigJsonSyncStatus() {
+  if (configJsonSyncLiveLog || configJsonSyncRunning || configJsonSyncSkippedRound) {
+    return buildConfigJsonSyncStatus({
+      log: configJsonSyncLiveLog,
+      running: configJsonSyncRunning,
+      skippedRound: configJsonSyncSkippedRound
+    });
+  }
+  try {
+    return JSON.parse(fs.readFileSync(CONFIG_JSON_SYNC_STATUS, 'utf8'));
+  } catch {
+    return buildConfigJsonSyncStatus({ log: null, running: false });
+  }
+}
+
+function persistConfigJsonSyncStatus(log) {
+  if (log) configJsonSyncLiveLog = log;
+  const status = currentConfigJsonSyncStatus();
+  try { fs.writeFileSync(CONFIG_JSON_SYNC_STATUS, JSON.stringify(status, null, 2), 'utf8'); } catch {}
+  if (status.healthy) {
+    configJsonSyncAutoRound = 0;
+    if (configJsonSyncRetryTimer) {
+      clearTimeout(configJsonSyncRetryTimer);
+      configJsonSyncRetryTimer = null;
+    }
+  } else {
+    console.warn('[ConfigJsonSync] ALERT', status.message);
+    scheduleConfigJsonSyncRetry(status.message);
+  }
+  return status;
+}
+
+function scheduleConfigJsonSyncRetry(reason) {
+  if (configJsonSyncRetryTimer) return;
+  if (configJsonSyncAutoRound >= CONFIG_JSON_SYNC_MAX_AUTO_ROUNDS) {
+    console.warn('[ConfigJsonSync] auto retry exhausted:', reason);
+    return;
+  }
+  configJsonSyncRetryTimer = setTimeout(() => {
+    configJsonSyncRetryTimer = null;
+    if (configJsonSyncRunning) {
+      scheduleConfigJsonSyncRetry(reason);
+      return;
+    }
+    configJsonSyncAutoRound += 1;
+    console.warn(`[ConfigJsonSync] auto retry ${configJsonSyncAutoRound}/${CONFIG_JSON_SYNC_MAX_AUTO_ROUNDS}: ${reason}`);
+    runIndependentConfigJsonSync('auto-retry').catch((e) => {
+      console.warn('[ConfigJsonSync] auto retry failed:', e && e.message);
+    });
+  }, CONFIG_JSON_SYNC_RETRY_DELAY_MS);
+}
+
+function deleteConfigJsonSyncLogs() {
+  for (const file of [CONFIG_JSON_SYNC_LOG]) {
+    try { if (fs.existsSync(file)) fs.unlinkSync(file); } catch {}
+  }
+}
+
+function cleanupExpiredConfigJsonSyncLogs() {
+  try {
+    if (fs.existsSync(CONFIG_JSON_SYNC_LOG)) {
+      const age = Date.now() - fs.statSync(CONFIG_JSON_SYNC_LOG).mtimeMs;
+      if (age >= CONFIG_JSON_SYNC_LOG_TTL_MS) fs.unlinkSync(CONFIG_JSON_SYNC_LOG);
+    }
+  } catch {}
+}
+
+async function runIndependentConfigJsonSync(trigger) {
+  if (configJsonSyncRunning) {
+    configJsonSyncSkippedRound = { at: new Date().toISOString(), reason: 'previous sync still running' };
+    persistConfigJsonSyncStatus(configJsonSyncLiveLog);
+    return { running: true, skipped: true, reason: 'previous sync still running' };
+  }
+  configJsonSyncRunning = true;
+  const startedAt = new Date().toISOString();
+  try {
+    const cfg = loadConfig();
+    const targets = [];
+    for (const environment of CONFIG_ENVIRONMENTS) {
+      for (const appCfg of (cfg.apps || [])) {
+        const app = normalizeAppConfig(appCfg);
+        if (hasConfigJsonSyncSource(app.configJsonEnvironments[environment].configJsonSync || {})) {
+          targets.push([app.id, environment]);
+        }
+      }
+    }
+    const settled = await mapLimit(targets, CONFIG_JSON_SYNC_CONCURRENCY, ([appId, environment]) =>
+      runConfigJsonSyncTarget(trigger, appId, environment)
+    );
+    const log = {
+      startedAt,
+      finishedAt: new Date().toISOString(),
+      trigger,
+      independent: true,
+      changed: settled.some((item) => item.changed),
+      results: settled
+    };
+    configJsonSyncSkippedRound = null;
+    persistConfigJsonSyncStatus(log);
+    deleteConfigJsonSyncLogs();
+    return log;
+  } finally {
+    configJsonSyncRunning = false;
+  }
+}
+
+async function runConfigJsonSyncForApp(trigger, appId, onlyEnvironment = '') {
+  const cfg = loadConfig();
+  const source = (cfg.apps || []).find((a) => a && a.id === appId);
+  if (!source) {
+    return { error: 'app not found' };
+  }
+  const environments = onlyEnvironment
+    ? [normalizeConfigEnvironment(onlyEnvironment, 'test')]
+    : CONFIG_ENVIRONMENTS;
+  const startedAt = new Date().toISOString();
+  const results = [];
+  for (const environment of environments) {
+    const item = await runConfigJsonSyncTarget(trigger, appId, environment);
+    if (!item.environmentName) {
+      item.environmentName = configEnvironmentLabel(environment);
+    }
+    results.push(item);
+  }
+  return {
+    startedAt,
     finishedAt: new Date().toISOString(),
     trigger,
-    independent: true,
-    changed: settled.some((item) => item.changed),
-    results: settled
+    onlyAppId: appId,
+    onlyEnvironment,
+    changed: results.some((item) => item && item.changed),
+    results
   };
-  try { fs.writeFileSync(CONFIG_JSON_SYNC_LOG, JSON.stringify(log, null, 2), 'utf8'); } catch {}
-  return log;
 }
 
 async function runConfigJsonSyncOnce(trigger = 'scheduled', onlyAppId = '', onlyEnvironment = '') {
@@ -1475,7 +1712,9 @@ async function runConfigJsonSyncOnce(trigger = 'scheduled', onlyAppId = '', only
       changed,
       results
     };
-    try { fs.writeFileSync(CONFIG_JSON_SYNC_LOG, JSON.stringify(log, null, 2), 'utf8'); } catch {}
+    configJsonSyncSkippedRound = null;
+    persistConfigJsonSyncStatus(log);
+    deleteConfigJsonSyncLogs();
     return log;
   } finally {
     configJsonSyncRunning = false;
@@ -1812,7 +2051,7 @@ function bundleInfo(id, appCfg, requestedEnvironment = DEFAULT_CONFIG_ENVIRONMEN
   }
   const serverBytes = fs.readdirSync(dir)
     .reduce((s, f) => s + fs.statSync(path.join(dir, f)).size, 0);
-  const cfgJson = appCfg ? configJsonInfo(appCfg) : configJsonInfo({ id });
+  const cfgJson = appCfg ? configJsonInfo(appCfg, environment) : configJsonInfo({ id }, environment);
   const cfgJsonEnvironments = appCfg ? configJsonEnvironmentInfo(appCfg) : {};
   return {
     id,
@@ -1881,8 +2120,10 @@ app.get('/api/admin/bundles', (req, res) => {
   for (const appCfg of (cfg.apps || [])) {
     if (!appCfg || !appCfg.id) continue;
     seen.add(appCfg.id);
+    // Keep known apps from other environments out of this list and the orphan-file scan below.
+    if (!normalizeBundleEnvironments(appCfg).includes(environment)) continue;
     const info = bundleInfo(appCfg.id, appCfg, environment);
-    const cfgJson = configJsonInfo(appCfg);
+    const cfgJson = configJsonInfo(appCfg, environment);
     const cfgJsonEnvironments = configJsonEnvironmentInfo(appCfg);
     out.push(info || {
       id: appCfg.id,
@@ -2400,6 +2641,8 @@ function startConfigJsonSyncScheduler() {
       console.warn('[ConfigJsonSync] minute sync failed:', e && e.message);
     });
   }, CONFIG_JSON_SYNC_INTERVAL_MS);
+  cleanupExpiredConfigJsonSyncLogs();
+  setInterval(() => { cleanupExpiredConfigJsonSyncLogs(); }, CONFIG_JSON_SYNC_LOG_TTL_MS);
   console.log('[ConfigJsonSync] 定时器已启动:每 60 秒独立同步每个 app/environment configJson');
 }
 
@@ -2408,7 +2651,8 @@ app.listen(PORT, () => {
   console.log(`[youhua-admin] server on http://localhost:${PORT}`);
   console.log(`  鸿蒙 App 配置:  GET http://localhost:${PORT}/api/config`);
   console.log(`  离线包托管:      http://localhost:${PORT}/bundles/<id>/manifest.json`);
-  console.log(`  后台登录:        账号 ${DEFAULT_USER} / 密码 ${DEFAULT_PASS}  (首登后可在后台改;或用 ADMIN_USER/ADMIN_PASS 环境变量)`);
+  console.log(`  JSON同步状态页:  http://localhost:${PORT}/config-json-sync.html`);
+  console.log('  后台登录:        账号文件已加载;首次启动必须设置 ADMIN_USER/ADMIN_PASS');
   if (MASTER_TOKEN) console.log(`  主令牌已开启:    X-Admin-Token: <ADMIN_TOKEN>(脚本用)`);
   if (process.env.DISABLE_SCHEDULERS !== '1') {
     persistRepairedRegionNames();

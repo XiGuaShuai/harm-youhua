@@ -11,6 +11,7 @@
   "buildOptionSet": [
     {
       "name": "release",
+      "debuggable": false,
       "arkOptions": {
         // 后台地址(release/上线):改成你的生产域名,只改这一处、且只在 release 生效。
         "buildProfileFields": {
@@ -18,7 +19,7 @@
         },
         "obfuscation": {
           "ruleOptions": {
-            "enable": false,
+            "enable": true,
             "files": [
               "./obfuscation-rules.txt"
             ]
@@ -26,7 +27,8 @@
           "consumerFiles": [
             "./consumer-rules.txt"
           ]
-        }
+        },
+        "packSourceMap": false
       }
     }
   ],

@@ -5,6 +5,7 @@ import { hilog } from '@kit.PerformanceAnalysisKit';
 import { BusinessError } from '@kit.BasicServicesKit';
 import { webCache, CacheStats, BundleProgress } from './core/WebCacheManager';
 import { webPool, WebNode } from './core/WebPreRender';
+import { CacheStorageRecovery } from './core/CacheStorageRecovery';
 import {
   remoteConfig,
   RemoteApp,
@@ -20,7 +21,7 @@ export { ConfigRefreshOptions, ConfigRefreshResult, ConfigRefreshState } from '.
 
 const TAG: string = 'WebAccel';
 const DOMAIN: number = 0x0001;
-const DEFAULT_CONFIG_REFRESH_SEC: number = 300;
+const DEFAULT_CONFIG_REFRESH_SEC: number = 60;
 const MIN_CONFIG_REFRESH_SEC: number = 30;
 
 /**
@@ -31,7 +32,7 @@ const MIN_CONFIG_REFRESH_SEC: number = 30;
  */
 export interface WebAccelOptions extends ConfigureOptions {
   autoRefresh?: boolean;     // 有 configServer 时是否开机异步拉最新配置(默认 true)
-  configRefreshSec?: number; // 后台应用 JSON 轮询间隔;<=0 关闭,默认 300 秒
+  configRefreshSec?: number; // 后台应用 JSON 轮询间隔;<=0 关闭,默认 60 秒
 }
 
 /**
@@ -64,6 +65,8 @@ export class WebAccel {
    *   提前初始化 Web 内核 → 初始化离线缓存 → 注入配置 → 同步读缓存/直供 → (可选)异步拉后台最新配置。
    */
   static init(context: common.UIAbilityContext, options?: WebAccelOptions): void {
+    CacheStorageRecovery.prepare(context);
+    hilog.info(DOMAIN, TAG, 'local-fix=20260922-r2 atomic-writes=true');
     // ① 提前初始化 Web 内核:首屏创建 Web 组件时无需再等内核冷启动
     try {
       webview.WebviewController.initializeWebEngine();
@@ -181,6 +184,12 @@ export class WebAccel {
    */
   static switchRegion(region: string): void {
     webPool.switchRegion(region);
+    // 首次安装时，init 可能早于隐私确认或网络就绪。若首次配置请求因此一直挂起，
+    // 地区切换后不能继续等待下一轮定时任务；此时取消旧请求并立即重拉一次。
+    if (remoteConfig.getServer().length > 0 && remoteConfig.getApps().length === 0) {
+      hilog.info(DOMAIN, TAG, 'region switched with empty config, restart refresh');
+      WebAccel.restartConfigRefresh();
+    }
   }
 
   /** 删除某地区离线包缓存,不影响 top */
