@@ -27,7 +27,7 @@ admin/server/bundles/
 *.key
 credentials*.json
 **/private/
-aidoc/harmony-build-env.md
+**/aidoc/harmony-build-env.md
 
 # 本地运维、迁移与抓取材料(可能含账号、会话或线上快照,勿上传)
 .deploy_tmp/
