@@ -90,8 +90,8 @@ test('isolates config overlays and offline bundles by environment', async (t) =>
       PORT: String(port),
       DATA_DIR: dataDir,
       BUNDLES_DIR: bundlesDir,
-      ADMIN_USER: 'admin',
-      ADMIN_PASS: 'admin123',
+      ADMIN_USER: 'test-admin',
+      ADMIN_PASS: 'test-only-password',
       DISABLE_SCHEDULERS: '1',
       DB_HOST: '127.0.0.1',
       DB_PORT: '1'
@@ -133,7 +133,7 @@ test('isolates config overlays and offline bundles by environment', async (t) =>
   const login = await requestJson(`${baseUrl}/api/login`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ username: 'admin', password: 'admin123' })
+    body: JSON.stringify({ username: 'test-admin', password: 'test-only-password' })
   });
   const adminHeaders = { 'content-type': 'application/json', 'x-admin-token': login.token };
   const adminConfig = await requestJson(`${baseUrl}/api/admin/config`, { headers: adminHeaders });
@@ -276,8 +276,8 @@ test('pauses offline bundle delivery without removing the app or pack files', as
       PORT: String(port),
       DATA_DIR: dataDir,
       BUNDLES_DIR: bundlesDir,
-      ADMIN_USER: 'admin',
-      ADMIN_PASS: 'admin123',
+      ADMIN_USER: 'test-admin',
+      ADMIN_PASS: 'test-only-password',
       DISABLE_SCHEDULERS: '1',
       DB_HOST: '127.0.0.1',
       DB_PORT: '1'
@@ -294,7 +294,7 @@ test('pauses offline bundle delivery without removing the app or pack files', as
   const login = await requestJson(`${baseUrl}/api/login`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ username: 'admin', password: 'admin123' })
+    body: JSON.stringify({ username: 'test-admin', password: 'test-only-password' })
   });
   const adminHeaders = { 'content-type': 'application/json', 'x-admin-token': login.token };
 

@@ -19,7 +19,7 @@ services:
       - "127.0.0.1:8787:8787"   # 只绑本地:由宿主机 nginx 反代 maidun.chujingservice.com → 此端口,不暴露公网
     environment:
       - PORT=8787
-      - ADMIN_USER=${ADMIN_USER:-admin}
+      - ADMIN_USER=${ADMIN_USER:?请在 .env 里设置 ADMIN_USER(后台登录账号)}
       - ADMIN_PASS=${ADMIN_PASS:?请在 .env 里设置 ADMIN_PASS(后台登录密码)}
       - DB_HOST=mysql
       - DB_PORT=3306

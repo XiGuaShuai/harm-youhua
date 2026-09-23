@@ -112,7 +112,7 @@ function sessionUser(token) {
   if (s.expires < Date.now()) { delete sessions[token]; saveSessions(); return null; }
   return s.username;
 }
-if (!fs.existsSync(USERS_FILE)) loadUsers(); // 首次启动落地默认账号
+if (!fs.existsSync(USERS_FILE)) loadUsers(); // 首次启动按环境变量落地初始账号
 
 // ——————————————— 配置读写 ———————————————
 function defaultConfig() {

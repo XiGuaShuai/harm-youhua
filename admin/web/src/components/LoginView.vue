@@ -7,7 +7,7 @@ import { useAuthStore } from '../stores/auth';
 const auth = useAuthStore();
 const emit = defineEmits(['done']);
 
-const form = ref({ username: 'admin', password: '' });
+const form = ref({ username: '', password: '' });
 const loading = ref(false);
 
 async function submit() {
@@ -65,7 +65,7 @@ async function submit() {
             登 录
           </el-button>
         </el-form>
-        <div class="tip">默认账号 <code>admin</code> / 密码 <code>admin123</code>,登录后请尽快修改</div>
+        <div class="tip">登录账号由部署环境初始化，不在页面或代码中提供默认凭据</div>
       </div>
     </div>
   </div>
