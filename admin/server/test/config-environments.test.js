@@ -306,6 +306,11 @@ test('pauses offline bundle delivery without removing the app or pack files', as
   assert.equal(paused.paused, true);
   assert.equal(paused.enabled, false);
   assert.deepEqual(paused.app.bundlePausedEnvironments, ['test']);
+  const savedAfterPause = JSON.parse(fs.readFileSync(path.join(dataDir, 'config.json'), 'utf8'));
+  assert.deepEqual(savedAfterPause.apps[0].configJsonEnvironments.prod, {
+    configJson: prodJson,
+    configJsonFileName: 'prod.json'
+  });
 
   const testPublic = await requestJson(`${baseUrl}/test/api/config`);
   const testApp = testPublic.apps.find((item) => item.id === 'sample');

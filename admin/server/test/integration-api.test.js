@@ -247,6 +247,40 @@ test('integration API is authenticated, idempotent, and hard-locked to test', as
   assert.equal(conflict.response.status, 409);
   assert.equal(conflict.body.code, 'idempotency_conflict');
 
+  const login = await request(`${baseUrl}/api/login`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ username: 'test-admin', password: 'test-only-password' })
+  });
+  assert.equal(login.response.status, 200, login.text);
+  const paused = await request(`${baseUrl}/api/admin/apps/external_demo/bundle-pause`, {
+    method: 'PUT',
+    headers: { 'content-type': 'application/json', 'x-admin-token': login.body.token },
+    body: JSON.stringify({ environment: 'test', paused: true })
+  });
+  assert.equal(paused.response.status, 200, paused.text);
+  assert.equal(paused.body.paused, true);
+
+  const updateWhilePaused = await request(`${baseUrl}/api/integration/v1/apps/external_demo/resources/upload`, {
+    method: 'POST',
+    headers: integrationHeaders(token, 'resource-update-paused-001'),
+    body: JSON.stringify(resourceBody)
+  });
+  assert.equal(updateWhilePaused.response.status, 200, updateWhilePaused.text);
+  assert.equal(updateWhilePaused.body.bundle.config.bundlePaused, true);
+  assert.equal(updateWhilePaused.body.bundle.config.bundle, false);
+
+  const pausedPublic = (await request(`${baseUrl}/test/api/config`)).body;
+  assert.equal(pausedPublic.apps.find((item) => item.id === 'external_demo').bundle, false);
+
+  const resumed = await request(`${baseUrl}/api/admin/apps/external_demo/bundle-pause`, {
+    method: 'PUT',
+    headers: { 'content-type': 'application/json', 'x-admin-token': login.body.token },
+    body: JSON.stringify({ environment: 'test', paused: false })
+  });
+  assert.equal(resumed.response.status, 200, resumed.text);
+  assert.equal(resumed.body.enabled, true);
+
   const status = await request(`${baseUrl}/api/integration/v1/apps/external_demo?environment=test`, {
     headers: integrationHeaders(token)
   });

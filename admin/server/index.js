@@ -1230,7 +1230,7 @@ function applyIntegrationResourceMetadata(appCfg, imported, inputByUrl, defaultS
   }
   appCfg.bundleResourceMetrics = metrics;
   enableBundleEnvironment(appCfg, INTEGRATION_API_ENVIRONMENT);
-  setBundlePausedInEnvironment(appCfg, INTEGRATION_API_ENVIRONMENT, false);
+  // 资源自动更新不能覆盖管理员在网页设置的“暂停下发”状态。
 }
 
 function integrationAppForWrite(raw, previous, id) {
@@ -1818,7 +1818,10 @@ app.put('/api/admin/apps/:id/bundle-pause', (req, res) => {
   if (!setBundlePausedInEnvironment(appCfg, environment, paused)) {
     return res.status(400).json({ error: '该应用未在所选环境配置离线包，无法暂停' });
   }
-  const saved = saveConfig(c);
+  // test 的下发开关只修改 bundlePausedEnvironments，不能顺带规范化 pre/prod 配置分区。
+  const saved = environment === INTEGRATION_API_ENVIRONMENT
+    ? saveIntegrationConfig(c)
+    : saveConfig(c);
   const responseApp = normalizeAppConfig(appCfg);
   responseApp.configJsonEnvironments = redactConfigJsonEnvironments(responseApp);
   res.json({

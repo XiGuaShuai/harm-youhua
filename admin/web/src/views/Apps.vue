@@ -29,6 +29,8 @@ const pathLocked = adminViewLocked();
 const pathShowsAll = adminShowsAll();
 // 地区名称按业务后台真实 ID 解析。美国/加拿大等在测试、预发、正式是三套不同 ID，显示时必须带环境后缀。
 const viewEnvironment = ref(defaultViewEnvironment());
+// 测试环境由集成 API 维护业务数据，管理页仅保留下发开关和只读状态入口。
+const testDeliveryOnly = computed(() => !pathShowsAll && viewEnvironment.value === 'test');
 const activeConfigEnvironment = ref('test');
 const activeConfigEnvironmentName = computed(() =>
   CONFIG_ENVIRONMENT_OPTIONS.find((item) => item.id === activeConfigEnvironment.value)?.name || activeConfigEnvironment.value
@@ -907,6 +909,7 @@ async function syncConfigJson(row) {
         <div class="eyebrow">WebAccel 配置</div>
         <h2>应用管理</h2>
         <p v-if="pathShowsAll">备份总览：显示全部应用和三个环境状态。按环境查看请用 /test、/pre、/prod。</p>
+        <p v-else-if="testDeliveryOnly">测试应用由接口自动维护；网页只展示状态并控制是否下发离线资源。</p>
         <p v-else-if="pathLocked">当前只显示{{ environmentLabel(viewEnvironment) }}环境已配置的应用和地区。</p>
         <p v-else>测试、预发、正式分开查看。当前只显示该环境已启用的应用和地区。</p>
       </div>
@@ -920,9 +923,18 @@ async function syncConfigJson(row) {
         </el-radio-group>
         <el-input v-model="appQuery" class="search-input" clearable :prefix-icon="Search" placeholder="搜索 ID / 名称 / URL" />
         <el-button :icon="Refresh" @click="loadBundles">刷新状态</el-button>
-        <el-button type="primary" :icon="Plus" @click="openAdd">新增网址</el-button>
+        <el-button v-if="!testDeliveryOnly" type="primary" :icon="Plus" @click="openAdd">新增网址</el-button>
       </div>
     </div>
+
+    <el-alert
+      v-if="testDeliveryOnly"
+      type="info"
+      :closable="false"
+      show-icon
+      title="测试环境采用接口托管"
+      description="应用、地区、JSON 和离线资源由接口上传更新；需要人工操作时，只切换应用是否向设备下发离线资源。"
+    />
 
     <div class="summary-grid">
       <div class="summary-item">
@@ -987,6 +999,7 @@ async function syncConfigJson(row) {
                 <div class="app-title">
                   <b>{{ row.name || row.id }}</b>
                   <el-tag size="small" effect="plain">{{ row.id }}</el-tag>
+                  <el-tag v-if="row.integrationManaged" size="small" type="info" effect="plain">接口托管</el-tag>
                 </div>
                 <div class="app-url">{{ row.url }}</div>
               </div>
@@ -1055,35 +1068,37 @@ async function syncConfigJson(row) {
               </div>
             </template>
           </el-table-column>
-          <el-table-column label="操作" width="360" fixed="right">
+          <el-table-column label="操作" :width="testDeliveryOnly ? 120 : 360" fixed="right">
             <template #default="{ row }">
               <div class="op-row compact-actions">
-                <el-button size="small" type="primary" plain :icon="Box" @click="openBundle(row)">资源</el-button>
-                <el-button
-                  size="small"
-                  type="warning"
-                  plain
-                  :icon="RefreshRight"
-                  :loading="syncingJson === row.id"
-                  :disabled="rowBusy(row) && syncingJson !== row.id"
-                  @click="syncConfigJson(row)"
-                >更新 JSON</el-button>
-                <el-button size="small" :icon="EditPen" @click="openEdit(row)">编辑</el-button>
-                <el-dropdown trigger="click" :disabled="rowBusy(row)" @command="(command) => handleRowCommand(command, row)">
-                  <el-button size="small" class="more-button" :loading="rowBusy(row)" :icon="MoreFilled">更多</el-button>
-                  <template #dropdown>
-                    <el-dropdown-menu>
-                      <el-dropdown-item command="check">检查资源更新</el-dropdown-item>
-                      <el-dropdown-item command="update">增量更新离线包</el-dropdown-item>
-                      <el-dropdown-item v-if="packDeliveringInView(row)" command="pause">暂停当前环境离线包</el-dropdown-item>
-                      <el-dropdown-item v-else-if="packConfiguredInView(row)" command="resume">恢复当前环境离线包</el-dropdown-item>
-                      <el-dropdown-item v-if="hasAnyConfigSync(row)" command="sync">同步三环境 JSON</el-dropdown-item>
-                      <el-dropdown-item command="build" divided>强制重建离线包</el-dropdown-item>
-                      <el-dropdown-item command="manifest">重新生成清单</el-dropdown-item>
-                      <el-dropdown-item command="delete" divided class="danger-menu-item">删除应用</el-dropdown-item>
-                    </el-dropdown-menu>
-                  </template>
-                </el-dropdown>
+                <el-button size="small" type="primary" plain :icon="Box" @click="openBundle(row)">{{ testDeliveryOnly ? '查看资源' : '资源' }}</el-button>
+                <template v-if="!testDeliveryOnly">
+                  <el-button
+                    size="small"
+                    type="warning"
+                    plain
+                    :icon="RefreshRight"
+                    :loading="syncingJson === row.id"
+                    :disabled="rowBusy(row) && syncingJson !== row.id"
+                    @click="syncConfigJson(row)"
+                  >更新 JSON</el-button>
+                  <el-button size="small" :icon="EditPen" @click="openEdit(row)">编辑</el-button>
+                  <el-dropdown trigger="click" :disabled="rowBusy(row)" @command="(command) => handleRowCommand(command, row)">
+                    <el-button size="small" class="more-button" :loading="rowBusy(row)" :icon="MoreFilled">更多</el-button>
+                    <template #dropdown>
+                      <el-dropdown-menu>
+                        <el-dropdown-item command="check">检查资源更新</el-dropdown-item>
+                        <el-dropdown-item command="update">增量更新离线包</el-dropdown-item>
+                        <el-dropdown-item v-if="packDeliveringInView(row)" command="pause">暂停当前环境离线包</el-dropdown-item>
+                        <el-dropdown-item v-else-if="packConfiguredInView(row)" command="resume">恢复当前环境离线包</el-dropdown-item>
+                        <el-dropdown-item v-if="hasAnyConfigSync(row)" command="sync">同步三环境 JSON</el-dropdown-item>
+                        <el-dropdown-item command="build" divided>强制重建离线包</el-dropdown-item>
+                        <el-dropdown-item command="manifest">重新生成清单</el-dropdown-item>
+                        <el-dropdown-item command="delete" divided class="danger-menu-item">删除应用</el-dropdown-item>
+                      </el-dropdown-menu>
+                    </template>
+                  </el-dropdown>
+                </template>
               </div>
             </template>
           </el-table-column>
@@ -1091,7 +1106,7 @@ async function syncConfigJson(row) {
       </section>
     </div>
 
-    <el-dialog v-model="dialog" :title="editing ? '编辑网址应用' : '新增网址应用'" width="960px" destroy-on-close>
+    <el-dialog v-if="!testDeliveryOnly" v-model="dialog" :title="editing ? '编辑网址应用' : '新增网址应用'" width="960px" destroy-on-close>
       <div class="dialog-head">
         <div>
           <b>{{ form.name || form.id || '未命名应用' }}</b>

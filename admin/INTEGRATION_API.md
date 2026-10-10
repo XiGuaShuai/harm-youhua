@@ -157,6 +157,8 @@ GET /test/bundles/<appId>/manifest.zz.json
 - 缺少环境参数返回 `400 environment_required`。
 - 传入 `pre`、`prod` 或任何非 `test` 值返回 `403 test_environment_only`。
 - 集成接口不会创建或写入 `bundles/pre`、`bundles/prod`。
+- 测试后台页面只展示资源状态并提供“下发/暂停”开关；应用、地区、JSON 和离线资源由接口维护。
+- 接口自动更新资源时会保留网页设置的“暂停下发”状态，不会擅自重新开启。
 - 每次已鉴权请求会记录到运行数据目录的 `integration-audit.jsonl`，仅记录请求 ID、调用方、令牌指纹、动作、应用 ID、环境、状态码和耗时，不记录令牌及请求正文。
 - 幂等结果保存在运行数据目录的 `integration-idempotency.json`。这两个文件属于运行数据，不应提交到 Git。
 

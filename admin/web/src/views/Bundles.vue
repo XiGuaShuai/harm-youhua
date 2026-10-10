@@ -42,6 +42,8 @@ const bundleEnvironment = ref(
 const bundleEnvironmentName = computed(() =>
   configEnvironmentOptions.find((item) => item.id === bundleEnvironment.value)?.name || bundleEnvironment.value
 );
+// 测试环境的应用、JSON、地区和资源由集成 API 托管；网页只负责查看状态和控制是否下发。
+const testDeliveryOnly = computed(() => bundleEnvironment.value === 'test');
 
 const autoLog = ref(null);
 const autoRunning = ref(false);
@@ -484,7 +486,9 @@ async function toggleSelectedPause(enabled) {
     <div class="bundle-head">
       <div>
         <div class="page-title">离线包资源面板</div>
-        <div class="muted">按网站查看离线包配置、文件名、大小、耗时和沙箱占用</div>
+        <div class="muted">
+          {{ testDeliveryOnly ? '测试资源由接口自动维护；此处只查看状态并控制是否下发' : '按网站查看离线包配置、文件名、大小、耗时和沙箱占用' }}
+        </div>
       </div>
       <div class="head-actions">
         <el-tag v-if="pathLocked" type="warning" effect="plain">{{ environmentLabel(bundleEnvironment) }}环境</el-tag>
@@ -498,12 +502,22 @@ async function toggleSelectedPause(enabled) {
         </el-select>
         <el-tag v-if="autoRunning" type="warning" size="small">处理中 {{ autoProgressText }}</el-tag>
         <el-button :loading="loading" @click="load">刷新</el-button>
-        <el-button type="primary" :loading="triggering && triggeringScope === 'all'" :disabled="autoRunning"
+        <el-button v-if="!testDeliveryOnly" type="primary" :loading="triggering && triggeringScope === 'all'" :disabled="autoRunning"
           @click="runAutoUpdate('', false)">一键检查并更新全部</el-button>
       </div>
     </div>
 
-    <div v-if="autoLog" class="auto-line">
+    <el-alert
+      v-if="testDeliveryOnly"
+      class="delivery-notice"
+      type="info"
+      :closable="false"
+      show-icon
+      title="测试环境采用接口托管"
+      description="应用、地区、JSON 和离线资源由对外接口上传或更新；本页面不会人工改资源，只控制设备是否接收离线资源。"
+    />
+
+    <div v-if="!testDeliveryOnly && autoLog" class="auto-line">
       <span v-if="autoRunning" class="muted">本轮进度 {{ autoProgressText }}</span>
       <span v-else class="muted">上次检查 {{ new Date(autoLog.finishedAt || autoLog.startedAt).toLocaleString() }}</span>
       <el-tag v-for="r in autoLog.results" :key="r.id" :type="r.ok ? (r.action === 'no-change' ? 'info' : 'success') : 'danger'" size="small">
@@ -516,7 +530,7 @@ async function toggleSelectedPause(enabled) {
         <div class="site-pane-head">
           <div>
             <div class="pane-title">网站</div>
-            <div class="site-pane-sub">选择网站维护静态资源</div>
+            <div class="site-pane-sub">{{ testDeliveryOnly ? '选择网站查看下发状态' : '选择网站维护静态资源' }}</div>
           </div>
           <el-tag size="small" type="info" effect="plain">{{ filteredBundles.length }}</el-tag>
         </div>
@@ -548,10 +562,12 @@ async function toggleSelectedPause(enabled) {
             <div class="resource-url">{{ selected.url }}</div>
           </div>
           <div class="resource-actions">
-            <el-button type="warning" :loading="triggering && triggeringScope === selected.id" :disabled="autoRunning"
-              @click="runAutoUpdate(selected.id, true)">重建并修复当前站</el-button>
-            <el-button type="primary" :icon="Upload" @click="openImportDialog">导入资源</el-button>
-            <el-button :icon="Upload" @click="openConfigDialog">导入配置 JSON</el-button>
+            <template v-if="!testDeliveryOnly">
+              <el-button type="warning" :loading="triggering && triggeringScope === selected.id" :disabled="autoRunning"
+                @click="runAutoUpdate(selected.id, true)">重建并修复当前站</el-button>
+              <el-button type="primary" :icon="Upload" @click="openImportDialog">导入资源</el-button>
+              <el-button :icon="Upload" @click="openConfigDialog">导入配置 JSON</el-button>
+            </template>
             <el-button link type="primary" @click="copyManifest(selected)">复制 manifest</el-button>
             <el-link type="primary" :href="manifestLink(selected)" target="_blank">打开 manifest</el-link>
           </div>
@@ -599,12 +615,14 @@ async function toggleSelectedPause(enabled) {
             @change="toggleSelectedPause"
           />
           <el-tag size="small" type="warning">{{ bundleEnvironmentName }}环境</el-tag>
-          <el-tag v-if="configMeta(selected).hasConfigJson" size="small" type="warning">
+          <el-tag v-if="!testDeliveryOnly && configMeta(selected).hasConfigJson" size="small" type="warning">
             JSON {{ configMeta(selected).configJsonFileName || selected.configJsonFileName }} {{ formatSize(configMeta(selected).configJsonBytes || selected.configJsonBytes) }}
           </el-tag>
-          <el-tag size="small" type="info">固定 {{ selected.config?.bundleExtraUrls?.length || 0 }}</el-tag>
-          <el-tag size="small" type="info">关闭 {{ selected.config?.bundleExcludeUrls?.length || 0 }}</el-tag>
-          <span class="muted">{{ staticCacheText(selected) }}</span>
+          <template v-if="!testDeliveryOnly">
+            <el-tag size="small" type="info">固定 {{ selected.config?.bundleExtraUrls?.length || 0 }}</el-tag>
+            <el-tag size="small" type="info">关闭 {{ selected.config?.bundleExcludeUrls?.length || 0 }}</el-tag>
+            <span class="muted">{{ staticCacheText(selected) }}</span>
+          </template>
         </div>
 
         <div class="table-tools">
@@ -625,7 +643,8 @@ async function toggleSelectedPause(enabled) {
         <el-table :data="resources" border size="small" height="520">
           <el-table-column label="缓存" width="78" align="center">
             <template #default="{ row }">
-              <el-switch :model-value="row.enabled !== false"
+              <el-tag v-if="testDeliveryOnly" size="small" :type="statusType(row)">{{ statusText(row) }}</el-tag>
+              <el-switch v-else :model-value="row.enabled !== false"
                 :loading="togglingKey === `${selected.id}|${row.url}`"
                 @change="(v) => setResourceEnabled(selected, row, v)" />
             </template>
@@ -656,7 +675,7 @@ async function toggleSelectedPause(enabled) {
       </section>
     </div>
 
-    <el-dialog v-model="importDialog" title="导入指定静态资源" width="760px">
+    <el-dialog v-if="!testDeliveryOnly" v-model="importDialog" title="导入指定静态资源" width="760px">
       <el-form label-position="top">
         <el-form-item label="目标网站">
           <el-input :model-value="selected ? `${selected.name || selected.id} (${selected.id})` : ''" disabled />
@@ -691,7 +710,7 @@ async function toggleSelectedPause(enabled) {
       </template>
     </el-dialog>
 
-    <el-dialog v-model="configDialog" title="导入配置 JSON" width="760px">
+    <el-dialog v-if="!testDeliveryOnly" v-model="configDialog" title="导入配置 JSON" width="760px">
       <el-form label-position="top">
         <el-form-item label="目标网站">
           <el-input :model-value="selected ? `${selected.name || selected.id} (${selected.id})` : ''" disabled />
@@ -746,6 +765,9 @@ async function toggleSelectedPause(enabled) {
   padding: 10px 0;
   border-top: 1px solid #edf0f6;
   border-bottom: 1px solid #edf0f6;
+}
+.delivery-notice {
+  margin-top: 14px;
 }
 .bundle-layout {
   display: grid;
