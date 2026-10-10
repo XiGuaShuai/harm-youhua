@@ -3,7 +3,7 @@ import { ref, onMounted } from 'vue';
 import { useRoute } from 'vue-router';
 import { storeToRefs } from 'pinia';
 import {
-  Odometer, Grid, CircleClose, Box, Setting,
+  Odometer, Grid, Document, CircleClose, Box, Setting,
   SwitchButton, Key, CaretBottom
 } from '@element-plus/icons-vue';
 import { useConfigStore } from './stores/config';
@@ -26,6 +26,7 @@ const pathEnvName = environmentLabel(defaultViewEnvironment());
 const menus = [
   { path: '/dashboard', title: '概览', icon: Odometer },
   { path: '/apps', title: '应用管理', icon: Grid },
+  { path: '/config-json', title: '更新 JSON', icon: Document },
   { path: '/blocklist', title: '过滤黑名单', icon: CircleClose },
   { path: '/bundles', title: '离线包', icon: Box },
   { path: '/settings', title: '全局设置', icon: Setting }

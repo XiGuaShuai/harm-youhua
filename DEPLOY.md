@@ -1,5 +1,9 @@
 # 部署:本地改完 → `git push` → 服务器自动更新
 
+> **2026-09-21 完整迁移入口**：test/pre/prod 全部应用、网页显示、数据库、原后台账号、运行镜像及证书资料统一备份到本地 [`../bar/20260921-full-recovery/README.md`](../bar/20260921-full-recovery/README.md)。按 [`BACKUP_RESTORE.md`](BACKUP_RESTORE.md) 校验和恢复；完成条件为校验通过且无 `INCOMPLETE` 标记。此前五应用包仅作历史快照。服务器不再额外生成运维备份文件，新服务器也只恢复运行数据。
+
+> 当前对外使用 HTTPS 和 `/test`、`/pre`、`/prod`；下文 HTTP 和早期路径属于最初搭建过程。阅读文档或生成恢复目录不会执行部署，`git push server main` 会触发真正上线。
+
 后台(`admin/`)用 **Docker + git push 自动部署**,跑在服务器 `47.236.73.89`(`meta-proxy1`)上,
 由该机**已有的 nginx** 反代,对外用域名 **`maidun.chujingservice.com`**。
 
@@ -76,19 +80,16 @@ git push server main
 
 ### ④ 装 nginx 反代(把 maidun 指向后台;先备份、校验,再生效)
 
-在**服务器**上执行:
+先按 [`BACKUP_RESTORE.md`](BACKUP_RESTORE.md) 将当前 nginx 配置直接保存到本地 `bar` 并校验；不在服务器创建 `.bak`。然后在**服务器**上执行:
 
 ```bash
-# 备份原 maidun 配置
-sudo cp /etc/nginx/conf.d/maidun.chujingservice.com.conf /etc/nginx/conf.d/maidun.chujingservice.com.conf.bak.$(date +%s)
 # 用仓库里的新配置覆盖
 sudo cp /srv/youhua/deploy/nginx-maidun.conf /etc/nginx/conf.d/maidun.chujingservice.com.conf
-# 校验通过才 reload(校验失败就别 reload,改回 .bak)
+# 校验通过才 reload；失败时从本地恢复原配置
 sudo nginx -t && sudo systemctl reload nginx
 ```
 
-浏览器打开 `http://maidun.chujingservice.com/` 即后台。万一 `nginx -t` 报错:
-`sudo cp /etc/nginx/conf.d/maidun.chujingservice.com.conf.bak.* /etc/nginx/conf.d/maidun.chujingservice.com.conf` 还原即可。
+浏览器打开 `http://maidun.chujingservice.com/` 即后台。万一 `nginx -t` 报错，先不要 reload；将本地恢复点的 `private/nginx-site.conf` 传回并覆盖原站点配置，重新检查通过后再 reload。
 
 ---
 
@@ -101,7 +102,7 @@ sudo nginx -t && sudo systemctl reload nginx
 | 重启 | 服务器 `cd /srv/youhua && docker compose restart` |
 | 停止(不丢数据) | 服务器 `docker compose down` |
 | 改后台密码 | 后台界面「修改密码」,或改 `/srv/youhua/.env` 的 `ADMIN_PASS` 后 `docker compose up -d` |
-| 备份数据 | 服务器 `docker run --rm -v youhua_admin-data:/d -v youhua_admin-bundles:/b -v $PWD:/out alpine tar czf /out/youhua-backup.tgz /d /b` |
+| 备份数据 | 直接流式导出到本地 `bar`，包含三环境、网页显示和部署资料；见 [`BACKUP_RESTORE.md`](BACKUP_RESTORE.md)，不要在服务器另建备份文件 |
 
 **回滚到上一版**:本地 `git push server <旧 commit>:main`,或服务器 `git --git-dir=/srv/youhua.git --work-tree=/srv/youhua checkout -f <commit> && cd /srv/youhua && docker compose up -d --build`。
 
@@ -113,7 +114,9 @@ maidun 的 DNS 已指向本机,直接在这个站上签证书即可:
 
 ```bash
 sudo certbot --nginx -d maidun.chujingservice.com     # 没有 certbot 先装:sudo dnf install -y certbot python3-certbot-nginx
+sudo systemctl enable --now certbot-renew.timer       # 必须打开定时续期；2026-09-07 因没有 timer，证书过期，真机 apps=0
 ```
 
-certbot 会自动给 `maidun.chujingservice.com.conf` 加 443/证书并配置自动续期。
+certbot 会自动给 `maidun.chujingservice.com.conf` 加 443/证书。
+`yuan` 若无免密 sudo，可用 docker 组 `nsenter` 跑同一条 `certbot renew`，见 [`后台运维记录-2026-09-07.md`](后台运维记录-2026-09-07.md)。
 之后鸿蒙 release 包的 `CONFIG_SERVER` 改成 `https://maidun.chujingservice.com`。

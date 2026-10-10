@@ -31,10 +31,36 @@ npm run dev
 | 后台页面 | 对应端侧(webaccel SDK) | 作用 |
 |---|---|---|
 | 应用管理 | `WebAccel.getApps()` / launcher 列表 | 增删网页应用、每个 app 的加速开关、路由列表 |
+| **更新 JSON** | SDK / 宿主读取的 `configJson` | 按应用 + 环境一键从运营后台拉最新 JSON；覆盖该应用绑定的全部地区 |
 | 过滤黑名单 | SDK 注入的 `blockHosts` | 被墙第三方域名,端侧命中即秒拒 |
 | 离线包 | 下载进接入方应用沙箱(不打进 HAP) | 服务端构建/手动导入静态资源,生成 manifest 并托管给端侧 |
 | configJson 自动同步 | 第三方后台登录 + 配置接口 | 启动时立即执行，之后每 60 秒按 `appId + environment` 独立登录并写回对应配置，单请求 20 秒超时 |
 | 全局设置 | 沙箱上限 / 离线包下载并发等 | (`字节码开关` 字段在元服务被忽略,平台不支持) |
+
+### 2026-10-08/09 相关运维
+
+测试环境四应用离线包（beacukai / Europcar / Australia / 哈利法塔）已更新，用户先自测；细节见 [`../../测试环境四应用离线包更新-2026-10-08.md`](../../测试环境四应用离线包更新-2026-10-08.md)。未授权不要同步到 pre/prod。
+
+### 更新 JSON 独立页（2026-10-08）
+
+侧栏菜单「更新 JSON」，路由 `#/config-json`。线上入口：
+
+```text
+测试：https://maidun.chujingservice.com/test#/config-json
+预发：https://maidun.chujingservice.com/pre#/config-json
+正式：https://maidun.chujingservice.com/prod#/config-json
+```
+
+操作口径：
+
+1. 先选环境（`/test`、`/pre`、`/prod` 路径会锁定对应环境）。
+2. 点某个应用的「更新此应用」：只刷 **当前环境** 这一份 `configJson`。
+3. 该应用若绑定多个地区（如 XE 18 个地区），共用这一份 JSON；一次更新等于覆盖该应用全部地区。
+4. 「更新当前环境全部」会刷当前环境所有已配置同步源的应用。
+5. 成功但内容没变时也会刷新 `configJsonSyncedAt`，页面显示「已检查，无变化」。
+6. 端侧不会实时强推；设备需重开应用、等 `configRefreshSec` 轮询，或调用 `WebAccel.refreshConfig()`。
+
+前端源码：`admin/web/src/views/ConfigJson.vue`。应用管理页原有行内「更新 JSON」按钮仍可用，行为与本页一致。
 
 ## 关键接口
 
@@ -77,13 +103,15 @@ npm run dev
 
 3. `getWebNameList` 不是 configJson 来源,它只是应用列表接口。
 
-4. 后台启动时立即执行同步，之后每 60 秒为每个应用/环境独立执行一次;当前已配置同步源的应用会按测试、预发、正式环境分别刷新 `configJson`，单个失败不阻塞其它应用。也可以手动调 `POST /api/admin/config-json-sync/run` 立即刷新。单目标 25 秒超时；并发 6；失败或卡住会自动再拉（单目标最多 3 次，整轮最多再跑 3 轮）。
+4. 后台启动时立即执行同步，之后每 60 秒为每个应用/环境独立执行一次;当前已配置同步源的应用会按测试、预发、正式环境分别刷新 `configJson`，单个失败不阻塞其它应用。也可以在「更新 JSON」页手动点，或调 `POST /api/admin/config-json-sync/run`（`{ appId, environment }`）立即刷新。单目标 25 秒超时；并发 6；失败或卡住会自动再拉（单目标最多 3 次，整轮最多再跑 3 轮）。成功拉取后无论内容是否变化都会刷新 `configJsonSyncedAt`。
 
    线上环境必须使用服务器自身可访问的配置读取接口。2026-09-04 测试运营域名解析失败见 [`后台运维记录-2026-09-04.md`](../后台运维记录-2026-09-04.md)。2026-09-07 正式环境锁死跳过见 [`后台运维记录-2026-09-07.md`](../后台运维记录-2026-09-07.md)。
 
-5. 同步状态用 HTML，不要堆日志：`GET /config-json-sync.html`（需登录）。JSON：`GET /api/admin/config-json-sync/status`。详细 `config-json-sync-log.json` 每轮删除。
+5. 日常按应用操作优先用管理页「更新 JSON」：`/#/config-json`。整轮健康状态仍看 `GET /config-json-sync.html`（需登录）和 `GET /api/admin/config-json-sync/status`。详细 `config-json-sync-log.json` 每轮删除。
 
 6. 端侧不需要新增任何必须接入的 API,还是按 `/api/config` 和 `WebAccel.refreshConfig()` 这条链路拿到最新配置。
+
+7. 数据模型仍是「一应用 + 一环境 = 一份 configJson」。地区只表示适用范围，不是按地区各存一份 JSON。
 
 同步账号不得写入仓库文档、示例代码或提交记录。测试、预发、生产即使共用登录账号，`configJson`、业务 appId 和读取接口仍必须按环境隔离。
 

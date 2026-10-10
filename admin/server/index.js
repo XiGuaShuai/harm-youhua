@@ -1477,16 +1477,22 @@ async function runConfigJsonSyncTargetOnce(appId, environment) {
     if (idx >= 0) {
       const normalized = normalizeAppConfig(latest.apps[idx]);
       const envConfig = normalized.configJsonEnvironments[environment];
+      const checkedAt = new Date().toISOString();
       if (envConfig.configJson !== synced.configJson) {
         envConfig.configJson = synced.configJson;
         envConfig.configJsonFileName = envConfig.configJsonFileName || `${appId}-${environment}.json`;
-        envConfig.configJsonSyncedAt = new Date().toISOString();
-        latest.apps[idx] = normalized;
-        saveConfig(latest);
         item.changed = true;
       }
+      // 成功拉取后无论内容是否变化都刷新时间，方便运营确认「已经刷过」。
+      envConfig.configJsonSyncedAt = checkedAt;
+      latest.apps[idx] = normalized;
+      saveConfig(latest);
+      item.regionsCount = Array.isArray(normalized.regions) ? normalized.regions.length : 0;
     }
-    item.detail = `同步 ${synced.bytes} bytes`;
+    item.bytes = synced.bytes;
+    item.detail = item.changed
+      ? `已更新 ${synced.bytes} bytes`
+      : `已检查，无变化（${synced.bytes} bytes）`;
     return item;
   } catch (e) {
     item.ok = false;
