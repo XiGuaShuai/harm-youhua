@@ -6,7 +6,8 @@ import { fileURLToPath } from 'node:url';
 import zlib from 'node:zlib';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const DATA_FILE = path.join(__dirname, 'data', 'config.json');
+const DATA_DIR = process.env.DATA_DIR ? path.resolve(process.env.DATA_DIR) : path.join(__dirname, 'data');
+const DATA_FILE = path.join(DATA_DIR, 'config.json');
 // 管理服务按 test/pre/prod 为每次构建注入独立目录；直接执行脚本时仍兼容旧目录。
 const BUNDLES_DIR = process.env.BUNDLES_DIR
   ? path.resolve(process.env.BUNDLES_DIR)

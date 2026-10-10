@@ -64,6 +64,9 @@ npm run dev
 
 ## 关键接口
 
+对外系统接入应用、配置 JSON、地区和离线资源时，使用只允许 `test` 环境的
+[`INTEGRATION_API.md`](./INTEGRATION_API.md)。该接口使用独立令牌，不复用后台登录会话。
+
 - `GET /api/config` —— **鸿蒙 App 开机拉取**:`{ version, apps, blockHosts, settings }`
 - `GET /bundles/<id>/manifest.json` —— 离线包(格式与 App 的 rawfile manifest 一致:`[{url,file,mime}]`)
 - `POST /api/admin/bundles/<id>/build` —— 服务端为某 app 打包(后台「服务端打包」按钮)

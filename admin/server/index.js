@@ -46,6 +46,11 @@ const FETCH_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (
 const IMPORT_TIMEOUT_MS = 60 * 1000;
 // 可选「主令牌」:仅当显式设置 ADMIN_TOKEN 时生效(给脚本/CI 用),默认不开,走账号密码登录
 const MASTER_TOKEN = process.env.ADMIN_TOKEN || '';
+// 对外集成接口使用独立令牌，不复用后台管理员会话。首版硬限制为 test 环境。
+const INTEGRATION_API_TOKEN = String(process.env.INTEGRATION_API_TOKEN || '');
+const INTEGRATION_API_ENVIRONMENT = 'test';
+const INTEGRATION_AUDIT_FILE = path.join(DATA_DIR, 'integration-audit.jsonl');
+const INTEGRATION_IDEMPOTENCY_FILE = path.join(DATA_DIR, 'integration-idempotency.json');
 const INITIAL_ADMIN_USER = String(process.env.ADMIN_USER || '').trim();
 const INITIAL_ADMIN_PASS = String(process.env.ADMIN_PASS || '');
 const SESSION_TTL_MS = 7 * 24 * 3600 * 1000; // 登录态有效期 7 天
@@ -113,6 +118,48 @@ function sessionUser(token) {
   return s.username;
 }
 if (!fs.existsSync(USERS_FILE)) loadUsers(); // 首次启动按环境变量落地初始账号
+
+function safeTokenEquals(actual, expected) {
+  const a = Buffer.from(String(actual || ''), 'utf8');
+  const b = Buffer.from(String(expected || ''), 'utf8');
+  return a.length > 0 && a.length === b.length && crypto.timingSafeEqual(a, b);
+}
+
+function stableJson(value) {
+  if (Array.isArray(value)) return `[${value.map((item) => stableJson(item)).join(',')}]`;
+  if (value && typeof value === 'object') {
+    return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${stableJson(value[key])}`).join(',')}}`;
+  }
+  return JSON.stringify(value);
+}
+
+function readJsonObject(file) {
+  try {
+    const parsed = JSON.parse(fs.readFileSync(file, 'utf8'));
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+function writeJsonObject(file, value) {
+  const pending = `${file}.pending`;
+  fs.writeFileSync(pending, JSON.stringify(value, null, 2), 'utf8');
+  try {
+    fs.renameSync(pending, file);
+  } catch {
+    fs.rmSync(file, { force: true });
+    fs.renameSync(pending, file);
+  }
+}
+
+// The external integration surface must not normalize unrelated applications or
+// protected environment partitions as a side effect of a test-only write.
+function saveIntegrationConfig(config) {
+  config.version = new Date().toISOString();
+  writeJsonObject(DATA_FILE, config);
+  return config;
+}
 
 // ——————————————— 配置读写 ———————————————
 function defaultConfig() {
@@ -626,10 +673,13 @@ function configRegions(apps, environment = '') {
 }
 
 // ——————————————— 缓存构建程序触发 ———————————————
-function runCacheBuilder(mode, appId, requestedEnvironment = LEGACY_BUNDLE_ENVIRONMENT) {
+function runCacheBuilder(mode, appIdOrConfig, requestedEnvironment = LEGACY_BUNDLE_ENVIRONMENT) {
   const environment = normalizeConfigEnvironment(requestedEnvironment, LEGACY_BUNDLE_ENVIRONMENT);
+  const appArg = appIdOrConfig && typeof appIdOrConfig === 'object'
+    ? JSON.stringify(appIdOrConfig)
+    : String(appIdOrConfig || '');
   return new Promise((resolve, reject) => {
-    execFile(process.execPath, [CACHE_BUILDER, mode, appId], {
+    execFile(process.execPath, [CACHE_BUILDER, mode, appArg], {
       cwd: __dirname,
       windowsHide: true,
       timeout: 10 * 60 * 1000,
@@ -918,6 +968,615 @@ function auth(req, res, next) {
   next();
 }
 app.use('/api/admin', auth);
+
+function integrationTokenOf(req) {
+  const direct = String(req.headers['x-integration-token'] || '').trim();
+  if (direct) return direct;
+  return String(req.headers.authorization || '').replace(/^Bearer\s+/i, '').trim();
+}
+
+function integrationAuth(req, res, next) {
+  if (!INTEGRATION_API_TOKEN) {
+    return res.status(503).json({
+      ok: false,
+      code: 'integration_api_disabled',
+      error: 'integration API is disabled'
+    });
+  }
+  const token = integrationTokenOf(req);
+  if (!safeTokenEquals(token, INTEGRATION_API_TOKEN)) {
+    return res.status(401).json({ ok: false, code: 'unauthorized', error: 'unauthorized' });
+  }
+  req.integrationTokenId = crypto.createHash('sha256').update(token).digest('hex').slice(0, 12);
+  next();
+}
+
+function integrationTestEnvironment(req, res, next) {
+  const requested = String(
+    req.body && req.body.environment || req.query && req.query.environment ||
+      req.headers['x-webaccel-environment'] || ''
+  ).trim().toLowerCase();
+  if (!requested) {
+    return res.status(400).json({
+      ok: false,
+      code: 'environment_required',
+      error: 'environment 必须显式填写 test'
+    });
+  }
+  if (requested !== INTEGRATION_API_ENVIRONMENT) {
+    return res.status(403).json({
+      ok: false,
+      code: 'test_environment_only',
+      error: '集成接口当前仅允许 test；pre/prod 已锁定'
+    });
+  }
+  req.integrationEnvironment = INTEGRATION_API_ENVIRONMENT;
+  next();
+}
+
+function integrationAudit(req, res, next) {
+  const requestedId = String(req.headers['x-request-id'] || '').trim();
+  const requestId = /^[A-Za-z0-9._-]{1,128}$/.test(requestedId)
+    ? requestedId
+    : crypto.randomUUID();
+  const client = String(req.headers['x-integration-client'] || 'external').trim().slice(0, 80) || 'external';
+  const startedAt = Date.now();
+  req.integrationRequestId = requestId;
+  req.integrationClient = client;
+  res.setHeader('X-Request-Id', requestId);
+  res.on('finish', () => {
+    const appMatch = String(req.path || '').match(/\/apps\/([^/?]+)/);
+    let appId = '';
+    try { appId = appMatch ? decodeURIComponent(appMatch[1]) : ''; } catch {}
+    const record = {
+      at: new Date().toISOString(),
+      requestId,
+      client,
+      tokenId: req.integrationTokenId || '',
+      method: req.method,
+      path: req.path,
+      action: req.integrationAction || '',
+      appId,
+      environment: req.integrationEnvironment || '',
+      status: res.statusCode,
+      durationMs: Date.now() - startedAt
+    };
+    try { fs.appendFileSync(INTEGRATION_AUDIT_FILE, JSON.stringify(record) + '\n', 'utf8'); } catch {}
+  });
+  next();
+}
+
+function integrationIdempotency(req, res, next) {
+  if (req.method === 'GET' || req.method === 'HEAD') return next();
+  const fromHeader = String(req.headers['x-idempotency-key'] || '').trim();
+  const fromBody = String(req.body && req.body.idempotencyKey || '').trim();
+  const key = fromHeader || fromBody;
+  if (!/^[A-Za-z0-9._:-]{8,128}$/.test(key)) {
+    return res.status(400).json({
+      ok: false,
+      code: 'idempotency_key_required',
+      error: '写接口必须提供 8-128 位 X-Idempotency-Key'
+    });
+  }
+  const body = Object.assign({}, req.body || {});
+  delete body.idempotencyKey;
+  const requestHash = crypto.createHash('sha256')
+    .update(`${req.method}\n${req.path}\n${stableJson(body)}`)
+    .digest('hex');
+  const storageKey = `${req.integrationTokenId}:${key}`;
+  const store = readJsonObject(INTEGRATION_IDEMPOTENCY_FILE);
+  const existing = store[storageKey];
+  if (existing) {
+    if (existing.requestHash !== requestHash) {
+      return res.status(409).json({
+        ok: false,
+        code: 'idempotency_conflict',
+        error: '同一幂等键不能用于不同请求'
+      });
+    }
+    res.setHeader('X-Idempotent-Replay', 'true');
+    return res.status(Number(existing.status) || 200).json(existing.body);
+  }
+
+  const originalJson = res.json.bind(res);
+  res.json = (responseBody) => {
+    if (!res.headersSent && res.statusCode < 500) {
+      const latest = readJsonObject(INTEGRATION_IDEMPOTENCY_FILE);
+      latest[storageKey] = {
+        requestHash,
+        status: res.statusCode,
+        body: responseBody,
+        createdAt: new Date().toISOString()
+      };
+      try { writeJsonObject(INTEGRATION_IDEMPOTENCY_FILE, latest); } catch {}
+    }
+    return originalJson(responseBody);
+  };
+  next();
+}
+
+app.use('/api/integration/v1', integrationAuth, integrationAudit, integrationTestEnvironment, integrationIdempotency);
+
+function integrationProtectedState(appCfg, appId) {
+  const reasons = [];
+  const id = String(appId || appCfg && appCfg.id || '').trim();
+  if (appCfg) {
+    const bundleEnvironments = normalizeBundleEnvironments(appCfg);
+    for (const environment of ['pre', 'prod']) {
+      if (bundleEnvironments.includes(environment)) reasons.push(`${environment}:bundle`);
+      const envConfig = configJsonEnvironmentOf(appCfg, environment);
+      if (envConfig.configJson || envConfig.configJsonFileName || envConfig.configJsonSyncedAt ||
+          envConfig.configJsonSync && (envConfig.configJsonSync.enabled || hasConfigJsonSyncSource(envConfig.configJsonSync))) {
+        reasons.push(`${environment}:configJson`);
+      }
+    }
+  }
+  for (const environment of ['pre', 'prod']) {
+    const dir = path.join(bundleRoot(environment), id);
+    try {
+      if (id && fs.existsSync(dir) && fs.readdirSync(dir).length > 0) reasons.push(`${environment}:files`);
+    } catch {
+      reasons.push(`${environment}:files-unreadable`);
+    }
+  }
+  return Array.from(new Set(reasons));
+}
+
+function integrationStringList(value, limit = 100) {
+  const source = Array.isArray(value) ? value : [];
+  const seen = new Set();
+  const result = [];
+  for (const item of source.slice(0, limit)) {
+    const text = String(item || '').trim();
+    if (text && text.length <= 2048 && !seen.has(text)) {
+      seen.add(text);
+      result.push(text);
+    }
+  }
+  return result;
+}
+
+function integrationHttpOrigin(value) {
+  try {
+    const url = new URL(String(value || '').trim());
+    return url.protocol === 'http:' || url.protocol === 'https:' ? url.origin : '';
+  } catch {
+    return '';
+  }
+}
+
+function integrationMaxResourceKB(value) {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? Math.min(8192, Math.max(1, Math.floor(parsed))) : 4096;
+}
+
+function integrationRegions(value) {
+  if (!Array.isArray(value)) return { ids: [], names: {} };
+  const ids = [];
+  const names = {};
+  const seen = new Set();
+  for (const item of value.slice(0, 100)) {
+    const id = String(item && typeof item === 'object' ? item.id : item || '').trim();
+    if (!/^[A-Za-z0-9._:-]{1,80}$/.test(id) || seen.has(id)) continue;
+    seen.add(id);
+    ids.push(id);
+    const name = String(item && typeof item === 'object' ? item.name || '' : '').trim().slice(0, 120);
+    if (name) names[id] = name;
+  }
+  return { ids, names };
+}
+
+function integrationAppView(appCfg) {
+  const app = normalizeAppConfig(appCfg);
+  const testConfig = configJsonEnvironmentOf(app, INTEGRATION_API_ENVIRONMENT);
+  return {
+    id: app.id,
+    name: app.name,
+    url: app.url,
+    scope: app.scope,
+    regions: app.regions,
+    regionNames: app.regionNames,
+    routes: Array.isArray(app.routes) ? app.routes : [],
+    appId: app.appId || '',
+    appVersion: app.appVersion || '',
+    priority: app.priority,
+    bundle: app.bundle === true,
+    bundleEnvironments: normalizeBundleEnvironments(app),
+    bundlePaused: bundlePausedInEnvironment(app, INTEGRATION_API_ENVIRONMENT),
+    configJson: testConfig.configJson,
+    configJsonFileName: testConfig.configJsonFileName,
+    configJsonSyncedAt: testConfig.configJsonSyncedAt,
+    integrationManaged: app.integrationManaged === true,
+    offlineBundle: bundleInfo(app.id, app, INTEGRATION_API_ENVIRONMENT)
+  };
+}
+
+function integrationBundleBuilderApp(appCfg) {
+  return {
+    id: appCfg.id,
+    name: appCfg.name,
+    url: appCfg.url,
+    userAgent: appCfg.userAgent,
+    bundleExtraUrls: Array.isArray(appCfg.bundleExtraUrls) ? appCfg.bundleExtraUrls : [],
+    bundleExcludeUrls: Array.isArray(appCfg.bundleExcludeUrls) ? appCfg.bundleExcludeUrls : [],
+    bundleResourceMetrics: appCfg.bundleResourceMetrics || {},
+    bundleMaxSizeKB: appCfg.bundleMaxSizeKB,
+    staticCache: appCfg.staticCache || null
+  };
+}
+
+function applyIntegrationResourceMetadata(appCfg, imported, inputByUrl, defaultSource) {
+  const importedUrls = imported.map((item) => item.url);
+  const extra = new Set(Array.isArray(appCfg.bundleExtraUrls) ? appCfg.bundleExtraUrls : []);
+  for (const url of importedUrls) extra.add(url);
+  appCfg.bundleExtraUrls = Array.from(extra);
+  if (Array.isArray(appCfg.bundleExcludeUrls)) {
+    const importedSet = new Set(importedUrls);
+    appCfg.bundleExcludeUrls = appCfg.bundleExcludeUrls.filter((url) => !importedSet.has(url));
+  }
+  const metrics = appCfg.bundleResourceMetrics && typeof appCfg.bundleResourceMetrics === 'object'
+    ? Object.assign({}, appCfg.bundleResourceMetrics)
+    : {};
+  for (const item of imported) {
+    const input = inputByUrl.get(item.url) || {};
+    metrics[item.url] = {
+      size: item.size,
+      measuredSize: Number(input.size) > 0 ? Number(input.size) : item.size,
+      mime: item.mime || '',
+      costMs: Number(input.costMs) > 0 ? Number(input.costMs) : Number(item.costMs || 0),
+      source: String(input.source || defaultSource),
+      measuredAt: new Date().toISOString()
+    };
+  }
+  appCfg.bundleResourceMetrics = metrics;
+  enableBundleEnvironment(appCfg, INTEGRATION_API_ENVIRONMENT);
+  setBundlePausedInEnvironment(appCfg, INTEGRATION_API_ENVIRONMENT, false);
+}
+
+function integrationAppForWrite(raw, previous, id) {
+  const base = previous ? Object.assign({}, previous) : {};
+  const allowed = [
+    'name', 'url', 'scope', 'appId', 'appVersion', 'priority', 'userAgent',
+    'bundleMaxSizeKB', 'staticCache', 'bundleExcludeUrls'
+  ];
+  for (const key of allowed) {
+    if (Object.prototype.hasOwnProperty.call(raw, key)) base[key] = raw[key];
+  }
+  base.id = id;
+  base.routes = Object.prototype.hasOwnProperty.call(raw, 'routes')
+    ? integrationStringList(raw.routes, 200)
+    : integrationStringList(base.routes, 200);
+  const regionInput = Object.prototype.hasOwnProperty.call(raw, 'regions')
+    ? integrationRegions(raw.regions)
+    : { ids: normalizeRegionIds(base), names: normalizeRegionNames(base, normalizeRegionIds(base)) };
+  base.scope = normalizeScope(base.scope);
+  base.regions = base.scope === 'region' ? regionInput.ids : [];
+  base.regionNames = base.scope === 'region' ? Object.assign({}, base.regionNames || {}, regionInput.names) : {};
+  base.region = base.regions[0] || '';
+  base.bundle = Object.prototype.hasOwnProperty.call(raw, 'bundle') ? raw.bundle !== false : (previous ? previous.bundle === true : true);
+  base.bundleEnvironments = base.bundle ? [INTEGRATION_API_ENVIRONMENT] : [];
+  base.bundlePausedEnvironments = normalizeBundlePausedEnvironments(base)
+    .filter((environment) => environment === INTEGRATION_API_ENVIRONMENT);
+  base.configJsonEnvironments = previous
+    ? normalizeConfigJsonEnvironments(previous)
+    : normalizeConfigJsonEnvironments({});
+  base.integrationManaged = true;
+  return normalizeAppConfig(base);
+}
+
+app.get('/api/integration/v1/apps/:id', (req, res) => {
+  req.integrationAction = 'app.get';
+  const id = String(req.params.id || '').trim();
+  const appCfg = (loadConfig().apps || []).find((item) => item && item.id === id);
+  const testConfig = appCfg ? configJsonEnvironmentOf(appCfg, INTEGRATION_API_ENVIRONMENT) : null;
+  const belongsToTest = appCfg && (
+    appCfg.integrationManaged === true ||
+    normalizeBundleEnvironments(appCfg).includes(INTEGRATION_API_ENVIRONMENT) ||
+    testConfig && (testConfig.configJson || testConfig.configJsonFileName || testConfig.configJsonSyncedAt)
+  );
+  if (!belongsToTest) {
+    return res.status(404).json({ ok: false, code: 'app_not_found', error: 'test 应用不存在' });
+  }
+  res.json({ ok: true, environment: INTEGRATION_API_ENVIRONMENT, app: integrationAppView(appCfg) });
+});
+
+app.put('/api/integration/v1/apps/:id', (req, res) => {
+  req.integrationAction = 'app.upsert';
+  const id = String(req.params.id || '').trim();
+  if (!/^[A-Za-z0-9_-]+$/.test(id)) {
+    return res.status(400).json({ ok: false, code: 'invalid_app_id', error: '应用 ID 只能包含英文、数字、下划线和短横线' });
+  }
+  const raw = req.body && req.body.app && typeof req.body.app === 'object' && !Array.isArray(req.body.app)
+    ? req.body.app
+    : req.body || {};
+  if (raw.id && String(raw.id).trim() !== id) {
+    return res.status(400).json({ ok: false, code: 'app_id_mismatch', error: '路径 ID 与 app.id 不一致' });
+  }
+  const c = loadConfig();
+  const apps = Array.isArray(c.apps) ? c.apps.slice() : [];
+  const index = apps.findIndex((item) => item && item.id === id);
+  const previous = index >= 0 ? normalizeAppConfig(apps[index]) : null;
+  const protectedState = integrationProtectedState(previous, id);
+  if (protectedState.length) {
+    return res.status(409).json({
+      ok: false,
+      code: 'protected_environment_state',
+      error: '应用已关联 pre/prod，测试集成接口拒绝修改共享应用字段',
+      protectedState
+    });
+  }
+  const appCfg = integrationAppForWrite(raw, previous, id);
+  if (!appCfg.name || !appCfg.url) {
+    return res.status(400).json({ ok: false, code: 'invalid_app', error: 'name 和 url 必填' });
+  }
+  if (!integrationHttpOrigin(appCfg.url)) {
+    return res.status(400).json({ ok: false, code: 'invalid_app', error: 'url 必须是有效的 http(s) 地址' });
+  }
+  const error = validateAppConfigForWebsdk(appCfg);
+  if (error) return res.status(400).json({ ok: false, code: 'invalid_app', error });
+  if (index >= 0) apps[index] = appCfg;
+  else apps.push(appCfg);
+  c.apps = apps;
+  const saved = saveIntegrationConfig(c);
+  res.status(previous ? 200 : 201).json({
+    ok: true,
+    operation: previous ? 'updated' : 'created',
+    environment: INTEGRATION_API_ENVIRONMENT,
+    version: saved.version,
+    app: integrationAppView(appCfg)
+  });
+});
+
+app.put('/api/integration/v1/apps/:id/regions', (req, res) => {
+  req.integrationAction = 'app.regions.replace';
+  const id = String(req.params.id || '').trim();
+  const c = loadConfig();
+  const index = (c.apps || []).findIndex((item) => item && item.id === id);
+  if (index < 0) return res.status(404).json({ ok: false, code: 'app_not_found', error: 'app not found' });
+  const appCfg = normalizeAppConfig(c.apps[index]);
+  const protectedState = integrationProtectedState(appCfg, id);
+  if (protectedState.length) {
+    return res.status(409).json({
+      ok: false,
+      code: 'protected_environment_state',
+      error: '应用已关联 pre/prod，测试集成接口拒绝修改共享地区字段',
+      protectedState
+    });
+  }
+  const parsed = integrationRegions(req.body && req.body.regions);
+  if (!parsed.ids.length) {
+    return res.status(400).json({ ok: false, code: 'regions_required', error: 'regions 至少包含一个有效地区 ID' });
+  }
+  appCfg.scope = 'region';
+  appCfg.regions = parsed.ids;
+  appCfg.regionNames = parsed.names;
+  appCfg.region = parsed.ids[0];
+  c.apps[index] = normalizeAppConfig(appCfg);
+  const error = validateAppConfigForWebsdk(c.apps[index]);
+  if (error) return res.status(400).json({ ok: false, code: 'invalid_regions', error });
+  const saved = saveIntegrationConfig(c);
+  res.json({
+    ok: true,
+    environment: INTEGRATION_API_ENVIRONMENT,
+    version: saved.version,
+    app: integrationAppView(c.apps[index])
+  });
+});
+
+app.put('/api/integration/v1/apps/:id/config-json', (req, res) => {
+  req.integrationAction = 'app.config-json.put';
+  const id = String(req.params.id || '').trim();
+  const c = loadConfig();
+  const index = (c.apps || []).findIndex((item) => item && item.id === id);
+  if (index < 0) return res.status(404).json({ ok: false, code: 'app_not_found', error: 'app not found' });
+  const originalApp = c.apps[index];
+  const appCfg = normalizeAppConfig(originalApp);
+  const input = req.body && req.body.configJson;
+  let text = '';
+  try {
+    text = typeof input === 'string' ? input.trim() : JSON.stringify(input);
+    if (!text || Buffer.byteLength(text, 'utf8') > 8 * 1024 * 1024) throw new Error('configJson 不能为空且不能超过 8MB');
+    const parsed = JSON.parse(text);
+    const configUrl = String(parsed && parsed.url || '').trim();
+    if (!configUrl || !integrationHttpOrigin(configUrl) ||
+        integrationHttpOrigin(configUrl) !== integrationHttpOrigin(appCfg.url)) {
+      throw new Error('configJson.url 必须存在并与应用 URL 同源');
+    }
+  } catch (error) {
+    return res.status(400).json({
+      ok: false,
+      code: 'invalid_config_json',
+      error: String(error && error.message || error)
+    });
+  }
+  const envConfig = appCfg.configJsonEnvironments[INTEGRATION_API_ENVIRONMENT];
+  envConfig.configJson = text;
+  envConfig.configJsonFileName = safeConfigJsonFileName(req.body && req.body.fileName, `${id}-test`);
+  envConfig.configJsonSyncedAt = new Date().toISOString();
+  const originalEnvironments = originalApp.configJsonEnvironments &&
+    typeof originalApp.configJsonEnvironments === 'object' && !Array.isArray(originalApp.configJsonEnvironments)
+    ? originalApp.configJsonEnvironments
+    : {};
+  c.apps[index] = Object.assign({}, originalApp, {
+    configJsonEnvironments: Object.assign({}, originalEnvironments, {
+      [INTEGRATION_API_ENVIRONMENT]: envConfig
+    })
+  });
+  const saved = saveIntegrationConfig(c);
+  res.json({
+    ok: true,
+    environment: INTEGRATION_API_ENVIRONMENT,
+    version: saved.version,
+    configJson: configJsonInfo(appCfg, INTEGRATION_API_ENVIRONMENT)
+  });
+});
+
+app.post('/api/integration/v1/apps/:id/resources/import-urls', async (req, res) => {
+  req.integrationAction = 'app.resources.import-urls';
+  const id = String(req.params.id || '').trim();
+  const c = loadConfig();
+  const index = (c.apps || []).findIndex((item) => item && item.id === id);
+  if (index < 0) return res.status(404).json({ ok: false, code: 'app_not_found', error: 'app not found' });
+  const appCfg = normalizeAppConfig(c.apps[index]);
+  const protectedState = integrationProtectedState(appCfg, id);
+  if (protectedState.length) {
+    return res.status(409).json({
+      ok: false,
+      code: 'protected_environment_state',
+      error: '应用已关联 pre/prod，测试集成接口拒绝修改共享资源字段',
+      protectedState
+    });
+  }
+  const imports = parseImportResources(req.body || {}, appCfg).slice(0, 100);
+  if (!imports.length) {
+    return res.status(400).json({ ok: false, code: 'resources_required', error: '请提供至少一个 http(s) 资源 URL' });
+  }
+  const maxResourceKB = integrationMaxResourceKB(req.body && req.body.maxResourceKB);
+  const maxResourceBytes = maxResourceKB * 1024;
+  const dir = path.join(bundleRoot(INTEGRATION_API_ENVIRONMENT), id);
+  fs.mkdirSync(dir, { recursive: true });
+  const results = [];
+  const inputByUrl = new Map(imports.map((item) => [item.url, item]));
+  for (const item of imports) {
+    try {
+      results.push(await downloadImportResource(item, appCfg, dir, maxResourceBytes));
+    } catch (error) {
+      results.push({ ok: false, url: item.url, error: String(error && error.message || error) });
+    }
+  }
+  const imported = results.filter((item) => item.ok);
+  if (!imported.length) {
+    return res.status(400).json({ ok: false, imported: 0, failed: results.length, results });
+  }
+  applyIntegrationResourceMetadata(appCfg, imported, inputByUrl, 'integration-url-import');
+  let manifest;
+  try {
+    manifest = await runCacheBuilder(
+      'manifest',
+      integrationBundleBuilderApp(appCfg),
+      INTEGRATION_API_ENVIRONMENT
+    );
+  } catch (error) {
+    return res.status(500).json({
+      ok: false,
+      imported: imported.length,
+      failed: results.length - imported.length,
+      results,
+      error: String(error && error.message || error)
+    });
+  }
+  c.apps[index] = appCfg;
+  const saved = saveIntegrationConfig(c);
+  res.json({
+    ok: true,
+    environment: INTEGRATION_API_ENVIRONMENT,
+    version: saved.version,
+    imported: imported.length,
+    failed: results.length - imported.length,
+    results,
+    manifest,
+    bundle: bundleInfo(id, appCfg, INTEGRATION_API_ENVIRONMENT)
+  });
+});
+
+app.post('/api/integration/v1/apps/:id/resources/upload', async (req, res) => {
+  req.integrationAction = 'app.resources.upload';
+  const id = String(req.params.id || '').trim();
+  const c = loadConfig();
+  const index = (c.apps || []).findIndex((item) => item && item.id === id);
+  if (index < 0) return res.status(404).json({ ok: false, code: 'app_not_found', error: 'app not found' });
+  const appCfg = normalizeAppConfig(c.apps[index]);
+  const protectedState = integrationProtectedState(appCfg, id);
+  if (protectedState.length) {
+    return res.status(409).json({
+      ok: false,
+      code: 'protected_environment_state',
+      error: '应用已关联 pre/prod，测试集成接口拒绝修改共享资源字段',
+      protectedState
+    });
+  }
+  const input = Array.isArray(req.body && req.body.resources) ? req.body.resources.slice(0, 100) : [];
+  if (!input.length) {
+    return res.status(400).json({ ok: false, code: 'resources_required', error: 'resources is required' });
+  }
+  const maxResourceKB = integrationMaxResourceKB(req.body && req.body.maxResourceKB);
+  const maxResourceBytes = maxResourceKB * 1024;
+  const maxTotalBytes = 12 * 1024 * 1024;
+  const dir = path.join(bundleRoot(INTEGRATION_API_ENVIRONMENT), id);
+  const prepared = [];
+  const inputByUrl = new Map();
+  const seenUrls = new Set();
+  const seenFiles = new Map();
+  let totalBytes = 0;
+  try {
+    for (const item of input) {
+      const parsedUrl = new URL(String(item && item.url || '').trim());
+      if (parsedUrl.protocol !== 'http:' && parsedUrl.protocol !== 'https:') throw new Error('unsupported URL protocol');
+      const url = parsedUrl.href;
+      if (seenUrls.has(url)) throw new Error(`duplicate resource URL: ${url}`);
+      const encoded = String(item && item.contentBase64 || '').replace(/\s+/g, '');
+      if (!encoded || !/^[A-Za-z0-9+/]*={0,2}$/.test(encoded)) throw new Error(`invalid base64 content: ${url}`);
+      const buf = Buffer.from(encoded, 'base64');
+      if (!buf.length) throw new Error(`empty content: ${url}`);
+      if (buf.length > maxResourceBytes) throw new Error(`resource exceeds ${maxResourceKB}KB limit: ${url}`);
+      totalBytes += buf.length;
+      if (totalBytes > maxTotalBytes) throw new Error('request exceeds 12MB decoded-content limit');
+      const expectedHash = String(item && item.sha256 || '').trim().toLowerCase();
+      const hash = crypto.createHash('sha256').update(buf).digest('hex');
+      if (expectedHash && (!/^[a-f0-9]{64}$/.test(expectedHash) || expectedHash !== hash)) {
+        throw new Error(`sha256 mismatch: ${url}`);
+      }
+      const file = fileNameForUrl(url);
+      const previousUrl = seenFiles.get(file);
+      if (previousUrl && previousUrl !== url) throw new Error(`resource file collision: ${previousUrl} / ${url}`);
+      const target = safeBundlePath(dir, file);
+      if (!target) throw new Error(`bad target file: ${url}`);
+      const mime = String(item && item.mime || '').split(';')[0].trim().toLowerCase() || mimeOfPath(url);
+      prepared.push({ ok: true, url, file, target, mime, size: buf.length, hash, buf });
+      inputByUrl.set(url, item || {});
+      seenUrls.add(url);
+      seenFiles.set(file, url);
+    }
+  } catch (error) {
+    return res.status(400).json({
+      ok: false,
+      code: 'invalid_resource_upload',
+      error: String(error && error.message || error)
+    });
+  }
+
+  fs.mkdirSync(dir, { recursive: true });
+  for (const item of prepared) fs.writeFileSync(item.target, item.buf);
+  const imported = prepared.map(({ buf, target, ...item }) => item);
+  applyIntegrationResourceMetadata(appCfg, imported, inputByUrl, 'integration-content-upload');
+  let manifest;
+  try {
+    manifest = await runCacheBuilder(
+      'manifest',
+      integrationBundleBuilderApp(appCfg),
+      INTEGRATION_API_ENVIRONMENT
+    );
+  } catch (error) {
+    return res.status(500).json({
+      ok: false,
+      imported: imported.length,
+      totalBytes,
+      error: String(error && error.message || error)
+    });
+  }
+  c.apps[index] = appCfg;
+  const saved = saveIntegrationConfig(c);
+  res.json({
+    ok: true,
+    environment: INTEGRATION_API_ENVIRONMENT,
+    version: saved.version,
+    imported: imported.length,
+    totalBytes,
+    resources: imported,
+    manifest,
+    bundle: bundleInfo(id, appCfg, INTEGRATION_API_ENVIRONMENT)
+  });
+});
 
 // 当前登录用户
 app.get('/api/admin/me', (req, res) => res.json({ username: req.user }));

@@ -21,6 +21,7 @@ services:
       - PORT=8787
       - ADMIN_USER=${ADMIN_USER:?请在 .env 里设置 ADMIN_USER(后台登录账号)}
       - ADMIN_PASS=${ADMIN_PASS:?请在 .env 里设置 ADMIN_PASS(后台登录密码)}
+      - INTEGRATION_API_TOKEN=${INTEGRATION_API_TOKEN:-}
       - DB_HOST=mysql
       - DB_PORT=3306
       - DB_NAME=${DB_NAME:-webaccel}
