@@ -25,17 +25,14 @@ const pathShowsAll = adminShowsAll();
 const pathEnvName = environmentLabel(defaultViewEnvironment());
 const environmentView = pathLocked;
 
-const allMenus = [
+const menus = [
   { path: '/dashboard', title: '概览', icon: Odometer },
   { path: '/apps', title: '应用管理', icon: Grid },
   { path: '/config-json', title: '更新 JSON', icon: Document },
   { path: '/blocklist', title: '过滤黑名单', icon: CircleClose },
   { path: '/bundles', title: '离线包', icon: Box },
   { path: '/settings', title: '全局设置', icon: Setting }
-];
-const menus = environmentView
-  ? allMenus.filter((item) => item.path === '/apps')
-  : allMenus;
+].filter((item) => !(environmentView && item.path === '/settings'));
 
 const pageTitle = computed(() => environmentView && route.path === '/config-json' ? '更新 JSON' : route.meta.title);
 const pageDescription = computed(() => environmentView && route.path === '/config-json'
@@ -45,7 +42,7 @@ const pageDescription = computed(() => environmentView && route.path === '/confi
 watch(
   () => route.path,
   (path) => {
-    if (environmentView && path !== '/apps') router.replace('/apps');
+    if (environmentView && path === '/settings') router.replace('/apps');
   },
   { immediate: true }
 );

@@ -1146,6 +1146,7 @@ async function syncConfigJson(row) {
                 />
                 <el-tag v-else size="small" type="info" effect="plain">未配置</el-tag>
               </div>
+              <el-button type="primary" plain :icon="Box" @click="openBundle(row)">查看离线资源</el-button>
             </div>
           </article>
         </div>
