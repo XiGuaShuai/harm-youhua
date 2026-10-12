@@ -1,13 +1,15 @@
 <script setup>
 import { ref, onMounted, onBeforeUnmount, computed, watch } from 'vue';
 import { useRoute } from 'vue-router';
-import { ElMessage, ElMessageBox } from 'element-plus';
+import { ElMessage } from 'element-plus';
 import { Search, Upload } from '@element-plus/icons-vue';
 import api from '../api';
 import { displayRegionName } from '../regionCatalog';
 import { adminViewLocked, defaultViewEnvironment, environmentLabel } from '../adminPath';
+import { useConfigStore } from '../stores/config';
 
 const route = useRoute();
+const configStore = useConfigStore();
 const bundles = ref([]);
 const loading = ref(false);
 const selectedId = ref('');
@@ -42,34 +44,132 @@ const bundleEnvironment = ref(
 const bundleEnvironmentName = computed(() =>
   configEnvironmentOptions.find((item) => item.id === bundleEnvironment.value)?.name || bundleEnvironment.value
 );
-// 测试环境的应用、JSON、地区和资源由集成 API 托管；网页只负责查看状态和控制是否下发。
-const testDeliveryOnly = computed(() => bundleEnvironment.value === 'test');
+// 分环境入口统一采用轻量资源清单和下发控制，不触发全环境离线包统计。
+const managedEnvironmentView = computed(() => pathLocked);
 
 const autoLog = ref(null);
 const autoRunning = ref(false);
 const triggering = ref(false);
 const triggeringScope = ref('');
 let autoPollTimer = 0;
+let loadSequence = 0;
+
+function testBundleShell(app) {
+  const environment = bundleEnvironment.value;
+  const bundleEnvironments = Array.isArray(app?.bundleEnvironments) ? app.bundleEnvironments : [];
+  const bundlePausedEnvironments = Array.isArray(app?.bundlePausedEnvironments) ? app.bundlePausedEnvironments : [];
+  const configured = bundleEnvironments.includes(environment);
+  const paused = configured && bundlePausedEnvironments.includes(environment);
+  return {
+    id: app.id,
+    environment,
+    name: app.name || app.id,
+    url: app.url || '',
+    scope: app.scope || 'app',
+    region: app.region || '',
+    regions: Array.isArray(app.regions) ? app.regions : [],
+    regionName: app.regionName || '',
+    regionNames: app.regionNames || {},
+    configJsonEnvironments: app.configJsonEnvironments || {},
+    count: 0,
+    sizeBytes: 0,
+    compressedSizeBytes: 0,
+    builtAt: null,
+    manifestUrl: `/${environment}/bundles/${app.id}/manifest.json`,
+    resources: [],
+    config: {
+      ...app,
+      bundle: configured && !paused,
+      bundlePaused: paused,
+      bundleEnvironments,
+      bundlePausedEnvironments
+    }
+  };
+}
+
+function applyTestManifest(row, manifest, headers = {}) {
+  const resources = (Array.isArray(manifest) ? manifest : []).map((item) => ({
+    ...item,
+    storedFile: item.file,
+    storedSize: Number(item.size || 0),
+    storedSizeKB: Math.round(Number(item.size || 0) / 102.4) / 10,
+    enabled: true,
+    inManifest: true
+  }));
+  const sizeBytes = resources.reduce((total, item) => total + Number(item.size || 0), 0);
+  return {
+    ...row,
+    count: resources.length,
+    sizeBytes,
+    compressedSizeBytes: sizeBytes,
+    builtAt: headers['last-modified'] || new Date().toISOString(),
+    resources
+  };
+}
+
+function selectRequestedBundle() {
+  const requestedId = typeof route.query.app === 'string' ? route.query.app : '';
+  if (requestedId && bundles.value.some((bundle) => bundle.id === requestedId)) {
+    selectedId.value = requestedId;
+  } else if (!selectedId.value || !bundles.value.some((bundle) => bundle.id === selectedId.value)) {
+    selectedId.value = bundles.value[0]?.id || '';
+  }
+}
+
+async function loadTestBundles(sequence) {
+  if (!configStore.apps.length) await configStore.load();
+  if (sequence !== loadSequence) return;
+  const rows = configStore.apps
+    .filter((app) => Array.isArray(app?.bundleEnvironments) && app.bundleEnvironments.includes(bundleEnvironment.value))
+    .map(testBundleShell);
+  bundles.value = rows;
+  selectRequestedBundle();
+  loading.value = false;
+
+  let cursor = 0;
+  let failed = 0;
+  const worker = async () => {
+    while (cursor < rows.length) {
+      const row = rows[cursor++];
+      try {
+        const response = await api.get(row.manifestUrl);
+        if (sequence !== loadSequence) return;
+        if (!Array.isArray(response.data)) continue;
+        const index = bundles.value.findIndex((item) => item.id === row.id);
+        if (index >= 0) bundles.value[index] = applyTestManifest(row, response.data, response.headers);
+      } catch (error) {
+        if (error.response?.status !== 404) failed++;
+      }
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(6, rows.length) }, () => worker()));
+  if (sequence === loadSequence && failed) ElMessage.warning(`${failed} 个应用的资源状态暂时读取失败`);
+}
 
 async function load() {
+  const sequence = ++loadSequence;
   loading.value = true;
   try {
+    if (managedEnvironmentView.value) {
+      await loadTestBundles(sequence);
+      return;
+    }
     const { data } = await api.get('/api/admin/bundles', { params: { environment: bundleEnvironment.value } });
     bundles.value = Array.isArray(data) ? data : [];
-    const requestedId = typeof route.query.app === 'string' ? route.query.app : '';
-    if (requestedId && bundles.value.some((b) => b.id === requestedId)) {
-      selectedId.value = requestedId;
-    } else if (!selectedId.value || !bundles.value.some((b) => b.id === selectedId.value)) {
-      selectedId.value = bundles.value[0]?.id || '';
-    }
+    selectRequestedBundle();
   } finally {
     loading.value = false;
   }
-  await loadAutoLog();
-  scheduleAutoPoll();
+  if (!managedEnvironmentView.value) {
+    await loadAutoLog();
+    scheduleAutoPoll();
+  }
 }
 onMounted(load);
-onBeforeUnmount(() => stopAutoPoll());
+onBeforeUnmount(() => {
+  loadSequence++;
+  stopAutoPoll();
+});
 
 watch(() => route.query.app, (appId) => {
   if (typeof appId === 'string' && bundles.value.some((bundle) => bundle.id === appId)) {
@@ -451,29 +551,19 @@ function packPaused(row) {
 async function toggleSelectedPause(enabled) {
   if (!selected.value) return;
   const envName = bundleEnvironmentName.value;
-  if (!enabled) {
-    await ElMessageBox.confirm(
-      `暂停后，${envName}环境设备不再下载和命中「${selected.value.name || selected.value.id}」的离线包。服务器上的包文件保留，可随时恢复。`,
-      `暂停${envName}环境离线包`,
-      { type: 'warning', confirmButtonText: '暂停下发', cancelButtonText: '取消' }
-    );
-  }
   pausing.value = true;
   try {
-    const { data } = await api.put(`/api/admin/apps/${encodeURIComponent(selected.value.id)}/bundle-pause`, {
-      environment: bundleEnvironment.value,
-      paused: !enabled
-    });
+    const data = await configStore.pauseBundle(selected.value.id, bundleEnvironment.value, !enabled);
     if (selected.value.config) {
       selected.value.config.bundle = data.enabled === true;
       selected.value.config.bundlePaused = data.paused === true;
       selected.value.config.bundlePausedEnvironments = data.app?.bundlePausedEnvironments || [];
     }
-    ElMessage.success(enabled ? `已恢复${envName}环境离线包下发` : `已暂停${envName}环境离线包下发`);
-  } catch (e) {
-    if (e !== 'cancel' && e !== 'close') {
-      ElMessage.error((enabled ? '恢复失败:' : '暂停失败:') + (e.response?.data?.error || e.message));
+    if (!managedEnvironmentView.value) {
+      ElMessage.success(enabled ? `已恢复${envName}环境离线包下发` : `已暂停${envName}环境离线包下发`);
     }
+  } catch (e) {
+    ElMessage.error((enabled ? '恢复失败:' : '暂停失败:') + (e.response?.data?.error || e.message));
     await load();
   } finally {
     pausing.value = false;
@@ -482,17 +572,17 @@ async function toggleSelectedPause(enabled) {
 </script>
 
 <template>
-  <div class="page-card">
+  <div class="page-card" :class="{ 'test-bundle-page': managedEnvironmentView }">
     <div class="bundle-head">
       <div>
-        <div class="page-title">离线包资源面板</div>
+        <div class="page-title">{{ managedEnvironmentView ? '离线资源' : '离线包资源面板' }}</div>
         <div class="muted">
-          {{ testDeliveryOnly ? '测试资源由接口自动维护；此处只查看状态并控制是否下发' : '按网站查看离线包配置、文件名、大小、耗时和沙箱占用' }}
+          {{ managedEnvironmentView ? `查看${bundleEnvironmentName}环境资源，并控制是否向该环境设备下发` : '按网站查看离线包配置、文件名、大小、耗时和沙箱占用' }}
         </div>
       </div>
       <div class="head-actions">
-        <el-tag v-if="pathLocked" type="warning" effect="plain">{{ environmentLabel(bundleEnvironment) }}环境</el-tag>
-        <el-radio-group v-else v-model="bundleEnvironment" size="small">
+        <el-tag v-if="pathLocked && !managedEnvironmentView" type="warning" effect="plain">{{ environmentLabel(bundleEnvironment) }}环境</el-tag>
+        <el-radio-group v-if="!pathLocked" v-model="bundleEnvironment" size="small">
           <el-radio-button v-for="option in configEnvironmentOptions" :key="option.id" :label="option.id">
             {{ option.name }}
           </el-radio-button>
@@ -502,22 +592,12 @@ async function toggleSelectedPause(enabled) {
         </el-select>
         <el-tag v-if="autoRunning" type="warning" size="small">处理中 {{ autoProgressText }}</el-tag>
         <el-button :loading="loading" @click="load">刷新</el-button>
-        <el-button v-if="!testDeliveryOnly" type="primary" :loading="triggering && triggeringScope === 'all'" :disabled="autoRunning"
+        <el-button v-if="!managedEnvironmentView" type="primary" :loading="triggering && triggeringScope === 'all'" :disabled="autoRunning"
           @click="runAutoUpdate('', false)">一键检查并更新全部</el-button>
       </div>
     </div>
 
-    <el-alert
-      v-if="testDeliveryOnly"
-      class="delivery-notice"
-      type="info"
-      :closable="false"
-      show-icon
-      title="测试环境采用接口托管"
-      description="应用、地区、JSON 和离线资源由对外接口上传或更新；本页面不会人工改资源，只控制设备是否接收离线资源。"
-    />
-
-    <div v-if="!testDeliveryOnly && autoLog" class="auto-line">
+    <div v-if="!managedEnvironmentView && autoLog" class="auto-line">
       <span v-if="autoRunning" class="muted">本轮进度 {{ autoProgressText }}</span>
       <span v-else class="muted">上次检查 {{ new Date(autoLog.finishedAt || autoLog.startedAt).toLocaleString() }}</span>
       <el-tag v-for="r in autoLog.results" :key="r.id" :type="r.ok ? (r.action === 'no-change' ? 'info' : 'success') : 'danger'" size="small">
@@ -529,13 +609,13 @@ async function toggleSelectedPause(enabled) {
       <aside class="site-pane">
         <div class="site-pane-head">
           <div>
-            <div class="pane-title">网站</div>
-            <div class="site-pane-sub">{{ testDeliveryOnly ? '选择网站查看下发状态' : '选择网站维护静态资源' }}</div>
+            <div class="pane-title">{{ managedEnvironmentView ? '应用' : '网站' }}</div>
+            <div class="site-pane-sub">{{ managedEnvironmentView ? '选择应用查看资源' : '选择网站维护静态资源' }}</div>
           </div>
           <el-tag size="small" type="info" effect="plain">{{ filteredBundles.length }}</el-tag>
         </div>
         <el-input v-model="siteQuery" :prefix-icon="Search" clearable size="small" class="site-search"
-          placeholder="搜索名称 / ID / URL" />
+          :placeholder="managedEnvironmentView ? '搜索应用名称 / ID' : '搜索名称 / ID / URL'" />
         <el-table :data="filteredBundles" size="small" height="680" highlight-current-row :current-row-key="selectedId" row-key="id" @row-click="selectSite">
           <el-table-column label="名称" min-width="150" show-overflow-tooltip>
             <template #default="{ row }">
@@ -562,7 +642,7 @@ async function toggleSelectedPause(enabled) {
             <div class="resource-url">{{ selected.url }}</div>
           </div>
           <div class="resource-actions">
-            <template v-if="!testDeliveryOnly">
+            <template v-if="!managedEnvironmentView">
               <el-button type="warning" :loading="triggering && triggeringScope === selected.id" :disabled="autoRunning"
                 @click="runAutoUpdate(selected.id, true)">重建并修复当前站</el-button>
               <el-button type="primary" :icon="Upload" @click="openImportDialog">导入资源</el-button>
@@ -573,7 +653,7 @@ async function toggleSelectedPause(enabled) {
           </div>
         </div>
 
-        <div class="metric-row">
+        <div class="metric-row" :class="{ 'test-metric-row': managedEnvironmentView }">
           <div class="metric">
             <span>端侧占用</span>
             <b>{{ formatSize(selected.compressedSizeBytes || selected.sizeBytes) }}</b>
@@ -601,7 +681,27 @@ async function toggleSelectedPause(enabled) {
           <span class="muted">{{ compressionText(selected) }}</span>
         </div>
 
-        <div class="config-strip">
+        <div v-if="managedEnvironmentView" class="test-delivery-strip" :class="{ 'is-enabled': selected.config?.bundle === true }">
+          <div class="test-delivery-copy">
+            <i></i>
+            <div>
+              <b>向{{ bundleEnvironmentName }}设备下发</b>
+              <span>{{ selected.config?.bundle === true ? `${bundleEnvironmentName}设备可以获取并使用当前资源` : `当前不会向${bundleEnvironmentName}设备下发资源` }}</span>
+            </div>
+          </div>
+          <el-switch
+            v-if="packConfigured(selected)"
+            :model-value="selected.config?.bundle === true"
+            :loading="pausing"
+            inline-prompt
+            active-text="开"
+            inactive-text="关"
+            @change="toggleSelectedPause"
+          />
+          <span v-else class="muted">未配置离线资源</span>
+        </div>
+
+        <div v-else class="config-strip">
           <el-tag size="small" :type="selected.config?.bundle ? 'success' : (packPaused(selected) ? 'warning' : 'info')">
             {{ selected.config?.bundle ? '离线包开启' : (packPaused(selected) ? '离线包已暂停' : '离线包关闭') }}
           </el-tag>
@@ -614,11 +714,11 @@ async function toggleSelectedPause(enabled) {
             inactive-text="暂停"
             @change="toggleSelectedPause"
           />
-          <el-tag size="small" type="warning">{{ bundleEnvironmentName }}环境</el-tag>
-          <el-tag v-if="!testDeliveryOnly && configMeta(selected).hasConfigJson" size="small" type="warning">
+          <el-tag v-if="!managedEnvironmentView" size="small" type="warning">{{ bundleEnvironmentName }}环境</el-tag>
+          <el-tag v-if="!managedEnvironmentView && configMeta(selected).hasConfigJson" size="small" type="warning">
             JSON {{ configMeta(selected).configJsonFileName || selected.configJsonFileName }} {{ formatSize(configMeta(selected).configJsonBytes || selected.configJsonBytes) }}
           </el-tag>
-          <template v-if="!testDeliveryOnly">
+          <template v-if="!managedEnvironmentView">
             <el-tag size="small" type="info">固定 {{ selected.config?.bundleExtraUrls?.length || 0 }}</el-tag>
             <el-tag size="small" type="info">关闭 {{ selected.config?.bundleExcludeUrls?.length || 0 }}</el-tag>
             <span class="muted">{{ staticCacheText(selected) }}</span>
@@ -640,11 +740,10 @@ async function toggleSelectedPause(enabled) {
             placeholder="搜索文件名、类型或 URL" />
         </div>
 
-        <el-table :data="resources" border size="small" height="520">
-          <el-table-column label="缓存" width="78" align="center">
+        <el-table :data="resources" :border="!managedEnvironmentView" size="small" height="520" class="resource-table">
+          <el-table-column v-if="!managedEnvironmentView" label="缓存" width="78" align="center">
             <template #default="{ row }">
-              <el-tag v-if="testDeliveryOnly" size="small" :type="statusType(row)">{{ statusText(row) }}</el-tag>
-              <el-switch v-else :model-value="row.enabled !== false"
+              <el-switch :model-value="row.enabled !== false"
                 :loading="togglingKey === `${selected.id}|${row.url}`"
                 @change="(v) => setResourceEnabled(selected, row, v)" />
             </template>
@@ -675,7 +774,7 @@ async function toggleSelectedPause(enabled) {
       </section>
     </div>
 
-    <el-dialog v-if="!testDeliveryOnly" v-model="importDialog" title="导入指定静态资源" width="760px">
+    <el-dialog v-if="!managedEnvironmentView" v-model="importDialog" title="导入指定静态资源" width="760px">
       <el-form label-position="top">
         <el-form-item label="目标网站">
           <el-input :model-value="selected ? `${selected.name || selected.id} (${selected.id})` : ''" disabled />
@@ -710,7 +809,7 @@ async function toggleSelectedPause(enabled) {
       </template>
     </el-dialog>
 
-    <el-dialog v-if="!testDeliveryOnly" v-model="configDialog" title="导入配置 JSON" width="760px">
+    <el-dialog v-if="!managedEnvironmentView" v-model="configDialog" title="导入配置 JSON" width="760px">
       <el-form label-position="top">
         <el-form-item label="目标网站">
           <el-input :model-value="selected ? `${selected.name || selected.id} (${selected.id})` : ''" disabled />
@@ -765,9 +864,6 @@ async function toggleSelectedPause(enabled) {
   padding: 10px 0;
   border-top: 1px solid #edf0f6;
   border-bottom: 1px solid #edf0f6;
-}
-.delivery-notice {
-  margin-top: 14px;
 }
 .bundle-layout {
   display: grid;
@@ -872,6 +968,52 @@ async function toggleSelectedPause(enabled) {
 .config-strip {
   margin-bottom: 12px;
 }
+.test-delivery-strip {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 18px;
+  margin-bottom: 14px;
+  padding: 11px 13px;
+  border: 1px solid #e7eaf1;
+  border-radius: 11px;
+  background: #fbfcfe;
+  transition: border-color .18s ease, background .18s ease;
+}
+.test-delivery-strip.is-enabled {
+  border-color: #d8eadf;
+  background: #f8fcf9;
+}
+.test-delivery-copy {
+  display: flex;
+  align-items: center;
+  gap: 11px;
+  min-width: 0;
+}
+.test-delivery-copy > i {
+  flex: none;
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  background: #b8bdc9;
+}
+.test-delivery-strip.is-enabled .test-delivery-copy > i {
+  background: #21ad52;
+  box-shadow: 0 0 0 4px rgba(33, 173, 82, .11);
+}
+.test-delivery-copy b,
+.test-delivery-copy span {
+  display: block;
+}
+.test-delivery-copy b {
+  color: #353b4e;
+  font-size: 13px;
+}
+.test-delivery-copy span {
+  margin-top: 3px;
+  color: #8b92a4;
+  font-size: 12px;
+}
 .table-tools {
   justify-content: space-between;
   margin-bottom: 10px;
@@ -895,6 +1037,38 @@ async function toggleSelectedPause(enabled) {
 }
 .encoding-tag {
   margin-left: 6px;
+}
+.test-bundle-page .bundle-layout {
+  grid-template-columns: 280px minmax(0, 1fr);
+}
+.test-bundle-page .resource-pane {
+  padding: 18px;
+}
+.test-bundle-page .test-metric-row {
+  gap: 0;
+  overflow: hidden;
+  border: 1px solid #edf0f6;
+  border-radius: 10px;
+  background: #fbfcfe;
+}
+.test-bundle-page .test-metric-row .metric {
+  border: 0;
+  border-right: 1px solid #edf0f6;
+  border-radius: 0;
+  background: transparent;
+}
+.test-bundle-page .test-metric-row .metric:last-child {
+  border-right: 0;
+}
+.test-bundle-page .table-tools {
+  padding: 9px 0;
+  border: 0;
+  border-top: 1px solid #edf0f6;
+  border-radius: 0;
+  background: transparent;
+}
+.test-bundle-page .resource-table {
+  border-top: 1px solid #edf0f6;
 }
 @media (max-width: 980px) {
   .bundle-layout {

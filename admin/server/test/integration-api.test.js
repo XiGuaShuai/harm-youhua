@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
+import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
@@ -47,7 +48,20 @@ function publicEnvironmentSnapshot(body) {
   };
 }
 
-test('integration API is authenticated, idempotent, and hard-locked to test', async (t) => {
+function directoryDigest(dir) {
+  const hash = crypto.createHash('sha256');
+  for (const file of fs.readdirSync(dir).sort()) {
+    const target = path.join(dir, file);
+    if (!fs.statSync(target).isFile()) continue;
+    hash.update(file);
+    hash.update('\0');
+    hash.update(fs.readFileSync(target));
+    hash.update('\0');
+  }
+  return hash.digest('hex');
+}
+
+test('legacy integration API remains authenticated, idempotent, and test-only', async (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'webaccel-integration-'));
   const dataDir = path.join(root, 'data');
   const bundlesDir = path.join(root, 'bundles');
@@ -55,6 +69,42 @@ test('integration API is authenticated, idempotent, and hard-locked to test', as
   for (const environment of ['test', 'pre', 'prod']) {
     fs.mkdirSync(path.join(bundlesDir, environment), { recursive: true });
   }
+
+  const syncSource = http.createServer((req, res) => {
+    const chunks = [];
+    req.on('data', (chunk) => chunks.push(chunk));
+    req.on('end', () => {
+      res.setHeader('content-type', 'application/json');
+      if (req.url === '/login' && req.method === 'POST') {
+        const body = JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}');
+        if (body.username !== 'external-user' || body.password !== 'external-password') {
+          res.statusCode = 401;
+          res.end(JSON.stringify({ error: 'invalid credentials' }));
+          return;
+        }
+        res.end(JSON.stringify({ data: { token: 'sync-source-token' } }));
+        return;
+      }
+      if (req.url === '/config' && req.method === 'GET') {
+        if (req.headers.authorization !== 'Bearer sync-source-token') {
+          res.statusCode = 401;
+          res.end(JSON.stringify({ error: 'invalid token' }));
+          return;
+        }
+        res.end(JSON.stringify({ payload: {
+          url: 'https://example.test/app',
+          title: 'synced through unified API',
+          version: 2
+        } }));
+        return;
+      }
+      res.statusCode = 404;
+      res.end(JSON.stringify({ error: 'not found' }));
+    });
+  });
+  await new Promise((resolve) => syncSource.listen(0, '127.0.0.1', resolve));
+  t.after(() => syncSource.close());
+  const syncSourceUrl = `http://127.0.0.1:${syncSource.address().port}`;
 
   const protectedConfig = {
     test: { configJson: JSON.stringify({ url: 'https://protected.example/app', title: 'test' }) },
@@ -108,6 +158,9 @@ test('integration API is authenticated, idempotent, and hard-locked to test', as
       ADMIN_USER: 'test-admin',
       ADMIN_PASS: 'test-only-password',
       INTEGRATION_API_TOKEN: token,
+      INTEGRATION_API_TOKEN_TEST: token,
+      INTEGRATION_API_TOKEN_PRE: 'integration-pre-test-token',
+      INTEGRATION_API_TOKEN_PROD: 'integration-prod-test-token',
       DISABLE_SCHEDULERS: '1',
       DB_HOST: '127.0.0.1',
       DB_PORT: '1'
@@ -165,7 +218,7 @@ test('integration API is authenticated, idempotent, and hard-locked to test', as
     })
   });
   assert.equal(result.response.status, 409);
-  assert.equal(result.body.code, 'protected_environment_state');
+  assert.equal(result.body.code, 'shared_app_identity_conflict');
 
   result = await request(`${baseUrl}/api/integration/v1/apps/external_demo`, {
     method: 'PUT',
@@ -209,6 +262,50 @@ test('integration API is authenticated, idempotent, and hard-locked to test', as
   });
   assert.equal(result.response.status, 200, result.text);
   assert.equal(result.body.configJson.environment, 'test');
+  assert.equal(result.body.affectedRegionCount, 2);
+  assert.deepEqual(result.body.affectedRegions, [
+    { id: 'test-region-1', name: '测试地区一' },
+    { id: 'test-region-2', name: '测试地区二' }
+  ]);
+  assert.deepEqual(result.body.app.regions, ['test-region-1', 'test-region-2']);
+  assert.equal(JSON.parse(result.body.app.configJson).version, 1);
+
+  result = await request(`${baseUrl}/api/integration/v1/apps/external_demo/config-json-sync`, {
+    method: 'PUT',
+    headers: integrationHeaders(token, 'config-json-sync-001'),
+    body: JSON.stringify({
+      environment: 'test',
+      fileName: 'external-demo-synced.json',
+      configJsonSync: {
+        loginUrl: `${syncSourceUrl}/login`,
+        loginMethod: 'POST',
+        loginHeaders: { 'Content-Type': 'application/json' },
+        loginBody: { username: 'external-user', password: 'external-password' },
+        configUrl: `${syncSourceUrl}/config`,
+        configMethod: 'GET',
+        tokenPath: 'data.token',
+        tokenHeader: 'Authorization',
+        tokenPrefix: 'Bearer ',
+        configPath: 'payload'
+      }
+    })
+  });
+  assert.equal(result.response.status, 200, result.text);
+  assert.equal(result.body.configJsonSync.configured, true);
+  assert.equal(result.body.configJsonSync.loginBody, '******');
+  assert.equal(result.body.app.configJsonSync.loginBody, '******');
+  assert.equal(result.body.automaticSyncIntervalSeconds, 60);
+
+  result = await request(`${baseUrl}/api/integration/v1/apps/external_demo/config-json-sync/run`, {
+    method: 'POST',
+    headers: integrationHeaders(token, 'config-json-sync-run-001'),
+    body: JSON.stringify({ environment: 'test' })
+  });
+  assert.equal(result.response.status, 200, result.text);
+  assert.equal(result.body.ok, true);
+  assert.equal(result.body.affectedRegionCount, 2);
+  assert.equal(JSON.parse(result.body.app.configJson).title, 'synced through unified API');
+  assert.equal(result.body.app.configJsonSync.loginBody, '******');
 
   const source = `const testOnly = ${JSON.stringify('x'.repeat(4096))};\nconsole.log(testOnly.length);`;
   const encoded = Buffer.from(source).toString('base64');
@@ -270,6 +367,84 @@ test('integration API is authenticated, idempotent, and hard-locked to test', as
   assert.equal(updateWhilePaused.body.bundle.config.bundlePaused, true);
   assert.equal(updateWhilePaused.body.bundle.config.bundle, false);
 
+  const appBundleDir = path.join(bundlesDir, 'test', 'external_demo');
+  const incrementalManifest = JSON.parse(fs.readFileSync(path.join(appBundleDir, 'manifest.json'), 'utf8'));
+  const replacedResourceFile = incrementalManifest[0].file;
+  const snapshotJavaScript = `const snapshotVersion = ${JSON.stringify('v1'.repeat(1024))};`;
+  const snapshotCss = 'body { color: #334155; background: #f8fafc; }';
+  const snapshotBody = {
+    environment: 'test',
+    releaseId: 'release-2026-10-11.001',
+    expectedReleaseId: '',
+    resources: [
+      {
+        url: 'https://example.test/assets/snapshot.001.js',
+        mime: 'application/javascript',
+        contentBase64: Buffer.from(snapshotJavaScript).toString('base64'),
+        sha256: crypto.createHash('sha256').update(snapshotJavaScript).digest('hex')
+      },
+      {
+        url: 'https://example.test/assets/snapshot.001.css',
+        mime: 'text/css',
+        contentBase64: Buffer.from(snapshotCss).toString('base64'),
+        sha256: crypto.createHash('sha256').update(snapshotCss).digest('hex')
+      }
+    ]
+  };
+  const snapshot = await request(`${baseUrl}/api/integration/v1/apps/external_demo/resources/snapshot`, {
+    method: 'PUT',
+    headers: integrationHeaders(token, 'resource-snapshot-001'),
+    body: JSON.stringify(snapshotBody)
+  });
+  assert.equal(snapshot.response.status, 200, snapshot.text);
+  assert.equal(snapshot.body.operation, 'replaced');
+  assert.equal(snapshot.body.imported, 2);
+  assert.equal(snapshot.body.removed, 1);
+  assert.deepEqual(snapshot.body.removedResources, ['https://example.test/assets/app.12345678.js']);
+  assert.equal(snapshot.body.release.releaseId, 'release-2026-10-11.001');
+  assert.equal(snapshot.body.release.resourceCount, 2);
+  assert.equal(snapshot.body.bundle.count, 2);
+  assert.equal(snapshot.body.bundle.config.bundlePaused, true);
+  assert.equal(snapshot.body.bundle.config.bundle, false);
+  assert.equal(fs.existsSync(path.join(appBundleDir, replacedResourceFile)), false);
+
+  const snapshotReplay = await request(`${baseUrl}/api/integration/v1/apps/external_demo/resources/snapshot`, {
+    method: 'PUT',
+    headers: integrationHeaders(token, 'resource-snapshot-001'),
+    body: JSON.stringify(snapshotBody)
+  });
+  assert.equal(snapshotReplay.response.status, 200, snapshotReplay.text);
+  assert.equal(snapshotReplay.response.headers.get('x-idempotent-replay'), 'true');
+  assert.deepEqual(snapshotReplay.body, snapshot.body);
+
+  const beforeRejectedSnapshot = directoryDigest(appBundleDir);
+  const rejectedSnapshot = await request(`${baseUrl}/api/integration/v1/apps/external_demo/resources/snapshot`, {
+    method: 'PUT',
+    headers: integrationHeaders(token, 'resource-snapshot-invalid-002'),
+    body: JSON.stringify({
+      environment: 'test',
+      releaseId: 'release-2026-10-11.002',
+      expectedReleaseId: 'release-2026-10-11.001',
+      resources: [{
+        url: 'https://example.test/assets/broken.js',
+        contentBase64: Buffer.from('broken').toString('base64'),
+        sha256: '0'.repeat(64)
+      }]
+    })
+  });
+  assert.equal(rejectedSnapshot.response.status, 400, rejectedSnapshot.text);
+  assert.equal(rejectedSnapshot.body.code, 'invalid_resource_snapshot');
+  assert.equal(directoryDigest(appBundleDir), beforeRejectedSnapshot);
+
+  const staleSnapshot = await request(`${baseUrl}/api/integration/v1/apps/external_demo/resources/snapshot`, {
+    method: 'PUT',
+    headers: integrationHeaders(token, 'resource-snapshot-stale-003'),
+    body: JSON.stringify({ ...snapshotBody, releaseId: 'release-2026-10-11.003', expectedReleaseId: '' })
+  });
+  assert.equal(staleSnapshot.response.status, 409, staleSnapshot.text);
+  assert.equal(staleSnapshot.body.code, 'resource_release_changed');
+  assert.equal(directoryDigest(appBundleDir), beforeRejectedSnapshot);
+
   const pausedPublic = (await request(`${baseUrl}/test/api/config`)).body;
   assert.equal(pausedPublic.apps.find((item) => item.id === 'external_demo').bundle, false);
 
@@ -285,22 +460,28 @@ test('integration API is authenticated, idempotent, and hard-locked to test', as
     headers: integrationHeaders(token)
   });
   assert.equal(status.response.status, 200, status.text);
-  assert.equal(JSON.parse(status.body.app.configJson).title, 'test config only');
-  assert.equal(status.body.app.offlineBundle.count, 1);
+  assert.equal(JSON.parse(status.body.app.configJson).title, 'synced through unified API');
+  assert.equal(status.body.app.configJsonSync.loginBody, '******');
+  assert.equal(status.body.app.offlineBundle.count, 2);
+  assert.equal(status.body.app.resourceRelease.releaseId, 'release-2026-10-11.001');
+  assert.equal(status.body.app.resourceRelease.resourceCount, 2);
 
   const testPublic = (await request(`${baseUrl}/test/api/config`)).body;
   const testApp = testPublic.apps.find((item) => item.id === 'external_demo');
   assert.ok(testApp);
   assert.equal(testApp.bundle, true);
   assert.equal(testApp.configEnvironment, 'test');
-  assert.equal(JSON.parse(testApp.configJson).title, 'test config only');
+  assert.equal(JSON.parse(testApp.configJson).title, 'synced through unified API');
   assert.deepEqual(testApp.regions, ['test-region-1', 'test-region-2']);
 
   const manifestResponse = await fetch(`${baseUrl}/test/bundles/external_demo/manifest.json`);
   assert.equal(manifestResponse.status, 200);
   const manifest = await manifestResponse.json();
-  assert.equal(manifest.length, 1);
-  assert.equal(manifest[0].url, 'https://example.test/assets/app.12345678.js');
+  assert.equal(manifest.length, 2);
+  assert.deepEqual(manifest.map((item) => item.url).sort(), [
+    'https://example.test/assets/snapshot.001.css',
+    'https://example.test/assets/snapshot.001.js'
+  ]);
   assert.equal(fs.existsSync(path.join(bundlesDir, 'test', 'external_demo', 'manifest.zz.json')), true);
 
   const preAfter = publicEnvironmentSnapshot((await request(`${baseUrl}/pre/api/config`)).body);
@@ -326,12 +507,176 @@ test('integration API is authenticated, idempotent, and hard-locked to test', as
   assert.deepEqual(protectedApp.configJsonEnvironments.prod, protectedProdBefore);
   const externalApp = saved.apps.find((item) => item.id === 'external_demo');
   assert.deepEqual(externalApp.bundleEnvironments, ['test']);
+  assert.equal(externalApp.bundleResourceReleases.test.releaseId, 'release-2026-10-11.001');
+  assert.equal(externalApp.bundleResourceReleases.test.resourceCount, 2);
   assert.equal(externalApp.configJsonEnvironments.pre.configJson, '');
   assert.equal(externalApp.configJsonEnvironments.prod.configJson, '');
+  assert.equal(
+    JSON.parse(externalApp.configJsonEnvironments.test.configJsonSync.loginBody).password,
+    'external-password'
+  );
 
   const auditLines = fs.readFileSync(path.join(dataDir, 'integration-audit.jsonl'), 'utf8').trim().split(/\r?\n/);
   assert.ok(auditLines.length >= 7);
   const auditRecords = auditLines.map((line) => JSON.parse(line));
   assert.ok(auditRecords.map((record) => record.action).includes('app.resources.upload'));
+  assert.ok(auditRecords.map((record) => record.action).includes('app.resources.snapshot.replace'));
+  assert.ok(auditRecords.map((record) => record.action).includes('app.config-json-sync.run'));
   assert.ok(auditRecords.some((record) => record.appId === 'external_demo' && record.environment === 'test'));
+});
+
+test('environment-prefixed integration APIs isolate test, pre, and prod', async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'webaccel-integration-envs-'));
+  const dataDir = path.join(root, 'data');
+  const bundlesDir = path.join(root, 'bundles');
+  fs.mkdirSync(dataDir, { recursive: true });
+  for (const environment of ['test', 'pre', 'prod']) {
+    fs.mkdirSync(path.join(bundlesDir, environment), { recursive: true });
+  }
+  fs.writeFileSync(path.join(dataDir, 'config.json'), JSON.stringify({
+    version: 'fixture',
+    apps: [],
+    blockHosts: [],
+    settings: { configRefreshSec: 300 }
+  }, null, 2));
+
+  const tokens = {
+    test: 'isolated-test-token',
+    pre: 'isolated-pre-token',
+    prod: 'isolated-prod-token'
+  };
+  const port = 23000 + Math.floor(Math.random() * 1000);
+  const baseUrl = `http://127.0.0.1:${port}`;
+  const serverDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+  const child = spawn(process.execPath, ['index.js'], {
+    cwd: serverDir,
+    env: {
+      ...process.env,
+      PORT: String(port),
+      DATA_DIR: dataDir,
+      BUNDLES_DIR: bundlesDir,
+      ADMIN_USER: 'test-admin',
+      ADMIN_PASS: 'test-only-password',
+      INTEGRATION_API_TOKEN: tokens.test,
+      INTEGRATION_API_TOKEN_TEST: tokens.test,
+      INTEGRATION_API_TOKEN_PRE: tokens.pre,
+      INTEGRATION_API_TOKEN_PROD: tokens.prod,
+      DISABLE_SCHEDULERS: '1',
+      DB_HOST: '127.0.0.1',
+      DB_PORT: '1'
+    },
+    stdio: 'ignore',
+    windowsHide: true
+  });
+  t.after(() => {
+    child.kill();
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+  await waitForServer(baseUrl, child);
+
+  let result = await request(`${baseUrl}/api/integration/v1/pre/apps/three_env_app`, {
+    headers: integrationHeaders(tokens.test)
+  });
+  assert.equal(result.response.status, 401);
+
+  result = await request(`${baseUrl}/api/integration/v1/pre/apps/three_env_app`, {
+    method: 'PUT',
+    headers: integrationHeaders(tokens.pre, 'pre-env-mismatch-001'),
+    body: JSON.stringify({
+      environment: 'prod',
+      app: { name: 'Three Environment App', url: 'https://three.example/app' }
+    })
+  });
+  assert.equal(result.response.status, 409);
+  assert.equal(result.body.code, 'environment_mismatch');
+
+  for (const environment of ['test', 'pre', 'prod']) {
+    result = await request(`${baseUrl}/api/integration/v1/${environment}/apps/three_env_app`, {
+      method: 'PUT',
+      headers: integrationHeaders(tokens[environment], `create-${environment}-app-001`),
+      body: JSON.stringify({
+        app: {
+          name: 'Three Environment App',
+          url: 'https://three.example/app',
+          scope: 'region',
+          regions: [{ id: `${environment}-region`, name: `${environment.toUpperCase()} Region` }],
+          bundle: true,
+          bundleMaxSizeKB: environment === 'prod' ? 6144 : 5120
+        }
+      })
+    });
+    assert.ok([200, 201].includes(result.response.status), result.text);
+    assert.equal(result.body.environment, environment);
+    assert.deepEqual(result.body.app.regions, [`${environment}-region`]);
+
+    result = await request(`${baseUrl}/api/integration/v1/${environment}/apps/three_env_app/config-json`, {
+      method: 'PUT',
+      headers: integrationHeaders(tokens[environment], `json-${environment}-001`),
+      body: JSON.stringify({
+        configJson: {
+          url: 'https://three.example/app',
+          environment,
+          marker: `json-${environment}`
+        },
+        fileName: `three-${environment}.json`
+      })
+    });
+    assert.equal(result.response.status, 200, result.text);
+    assert.equal(JSON.parse(result.body.app.configJson).marker, `json-${environment}`);
+    assert.equal(result.body.affectedRegionCount, 1);
+
+    const source = `globalThis.integrationEnvironment = ${JSON.stringify(environment)};`;
+    result = await request(`${baseUrl}/api/integration/v1/${environment}/apps/three_env_app/resources/snapshot`, {
+      method: 'PUT',
+      headers: integrationHeaders(tokens[environment], `snapshot-${environment}-001`),
+      body: JSON.stringify({
+        releaseId: `release-${environment}-001`,
+        expectedReleaseId: '',
+        resources: [{
+          url: `https://three.example/assets/${environment}.12345678.js`,
+          mime: 'application/javascript',
+          contentBase64: Buffer.from(source).toString('base64'),
+          sha256: crypto.createHash('sha256').update(source).digest('hex')
+        }]
+      })
+    });
+    assert.equal(result.response.status, 200, result.text);
+    assert.equal(result.body.environment, environment);
+    assert.equal(result.body.release.releaseId, `release-${environment}-001`);
+  }
+
+  const environmentDigests = {};
+  for (const environment of ['test', 'pre', 'prod']) {
+    result = await request(`${baseUrl}/api/integration/v1/${environment}/apps/three_env_app`, {
+      headers: integrationHeaders(tokens[environment])
+    });
+    assert.equal(result.response.status, 200, result.text);
+    assert.deepEqual(result.body.app.regions, [`${environment}-region`]);
+    assert.equal(JSON.parse(result.body.app.configJson).marker, `json-${environment}`);
+    assert.equal(result.body.app.resourceRelease.releaseId, `release-${environment}-001`);
+    assert.equal(result.body.app.offlineBundle.count, 1);
+
+    const publicConfig = (await request(`${baseUrl}/${environment}/api/config`)).body;
+    const publicApp = publicConfig.apps.find((item) => item.id === 'three_env_app');
+    assert.ok(publicApp);
+    assert.deepEqual(publicApp.regions, [`${environment}-region`]);
+    assert.equal(JSON.parse(publicApp.configJson).marker, `json-${environment}`);
+
+    const manifest = JSON.parse(fs.readFileSync(
+      path.join(bundlesDir, environment, 'three_env_app', 'manifest.json'),
+      'utf8'
+    ));
+    assert.deepEqual(manifest.map((item) => item.url), [
+      `https://three.example/assets/${environment}.12345678.js`
+    ]);
+    environmentDigests[environment] = directoryDigest(path.join(bundlesDir, environment, 'three_env_app'));
+  }
+  assert.equal(new Set(Object.values(environmentDigests)).size, 3);
+
+  const saved = JSON.parse(fs.readFileSync(path.join(dataDir, 'config.json'), 'utf8'));
+  const app = saved.apps.find((item) => item.id === 'three_env_app');
+  assert.deepEqual(app.integrationManagedEnvironments, ['test', 'pre', 'prod']);
+  assert.deepEqual(app.bundleEnvironments, ['test', 'pre', 'prod']);
+  assert.deepEqual(Object.keys(app.bundleResourceEnvironments).sort(), ['pre', 'prod', 'test']);
+  assert.deepEqual(Object.keys(app.bundleResourceReleases).sort(), ['pre', 'prod', 'test']);
 });

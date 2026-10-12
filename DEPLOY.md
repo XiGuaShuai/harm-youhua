@@ -1,6 +1,8 @@
 # 部署:本地改完 → `git push` → 服务器自动更新
 
-> **2026-09-21 完整迁移入口**：test/pre/prod 全部应用、网页显示、数据库、原后台账号、运行镜像及证书资料统一备份到本地 [`../bar/20260921-full-recovery/README.md`](../bar/20260921-full-recovery/README.md)。按 [`BACKUP_RESTORE.md`](BACKUP_RESTORE.md) 校验和恢复；完成条件为校验通过且无 `INCOMPLETE` 标记。此前五应用包仅作历史快照。服务器不再额外生成运维备份文件，新服务器也只恢复运行数据。
+> **当前工作约束（2026-10-11）**：用户已确认将三环境集成 API 部署到服务器，`test`、`pre`、`prod` 使用独立路径、令牌和数据分区。部署前必须备份服务器配置及三个环境离线资源并校验；本次不提交、不推送 Git，不修改 HAR 或 AtomicPlatform。
+
+> **当前完整恢复入口**：首选本地 [`../bar/20261009-current-backup/`](../bar/20261009-current-backup/README.md)，上一次完整包为 `20260922-portable-server`。范围、校验和恢复约束见 [`BACKUP_RESTORE.md`](BACKUP_RESTORE.md)。
 
 > 当前对外使用 HTTPS 和 `/test`、`/pre`、`/prod`；下文 HTTP 和早期路径属于最初搭建过程。阅读文档或生成恢复目录不会执行部署，`git push server main` 会触发真正上线。
 
@@ -118,5 +120,5 @@ sudo systemctl enable --now certbot-renew.timer       # 必须打开定时续期
 ```
 
 certbot 会自动给 `maidun.chujingservice.com.conf` 加 443/证书。
-`yuan` 若无免密 sudo，可用 docker 组 `nsenter` 跑同一条 `certbot renew`，见 [`后台运维记录-2026-09-07.md`](后台运维记录-2026-09-07.md)。
+`yuan` 若无免密 sudo，需要由具备运维权限的人员完成证书续期；不要为了续期扩大现有账号权限。
 之后鸿蒙 release 包的 `CONFIG_SERVER` 改成 `https://maidun.chujingservice.com`。

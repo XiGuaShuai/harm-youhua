@@ -25,6 +25,11 @@ body {
   -webkit-font-smoothing: antialiased;
 }
 
+/* 分环境入口使用简洁管理界面，不展示全局定时同步告警。 */
+body.environment-admin #wa-sync-bar {
+  display: none !important;
+}
+
 /* 细滚动条 */
 ::-webkit-scrollbar { width: 8px; height: 8px; }
 ::-webkit-scrollbar-thumb { background: #c7ccd9; border-radius: 8px; }

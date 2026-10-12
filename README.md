@@ -1,58 +1,94 @@
-# youhua-mono
+# harm-youhua
 
-「网页应用集合」鸿蒙加速方案的单仓库(monorepo),由两部分组成:
+鸿蒙网页应用离线加速项目，由端侧 SDK/元服务和远程配置后台组成。
 
+```text
+harm-youhua/
+├── app/
+│   ├── webaccel/   HAR SDK：拉取配置、下载离线资源、WebView 本地命中
+│   └── entry/      HarmonyOS 元服务壳
+└── admin/
+    ├── server/     Node.js：配置 API、三环境集成 API、离线资源托管
+    └── web/        Vue 3 管理界面
 ```
-youhua-mono/
-├── app/                鸿蒙元服务(Atomic Service)工程 —— 后台离线包 + WebView 拦截 + 远程配置
-│   ├── webaccel/       加速能力封装成的 HAR SDK(被 entry 依赖,也可被别的工程复用)
-│   └── entry/          元服务本体(installationFree,消费 webaccel)
-└── admin/              配套后台 —— server(Node+Express 配置 API + 离线包托管)+ web(Vue3 + Vite + Element Plus + Pinia 管理界面)
+
+## 当前实现边界
+
+- 端侧只保留“远程配置 + 后台离线包 + WebView 本地命中”链路。
+- 不做运行时静态资源自动缓存、主文档 SWR、离屏预渲染或 chunk 预取。
+- 离线资源不打进 HAP/HAR，由后台托管并下载到接入方应用沙箱。
+- 黑名单仍沿用现有全局机制。本轮不修改 HAR，也不新增应用级黑名单。
+- 外部系统可通过集成 API 创建应用、设置地区、上传配置 JSON 和离线资源。
+- 集成 API 通过独立路径和令牌开放 `test`、`pre`、`prod`，地区、JSON 和离线资源按环境隔离。
+- 后台主要用于查看接口托管结果，以及控制是否向对应环境设备下发离线资源。
+
+给调用方的完整接口说明见 [对外接口交互文档.md](对外接口交互文档.md)。
+
+## 本地运行
+
+### 后台服务
+
+```powershell
+cd admin/server
+npm install
+$env:ADMIN_USER='<admin-name>'
+$env:ADMIN_PASS='<strong-password>'
+$env:INTEGRATION_API_TOKEN_TEST='<test-token>'
+$env:INTEGRATION_API_TOKEN_PRE='<pre-token>'
+$env:INTEGRATION_API_TOKEN_PROD='<prod-token>'
+npm start
 ```
 
-> 原 `D:\youhua` → `app/`,原 `D:\youhua-suite\admin` → `admin/`。
+默认监听 `http://localhost:8787`。首次启动使用环境变量创建后台账号，密码只以哈希形式写入运行数据。
 
-## 两者关系
+### 管理界面
 
-- **app** 是端侧元服务:加速能力抽成 `webaccel` HAR SDK,`entry` 是消费它的**元服务本体**(`bundleType: atomicService` + `installationFree: true`);**开机从服务器拉配置**(应用 / 黑名单 / 设置),按后台 manifest 下载离线包进沙箱,WebView 请求命中本地离线包。
-- **admin** 是后台:负责配置应用、筛选大资源/慢资源、生成并托管离线包。后台改配置不用重新发版,`configJson` 由后台每分钟按 `appId + environment` 独立登录第三方系统自动同步（单请求 20 秒超时）,端侧按 `configRefreshSec` 轮询对应环境 `/api/config` 或主动 `WebAccel.refreshConfig()` 才会拿到新版本。
+```powershell
+cd admin/web
+npm install
+npm run dev
+```
 
-> 当前 SDK 对外 API 没有新增必须接入的接口;这次变化主要是后台配置与 `configJson` 的自动同步链路。
+开发服务器默认由 Vite 提供，API 代理到后台服务。后端也可同源托管 `admin/web/dist`。
 
-> 新会话先读 [新会话快速上下文.md](新会话快速上下文.md)。当前定版口径:端侧不做运行时静态资源自动缓存,不做预渲染,不做 SWR 主文档缓存,不做 chunk 预取;只保留后台离线包链路。
+### 自动测试与构建
 
-SDK API 与元服务注意事项见 `app/webaccel/README.md`;后台接入见 `admin/README.md`;更新/发版流程见 `app/UPDATE.md`。
+```powershell
+cd admin/server
+npm test
 
-## 快速开始
+cd ../web
+npm run build
+```
 
-### app(鸿蒙元服务)
-用 DevEco Studio 打开 `app/` 并 **Sync**(解析 `entry → webaccel` 本地依赖),命令行构建:
+集成 API 的鉴权、幂等、环境隔离、JSON 和离线资源上传由 `admin/server/test/integration-api.test.js` 覆盖。
 
-```bash
+## HarmonyOS 构建
+
+用 DevEco Studio 打开 `app/` 并完成 Sync。命令行示例：
+
+```powershell
 cd app
-# 单独产出 SDK(HAR,供别的工程复用;entry 构建时会自动并入,无需手动先跑)
 hvigorw assembleHar -p module=webaccel@default
-# 构建元服务 HAP
 hvigorw --mode module -p module=entry@default -p product=default assembleHap
 ```
 
-> **首次需在 DevEco 配置元服务签名**:`File > Project Structure > Signing Configs` 勾选自动签名(需登录已开通元服务的华为账号)——原普通 App 的证书无法用于元服务。
-> 「不要打 rawfile 离线包、保持包体 ≤ 2MB」等见 `app/webaccel/README.md`。
+首次构建需要配置元服务签名。不要把本机签名路径、口令或临时 bundleName 提交到 Git。
 
-### admin(后台)
+## 文档入口
 
-```bash
-# 后端(端口 8787)
-cd admin/server && npm install && npm start
+- [admin/README.md](admin/README.md)：后台能力、本地运行和数据目录。
+- [对外接口交互文档.md](对外接口交互文档.md)：可直接交给调用方的完整接口说明。
+- [app/webaccel/README.md](app/webaccel/README.md)：HAR SDK 接入。
+- [app/UPDATE.md](app/UPDATE.md)：更新与发版边界。
+- [SDK_OFFLINE_BUNDLE.md](SDK_OFFLINE_BUNDLE.md)：离线包机制。
+- [OFFLINE_BUNDLE_ARCHITECTURE.md](OFFLINE_BUNDLE_ARCHITECTURE.md)：端、云、沙箱关系。
+- [TROUBLESHOOTING.md](TROUBLESHOOTING.md)：仍有参考价值的排障记录。
+- [DEPLOY.md](DEPLOY.md)：部署说明；没有明确授权时只做本地验证，不执行远端部署。
 
-# 管理界面(端口 5174,开发时代理到 8787)
-cd admin/web && npm install && npm run dev
-```
+## 工作约束
 
-## SDK 离线包说明
-
-SDK 作为接入方能力时,离线包会由接入方 App 端侧下载并存入接入方自己的沙箱。服务端配置拉取成功后,多站点 `bundle:true` 会全部进入下载队列,用于后续 WebView 请求本地命中。详细边界、压缩策略、RWS 当前状态和后台配置要求见 [SDK_OFFLINE_BUNDLE.md](SDK_OFFLINE_BUNDLE.md)。
-
-当前后台、端侧、压缩离线包、手动导入和命中流程见 [OFFLINE_BUNDLE_ARCHITECTURE.md](OFFLINE_BUNDLE_ARCHITECTURE.md)。
-
-重装或首次安装后沙箱为空,SDK 需要先把后台开启的站点离线包下载完成;调试浮窗显示 `包下载 x/y` 时首次进入仍可能慢,显示 `包完成 x/y` 后才是离线包命中后的效果。
+1. 先在本地完成接口测试和页面验证。
+2. 用户确认后再提交或推送 Git。
+3. 部署前备份服务器运行配置和三个环境离线资源；接口写入严格按环境隔离。
+4. 本轮接口化不改 HAR，也不改 AtomicPlatform；相关能力需等双方版本协同后再迭代。

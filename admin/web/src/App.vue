@@ -1,6 +1,6 @@
 <script setup>
-import { ref, onMounted } from 'vue';
-import { useRoute } from 'vue-router';
+import { computed, ref, onBeforeUnmount, onMounted, watch } from 'vue';
+import { useRoute, useRouter } from 'vue-router';
 import { storeToRefs } from 'pinia';
 import {
   Odometer, Grid, Document, CircleClose, Box, Setting,
@@ -13,6 +13,7 @@ import LoginView from './components/LoginView.vue';
 import ChangePassword from './components/ChangePassword.vue';
 
 const route = useRoute();
+const router = useRouter();
 const store = useConfigStore();
 const auth = useAuthStore();
 const { version } = storeToRefs(store);
@@ -22,6 +23,7 @@ const pwDialog = ref(false);
 const pathLocked = adminViewLocked();
 const pathShowsAll = adminShowsAll();
 const pathEnvName = environmentLabel(defaultViewEnvironment());
+const environmentView = pathLocked;
 
 const menus = [
   { path: '/dashboard', title: '概览', icon: Odometer },
@@ -30,12 +32,29 @@ const menus = [
   { path: '/blocklist', title: '过滤黑名单', icon: CircleClose },
   { path: '/bundles', title: '离线包', icon: Box },
   { path: '/settings', title: '全局设置', icon: Setting }
-];
+].filter((item) => !(environmentView && item.path === '/settings'));
+
+const pageTitle = computed(() => environmentView && route.path === '/config-json' ? '更新 JSON' : route.meta.title);
+const pageDescription = computed(() => environmentView && route.path === '/config-json'
+  ? `通过已配置账号和接口更新${pathEnvName}环境应用 JSON，并同步覆盖应用关联的全部地区`
+  : route.meta.desc);
+
+watch(
+  () => route.path,
+  (path) => {
+    if (environmentView && path === '/settings') router.replace('/apps');
+  },
+  { immediate: true }
+);
 
 function onLoggedIn() { store.load(); }
 function logout() { auth.logout().then(() => { /* authed 变 false 自动回登录页 */ }); }
 
-onMounted(() => { if (authed.value) store.load(); });
+onMounted(() => {
+  if (environmentView) document.body.classList.add('environment-admin');
+  if (authed.value) store.load();
+});
+onBeforeUnmount(() => document.body.classList.remove('environment-admin'));
 </script>
 
 <template>
@@ -61,8 +80,8 @@ onMounted(() => { if (authed.value) store.load(); });
       <!-- 顶栏 -->
       <el-header class="header">
         <div class="title-wrap">
-          <div class="title">{{ route.meta.title }}</div>
-          <div class="desc">{{ route.meta.desc }}</div>
+          <div class="title">{{ pageTitle }}</div>
+          <div class="desc">{{ pageDescription }}</div>
         </div>
         <div class="right">
           <el-tag v-if="pathShowsAll" size="small" type="warning" effect="plain" round>备份总览</el-tag>

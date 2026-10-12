@@ -10,17 +10,24 @@ export const useConfigStore = defineStore('config', () => {
   const settings = ref({ ...defaultSettings });
   const version = ref('');
   const loading = ref(false);
+  let loadRequest = null;
 
   async function load() {
+    if (loadRequest) return loadRequest;
     loading.value = true;
-    try {
+    loadRequest = (async () => {
       const { data } = await api.get('/api/admin/config');
       apps.value = data.apps || [];
       blockHosts.value = data.blockHosts || [];
       settings.value = { ...defaultSettings, ...(data.settings || {}) };
       version.value = data.version || '';
+      return data;
+    })();
+    try {
+      return await loadRequest;
     } finally {
       loading.value = false;
+      loadRequest = null;
     }
   }
 

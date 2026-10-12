@@ -28,12 +28,17 @@ const viewEnvironment = ref(
       ? String(route.query.environment)
       : defaultViewEnvironment())
 );
+const managedEnvironmentView = computed(() => pathLocked);
+const testIntegrationView = computed(() => managedEnvironmentView.value && viewEnvironment.value === 'test');
 const siteQuery = ref('');
-const onlyReady = ref(true);
+const onlyReady = ref(!managedEnvironmentView.value);
 const syncingId = ref('');
 const syncingAll = ref(false);
 const lastResults = ref([]);
 const health = ref(null);
+const jsonDialog = ref(false);
+const selectedJsonName = ref('');
+const selectedJsonText = ref('');
 
 const environmentName = computed(() => environmentLabel(viewEnvironment.value));
 
@@ -43,6 +48,15 @@ function hasConfigSyncSource(sync) {
 
 function envMetaOf(row, environment = viewEnvironment.value) {
   return row?.configJsonEnvironments?.[environment] || {};
+}
+
+function appInViewEnvironment(app) {
+  if (pathShowsAll) return true;
+  const environments = Array.isArray(app?.bundleEnvironments) ? app.bundleEnvironments : [];
+  const meta = envMetaOf(app);
+  return environments.includes(viewEnvironment.value) ||
+    (viewEnvironment.value === 'test' && app?.integrationManaged === true) ||
+    !!String(meta.configJson || '').trim();
 }
 
 function regionIdsOf(row) {
@@ -103,6 +117,7 @@ function formatTime(value) {
 const rows = computed(() => {
   const q = siteQuery.value.trim().toLowerCase();
   return (apps.value || [])
+    .filter((app) => appInViewEnvironment(app))
     .map((app) => {
       const meta = envMetaOf(app);
       const sync = meta.configJsonSync || {};
@@ -113,19 +128,37 @@ const rows = computed(() => {
         _ready: ready,
         _syncedAt: meta.configJsonSyncedAt || '',
         _jsonBytes: jsonBytes(app),
+        _hasJson: jsonBytes(app) > 0,
         _regionIds: regionIds,
         _regionLabel: regionLabel(app),
         _syncEnabled: sync.enabled === true || ready
       };
     })
     .filter((row) => {
-      if (onlyReady.value && !row._ready) return false;
+      if (!managedEnvironmentView.value && onlyReady.value && !row._ready) return false;
       if (!q) return true;
       return [row.id, row.name, row.url, row._regionLabel]
         .some((value) => String(value || '').toLowerCase().includes(q));
     })
     .sort((a, b) => String(a.name || a.id).localeCompare(String(b.name || b.id), 'zh'));
 });
+
+const rowSummary = computed(() => ({
+  total: rows.value.length,
+  withJson: rows.value.filter((row) => row._hasJson).length,
+  bytes: rows.value.reduce((total, row) => total + row._jsonBytes, 0)
+}));
+
+function showJson(row) {
+  const raw = String(envMetaOf(row).configJson || '').trim();
+  selectedJsonName.value = row.name || row.id;
+  try {
+    selectedJsonText.value = JSON.stringify(JSON.parse(raw), null, 2);
+  } catch {
+    selectedJsonText.value = raw;
+  }
+  jsonDialog.value = true;
+}
 
 async function loadHealth() {
   try {
@@ -137,7 +170,8 @@ async function loadHealth() {
 }
 
 async function refresh() {
-  await Promise.all([store.load(), loadHealth()]);
+  if (managedEnvironmentView.value) await store.load();
+  else await Promise.all([store.load(), loadHealth()]);
 }
 
 function summarizeResults(results, appName = '') {
@@ -234,7 +268,7 @@ async function syncCurrentEnvironment() {
 
 onMounted(() => {
   if (!apps.value.length) store.load();
-  loadHealth();
+  if (!managedEnvironmentView.value) loadHealth();
 });
 
 watch(viewEnvironment, () => {
@@ -244,22 +278,27 @@ watch(viewEnvironment, () => {
 
 <template>
   <div class="page-card">
-    <div class="page-head">
+    <div class="page-head" :class="{ 'managed-json-head': managedEnvironmentView }">
       <div>
-        <div class="page-title">更新 configJson</div>
-        <div class="muted">
+        <div v-if="managedEnvironmentView" class="managed-json-label"><span></span>{{ environmentName }}环境 JSON</div>
+        <div v-else class="page-title">更新 configJson</div>
+        <div v-if="managedEnvironmentView" class="muted">
+          已配置账号和读取接口的应用可手动拉取；{{ testIntegrationView ? '外部推送应用由开放接口更新。' : '' }}一次更新覆盖应用全部地区。
+        </div>
+        <div v-else class="muted">
           按应用从运营后台拉取 JSON，并写回当前环境。一个应用只存一份 JSON，会覆盖它绑定的全部地区；测试 / 预发 / 正式仍然分开。
         </div>
       </div>
       <div class="head-actions">
-        <el-tag v-if="pathLocked" type="warning" effect="plain">{{ environmentName }}环境</el-tag>
-        <el-radio-group v-else v-model="viewEnvironment" size="small">
+        <el-tag v-if="pathLocked && !managedEnvironmentView" type="warning" effect="plain">{{ environmentName }}环境</el-tag>
+        <el-radio-group v-if="!pathLocked" v-model="viewEnvironment" size="small">
           <el-radio-button v-for="option in CONFIG_ENVIRONMENT_OPTIONS" :key="option.id" :label="option.id">
             {{ option.name }}
           </el-radio-button>
         </el-radio-group>
         <el-button :icon="Refresh" :loading="loading" @click="refresh">刷新</el-button>
         <el-button
+          v-if="!managedEnvironmentView"
           type="primary"
           :icon="RefreshRight"
           :loading="syncingAll"
@@ -271,6 +310,12 @@ watch(viewEnvironment, () => {
       </div>
     </div>
 
+    <div v-if="managedEnvironmentView" class="json-summary">
+      <div><span>{{ environmentName }}应用</span><b>{{ rowSummary.total }}</b></div>
+      <div><span>已有 JSON</span><b>{{ rowSummary.withJson }}</b></div>
+      <div><span>JSON 总体积</span><b>{{ formatBytes(rowSummary.bytes) }}</b></div>
+    </div>
+
     <div class="toolbar">
       <el-input
         v-model="siteQuery"
@@ -280,17 +325,17 @@ watch(viewEnvironment, () => {
         placeholder="搜索应用名 / ID / 地区"
         style="width: 260px"
       />
-      <el-checkbox v-model="onlyReady">只看已配置同步源</el-checkbox>
-      <el-tag v-if="health?.healthy === false" type="danger" effect="plain">
+      <el-checkbox v-if="!managedEnvironmentView" v-model="onlyReady">只看已配置同步源</el-checkbox>
+      <el-tag v-if="!managedEnvironmentView && health?.healthy === false" type="danger" effect="plain">
         {{ health.message || '定时同步异常' }}
       </el-tag>
-      <el-tag v-else-if="health?.healthy === true" type="success" effect="plain">
+      <el-tag v-else-if="!managedEnvironmentView && health?.healthy === true" type="success" effect="plain">
         {{ health.message || '定时同步正常' }}
       </el-tag>
-      <a class="status-link" href="/config-json-sync.html" target="_blank" rel="noreferrer">查看同步状态页</a>
+      <a v-if="!managedEnvironmentView" class="status-link" href="/config-json-sync.html" target="_blank" rel="noreferrer">查看同步状态页</a>
     </div>
 
-    <el-table :data="rows" v-loading="loading || syncingAll" size="small" row-key="id">
+    <el-table :data="rows" v-loading="loading || syncingAll" size="small" row-key="id" class="json-table">
       <el-table-column label="应用" min-width="180">
         <template #default="{ row }">
           <div class="app-name">{{ row.name || row.id }}</div>
@@ -308,20 +353,46 @@ watch(viewEnvironment, () => {
           {{ formatBytes(row._jsonBytes) }}
         </template>
       </el-table-column>
-      <el-table-column label="上次同步" min-width="170">
+      <el-table-column :label="managedEnvironmentView ? '更新时间' : '上次同步'" min-width="170">
         <template #default="{ row }">
           {{ formatTime(row._syncedAt) }}
         </template>
       </el-table-column>
-      <el-table-column label="同步源" width="100">
+      <el-table-column :label="managedEnvironmentView ? '维护方式' : '同步源'" width="120">
         <template #default="{ row }">
-          <el-tag v-if="row._ready" size="small" type="success" effect="plain">已配置</el-tag>
+          <el-tag v-if="managedEnvironmentView && row._ready" size="small" type="success" effect="plain">接口同步</el-tag>
+          <el-tag v-else-if="testIntegrationView && row.integrationManaged" size="small" type="primary" effect="plain">外部推送</el-tag>
+          <el-tag v-else-if="row._ready" size="small" type="success" effect="plain">已配置</el-tag>
           <el-tag v-else size="small" type="info" effect="plain">未配置</el-tag>
         </template>
       </el-table-column>
-      <el-table-column label="操作" width="160" fixed="right">
+      <el-table-column label="操作" :width="managedEnvironmentView ? 260 : 160" fixed="right">
         <template #default="{ row }">
+          <template v-if="managedEnvironmentView">
+            <el-tooltip
+              :disabled="row._ready"
+              content="该应用尚未配置登录账号或 JSON 读取接口"
+              placement="top"
+            >
+              <span>
+                <el-button
+                  size="small"
+                  type="primary"
+                  :icon="RefreshRight"
+                  :loading="syncingId === row.id"
+                  :disabled="!row._ready || (!!syncingId && syncingId !== row.id)"
+                  @click="syncOne(row)"
+                >
+                  更新此应用
+                </el-button>
+              </span>
+            </el-tooltip>
+            <el-button size="small" plain :disabled="!row._hasJson" @click="showJson(row)">
+              查看 JSON
+            </el-button>
+          </template>
           <el-button
+            v-else
             size="small"
             type="primary"
             plain
@@ -335,7 +406,7 @@ watch(viewEnvironment, () => {
         </template>
       </el-table-column>
       <template #empty>
-        {{ onlyReady ? `${environmentName}环境暂无已配置同步源的应用` : '暂无应用' }}
+        {{ managedEnvironmentView ? `${environmentName}环境暂无应用` : (onlyReady ? `${environmentName}环境暂无已配置同步源的应用` : '暂无应用') }}
       </template>
     </el-table>
 
@@ -369,6 +440,14 @@ watch(viewEnvironment, () => {
         </el-table-column>
       </el-table>
     </el-card>
+
+    <el-dialog v-model="jsonDialog" :title="`${selectedJsonName} · ${environmentName}环境 JSON`" width="760px" destroy-on-close>
+      <el-input v-model="selectedJsonText" type="textarea" :rows="22" readonly class="json-preview" />
+      <template #footer>
+        <el-button type="primary" @click="jsonDialog = false">关闭</el-button>
+      </template>
+    </el-dialog>
+
   </div>
 </template>
 
@@ -401,6 +480,58 @@ watch(viewEnvironment, () => {
 }
 .toolbar {
   margin-bottom: 12px;
+}
+.managed-json-head {
+  align-items: center;
+  margin-bottom: 12px;
+}
+.managed-json-label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 5px;
+  color: #343a52;
+  font-size: 14px;
+  font-weight: 700;
+}
+.managed-json-label span {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #5964dc;
+  box-shadow: 0 0 0 4px #eceeff;
+}
+.json-summary {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(150px, 1fr));
+  gap: 12px;
+  margin-bottom: 14px;
+}
+.json-summary > div {
+  padding: 10px 14px;
+  border: 1px solid #e9ecf5;
+  border-radius: 10px;
+  background: linear-gradient(135deg, #fafbff, #fff);
+}
+.json-summary span {
+  display: block;
+  color: #8a90a2;
+  font-size: 12px;
+}
+.json-summary b {
+  display: block;
+  margin-top: 6px;
+  color: #252a3a;
+  font-size: 18px;
+}
+.json-table :deep(th.el-table__cell) {
+  background: #fafbfe;
+  color: #6d7487;
+  font-size: 12px;
+}
+.json-preview :deep(textarea) {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  line-height: 1.55;
 }
 .app-name { font-weight: 600; color: #1f2433; }
 .region-text {

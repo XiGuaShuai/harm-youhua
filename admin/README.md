@@ -1,140 +1,128 @@
-# youhua-admin —— 网页加速方案的远程配置 + 离线包服务
+# youhua-admin
 
-配套 `app/`(鸿蒙元服务「网页应用集合」,经 `webaccel` SDK 接入)的**后台**:让端侧不用每次改个应用/黑名单/离线包就重新发版,
-而是开机从这台服务器拉配置;离线包也放这台服务器让端侧下载到应用沙箱(不打进 HAP)。
+远程配置和离线资源服务。`server/` 提供 Node.js API 与静态资源托管，`web/` 提供 Vue 3 管理界面。
 
-```
-youhua-admin/
-├── server/   Node + Express:配置 API + 离线包托管 + 一键服务端打包
-└── web/      Vue3 + Vite + Element Plus + Pinia:后台管理界面
-```
+## 当前三环境接口模式
 
-## 跑起来
+测试应用由外部系统通过接口维护：
 
-```bash
-# 1) 后端(端口 8787)
+1. 创建或更新应用。
+2. 设置适用地区。
+3. 上传配置 JSON。
+4. 上传完整离线资源快照；只上报变化文件时也可增量上传或提交 URL 让服务端拉取。
+5. 查询状态并验证目标环境配置和 manifest。
+
+服务端通过环境前缀路径和独立令牌开放 `test`、`pre`、`prod`。地区、配置 JSON、资源元数据、发布版本和物理离线包均按环境隔离；应用共享身份字段冲突会被拒绝。接口细节见 [../对外接口交互文档.md](../对外接口交互文档.md)。
+
+测试后台的职责是查看接口提交结果，并控制离线资源“下发/暂停”：
+
+- `/test#/`：测试应用、离线包和资源概览。
+- `/test#/apps`：应用、地区、JSON、离线资源状态和下发开关。
+- `/test#/config-json`：只读查看已上传的 JSON。
+- `/test#/bundles`：查看已有离线资源。
+- `/test#/blocklist`：保留原有全局黑名单页面，本轮不改动其机制。
+
+测试环境不显示“全局设置”。设置数据和非测试环境原有页面没有被删除。
+
+## 本地运行
+
+需要 Node.js 18 或更高版本。
+
+```powershell
 cd server
 npm install
-ADMIN_USER='<admin-name>' ADMIN_PASS='<strong-password>' npm start
-#   → http://localhost:8787/api/config      鸿蒙 App 拉这个
-#   → 首次启动用 ADMIN_USER / ADMIN_PASS 创建账号；之后读取 data/users.json，不把账号密码写进仓库
+$env:ADMIN_USER='<admin-name>'
+$env:ADMIN_PASS='<strong-password>'
+$env:INTEGRATION_API_TOKEN_TEST='<test-token>'
+$env:INTEGRATION_API_TOKEN_PRE='<pre-token>'
+$env:INTEGRATION_API_TOKEN_PROD='<prod-token>'
+npm start
+```
 
-# 2) 后台界面(端口 5174,开发时自动代理到 8787)
+默认地址为 `http://localhost:8787`。首次启动必须提供管理员账号和密码；后续从 `DATA_DIR` 中的用户数据读取。
+
+另开终端启动前端开发服务：
+
+```powershell
 cd web
 npm install
 npm run dev
-#   → http://localhost:5174   用账号密码登录
 ```
 
-## 后端能管什么(都适配当前方案)
+构建后的 `web/dist` 可由后台同源托管。
 
-| 后台页面 | 对应端侧(webaccel SDK) | 作用 |
-|---|---|---|
-| 应用管理 | `WebAccel.getApps()` / launcher 列表 | 增删网页应用、每个 app 的加速开关、路由列表 |
-| **更新 JSON** | SDK / 宿主读取的 `configJson` | 按应用 + 环境一键从运营后台拉最新 JSON；覆盖该应用绑定的全部地区 |
-| 过滤黑名单 | SDK 注入的 `blockHosts` | 被墙第三方域名,端侧命中即秒拒 |
-| 离线包 | 下载进接入方应用沙箱(不打进 HAP) | 服务端构建/手动导入静态资源,生成 manifest 并托管给端侧 |
-| configJson 自动同步 | 第三方后台登录 + 配置接口 | 启动时立即执行，之后每 60 秒按 `appId + environment` 独立登录并写回对应配置，单请求 20 秒超时 |
-| 全局设置 | 沙箱上限 / 离线包下载并发等 | (`字节码开关` 字段在元服务被忽略,平台不支持) |
+## 本地隔离验证
 
-### 2026-10-08/09 相关运维
+不要让本地调试读写现有服务器数据。使用独立目录和端口：
 
-测试环境四应用离线包（beacukai / Europcar / Australia / 哈利法塔）已更新，用户先自测；细节见 [`../../测试环境四应用离线包更新-2026-10-08.md`](../../测试环境四应用离线包更新-2026-10-08.md)。未授权不要同步到 pre/prod。
-
-### 更新 JSON 独立页（2026-10-08）
-
-侧栏菜单「更新 JSON」，路由 `#/config-json`。线上入口：
-
-```text
-测试：https://maidun.chujingservice.com/test#/config-json
-预发：https://maidun.chujingservice.com/pre#/config-json
-正式：https://maidun.chujingservice.com/prod#/config-json
+```powershell
+$env:DATA_DIR='<temporary-data-directory>'
+$env:BUNDLES_DIR='<temporary-bundles-directory>'
+$env:WEB_DIST='<absolute-path-to-admin-web-dist>'
+$env:PORT='8787'
+$env:ADMIN_USER='local-preview'
+$env:ADMIN_PASS='<local-only-password>'
+$env:INTEGRATION_API_TOKEN_TEST='<local-test-token>'
+$env:INTEGRATION_API_TOKEN_PRE='<local-pre-token>'
+$env:INTEGRATION_API_TOKEN_PROD='<local-prod-token>'
+node index.js
 ```
 
-操作口径：
+完成验证后只删除本次创建的临时目录，不要清理共享或服务器数据目录。
 
-1. 先选环境（`/test`、`/pre`、`/prod` 路径会锁定对应环境）。
-2. 点某个应用的「更新此应用」：只刷 **当前环境** 这一份 `configJson`。
-3. 该应用若绑定多个地区（如 XE 18 个地区），共用这一份 JSON；一次更新等于覆盖该应用全部地区。
-4. 「更新当前环境全部」会刷当前环境所有已配置同步源的应用。
-5. 成功但内容没变时也会刷新 `configJsonSyncedAt`，页面显示「已检查，无变化」。
-6. 端侧不会实时强推；设备需重开应用、等 `configRefreshSec` 轮询，或调用 `WebAccel.refreshConfig()`。
+## 测试与构建
 
-前端源码：`admin/web/src/views/ConfigJson.vue`。应用管理页原有行内「更新 JSON」按钮仍可用，行为与本页一致。
+```powershell
+cd server
+npm test
+
+cd ../web
+npm run build
+```
+
+`integration-api.test.js` 会使用临时数据和资源目录启动独立服务，覆盖以下行为：
+
+- 未鉴权请求被拒绝。
+- 三个环境的路径、令牌、地区、JSON、离线资源和版本信息互相隔离。
+- 幂等键可安全重放并检测冲突。
+- 应用、地区和配置 JSON 写入。
+- 离线资源上传和 manifest 生成。
+- 完整资源快照的原子替换、版本冲突保护和失败保留旧包。
+- 网页设置的暂停下发状态在资源更新后仍保留。
+- 审计文件不记录令牌和请求正文。
 
 ## 关键接口
 
-对外系统接入应用、配置 JSON、地区和离线资源时，使用只允许 `test` 环境的
-[`INTEGRATION_API.md`](./INTEGRATION_API.md)。该接口使用独立令牌，不复用后台登录会话。
+| 接口 | 用途 |
+|---|---|
+| `GET /test/api/config` | 测试设备拉取配置 |
+| `GET /test/bundles/<id>/manifest.json` | 测试环境离线资源清单 |
+| `GET /api/integration/v1/:environment/apps/:id` | 查询指定环境应用状态 |
+| `PUT /api/integration/v1/:environment/apps/:id` | 创建或配置指定环境应用 |
+| `PUT /api/integration/v1/:environment/apps/:id/regions` | 全量设置指定环境地区 |
+| `PUT /api/integration/v1/:environment/apps/:id/config-json` | 上传指定环境配置 JSON |
+| `PUT /api/integration/v1/:environment/apps/:id/resources/snapshot` | 原子替换指定环境完整离线包 |
+| `POST /api/integration/v1/:environment/apps/:id/resources/upload` | 增量上传指定环境资源 |
+| `POST /api/integration/v1/:environment/apps/:id/resources/import-urls` | 从 URL 导入指定环境资源 |
+| `POST /api/login` | 后台账号登录 |
+| `/api/admin/*` | 原有后台管理接口，需要后台会话令牌 |
 
-- `GET /api/config` —— **鸿蒙 App 开机拉取**:`{ version, apps, blockHosts, settings }`
-- `GET /bundles/<id>/manifest.json` —— 离线包(格式与 App 的 rawfile manifest 一致:`[{url,file,mime}]`)
-- `POST /api/admin/bundles/<id>/build` —— 服务端为某 app 打包(后台「服务端打包」按钮)
-- `POST /api/admin/bundles/<id>/import` —— 手动导入指定静态资源 URL,立即下载并重生成 manifest/压缩 manifest
-- `POST /api/login` —— 账号密码登录,返回会话 token;后续管理请求带 `X-Admin-Token: <token>` 头
-- `POST /api/admin/config-json-sync/run` —— 手动触发某个 app 的 `configJson` 同步(或全量同步)
-- `GET /api/admin/config-json-sync/status` —— 当前同步健康状态（失败/卡住/过期）
-- `GET /config-json-sync.html` —— 浏览器查看同步状态，每 20 秒刷新
-- `GET /config-json-sync-banner.js` —— 管理页底部状态横条
-- 应用/黑名单/设置的增删改:`/api/admin/*`(需 `X-Admin-Token` 头);改密 `POST /api/admin/password`
+无环境前缀的 `/api/config` 和 `/bundles/*` 为旧客户端兼容路径，按生产环境处理，不能用来验证测试数据。
 
-## 鸿蒙端怎么接(已完成,经 webaccel SDK)
+## 数据目录
 
-端侧已通过 `app/webaccel` SDK 接入本后台,一行 `WebAccel.init(ctx, { configServer })` 即可:
+- `DATA_DIR/config.json`：应用、地区、环境配置、黑名单和设置。
+- `DATA_DIR/users.json`：管理员账号的加盐哈希。
+- `DATA_DIR/sessions.json`：后台会话。
+- `DATA_DIR/integration-audit.jsonl`：集成接口审计，不记录请求正文和原始令牌。
+- `DATA_DIR/integration-idempotency.json`：幂等结果。
+- `BUNDLES_DIR/{test,pre,prod}/<appId>/`：各环境离线资源和 manifest。
 
-1. **开机拉配置**:SDK 内部请求 `https://你的服务器/api/config`,把 `apps`、`blockHosts`、`settings`
-   分别注入 launcher 列表 / 缓存黑名单 / 全局设置。配置缓存到沙箱,拉取失败用上次的(或直供兜底)。
-2. **离线包下载**:SDK 对 `bundle:true` 且已有 manifest 的站点,从 `/bundles/<id>/manifest*.json` 下载该站离线包到沙箱
-   (缓存 key = 原站 URL),**改资源不用重发 App**,且不计入元服务包体。
-3. 后台重建离线包后会生成新版本号;端侧重新打开应用或调用 `WebAccel.refreshConfig()` 后拉到新版本并下载新增/变更资源。
+这些都是运行数据，不应提交到 Git。
 
-## `configJson` 自动同步(后台应用 JSON)
+## 发布约束
 
-有些站点的 H5 配置不是人工上传,而是第三方后台接口返回的 `configJson`。这类站点在 admin 里配置 `configJsonSync`,由后台定时同步到本地 `configJson` 字段,再一起下发给端侧。
-
-同步链路如下:
-
-1. 先调用第三方登录接口拿 token,例如:
-
-   - `POST https://meta-manage.hssstg.com/admin-api/login`
-   - 响应里的 token 字段: `token`
-
-2. 再调用配置接口拿应用 JSON,例如:
-
-   - `GET https://meta-manage.hssstg.com/admin-api/api/webappconfig/getList?pageNum=1&pageSize=10&appId=1930101295172853761`
-   - 目标 JSON 路径: `data.records[0].configJson`
-
-3. `getWebNameList` 不是 configJson 来源,它只是应用列表接口。
-
-4. 后台启动时立即执行同步，之后每 60 秒为每个应用/环境独立执行一次;当前已配置同步源的应用会按测试、预发、正式环境分别刷新 `configJson`，单个失败不阻塞其它应用。也可以在「更新 JSON」页手动点，或调 `POST /api/admin/config-json-sync/run`（`{ appId, environment }`）立即刷新。单目标 25 秒超时；并发 6；失败或卡住会自动再拉（单目标最多 3 次，整轮最多再跑 3 轮）。成功拉取后无论内容是否变化都会刷新 `configJsonSyncedAt`。
-
-   线上环境必须使用服务器自身可访问的配置读取接口。2026-09-04 测试运营域名解析失败见 [`后台运维记录-2026-09-04.md`](../后台运维记录-2026-09-04.md)。2026-09-07 正式环境锁死跳过见 [`后台运维记录-2026-09-07.md`](../后台运维记录-2026-09-07.md)。
-
-5. 日常按应用操作优先用管理页「更新 JSON」：`/#/config-json`。整轮健康状态仍看 `GET /config-json-sync.html`（需登录）和 `GET /api/admin/config-json-sync/status`。详细 `config-json-sync-log.json` 每轮删除。
-
-6. 端侧不需要新增任何必须接入的 API,还是按 `/api/config` 和 `WebAccel.refreshConfig()` 这条链路拿到最新配置。
-
-7. 数据模型仍是「一应用 + 一环境 = 一份 configJson」。地区只表示适用范围，不是按地区各存一份 JSON。
-
-同步账号不得写入仓库文档、示例代码或提交记录。测试、预发、生产即使共用登录账号，`configJson`、业务 appId 和读取接口仍必须按环境隔离。
-
-> 接入与元服务注意事项见 `app/webaccel/README.md`、维护流程见 `app/UPDATE.md`。
-> 动态接口(跨境实时数据)仍由你的**后端镜像**解决,与本配置服务可以是同一台服务器。
-
-## 数据/存储
-
-- 本地开发配置存 `server/data/config.json`。线上有效配置在服务器/Docker 运行环境中,不要只改本地文件。
-- 离线包存 `server/bundles/<id>/`,通过 `/bundles` 静态托管。
-- 生产部署:`server` 用 pm2/systemd 常驻;`web` 跑 `npm run build` 出静态文件,用 nginx 托管并反代 `/api`、`/bundles` 到 server。
-
-## 更新日志
-
-### 2026-06-05 —— 后台升级为正式管理系统
-
-- **登录鉴权**:从「单一 token」改为**账号 + 密码**登录。密码用 scrypt 加盐哈希存 `data/users.json`(不存明文);登录后颁发会话 token 存 `data/sessions.json`,有效期 7 天,服务重启不掉线。
-- **修改密码**:新增 `POST /api/admin/password`,登录后在后台右上角用户菜单即可改。
-- **初始账号**:首次启动必须通过环境变量 `ADMIN_USER` / `ADMIN_PASS` 设置，密码仅以 scrypt 哈希写入运行数据；原 `ADMIN_TOKEN` 降级为可选的「脚本主令牌」，默认不开启。
-- **界面美化**:全新分栏登录页;新增「概览」仪表盘(统计卡 + 应用速览 + 系统信息);侧边栏改深色带图标、当前项渐变高亮;顶栏加配置版本标签与用户头像下拉(改密 / 退出);统一品牌主色与卡片样式。
-# 全环境备份入口（2026-09-21）
-
-测试、预发、生产全部应用配置和资源，连同本后台页面显示产物、账号、数据库和部署资料，统一备份到工作区本地 `bar/20260921-full-recovery`。服务器不额外生成运维备份副本。恢复范围、校验及新服务器操作见 [`../BACKUP_RESTORE.md`](../BACKUP_RESTORE.md)；旧五应用备份只作阶段快照。
+- 先完成本地测试和页面检查。
+- 用户确认后才能提交或推送 Git。
+- 没有明确授权时，不部署，也不修改预发或生产环境。
+- 本轮不修改 `app/webaccel` HAR 和 AtomicPlatform。

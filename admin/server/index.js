@@ -47,7 +47,12 @@ const IMPORT_TIMEOUT_MS = 60 * 1000;
 // 可选「主令牌」:仅当显式设置 ADMIN_TOKEN 时生效(给脚本/CI 用),默认不开,走账号密码登录
 const MASTER_TOKEN = process.env.ADMIN_TOKEN || '';
 // 对外集成接口使用独立令牌，不复用后台管理员会话。首版硬限制为 test 环境。
-const INTEGRATION_API_TOKEN = String(process.env.INTEGRATION_API_TOKEN || '');
+const INTEGRATION_API_LEGACY_TOKEN = String(process.env.INTEGRATION_API_TOKEN || '');
+const INTEGRATION_API_TOKENS = {
+  test: String(process.env.INTEGRATION_API_TOKEN_TEST || INTEGRATION_API_LEGACY_TOKEN || ''),
+  pre: String(process.env.INTEGRATION_API_TOKEN_PRE || ''),
+  prod: String(process.env.INTEGRATION_API_TOKEN_PROD || '')
+};
 const INTEGRATION_API_ENVIRONMENT = 'test';
 const INTEGRATION_AUDIT_FILE = path.join(DATA_DIR, 'integration-audit.jsonl');
 const INTEGRATION_IDEMPOTENCY_FILE = path.join(DATA_DIR, 'integration-idempotency.json');
@@ -538,6 +543,72 @@ function mergeMaskedConfigJsonEnvironments(nextApp, previousApp) {
   return next;
 }
 
+function appRegionsForEnvironment(appCfg, requestedEnvironment) {
+  const environment = normalizeConfigEnvironment(requestedEnvironment, 'test');
+  const explicit = appCfg && appCfg.integrationRegionEnvironments;
+  if (explicit && typeof explicit === 'object' && !Array.isArray(explicit) &&
+      Object.prototype.hasOwnProperty.call(explicit, environment)) {
+    const entry = explicit[environment] && typeof explicit[environment] === 'object'
+      ? explicit[environment]
+      : {};
+    const parsed = integrationRegions(Array.isArray(entry.regions)
+      ? entry.regions.map((id) => ({ id, name: entry.regionNames && entry.regionNames[id] }))
+      : []);
+    return parsed;
+  }
+  const ids = selectRegionIdsForEnvironment(normalizeRegionIds(appCfg), environment, {
+    appName: appCfg && appCfg.name,
+    regionNames: appCfg && appCfg.regionNames
+  });
+  const allNames = normalizeRegionNames(appCfg, normalizeRegionIds(appCfg));
+  const names = {};
+  for (const id of ids) names[id] = allNames[id] || id;
+  return { ids, names };
+}
+
+function setAppRegionsForEnvironment(appCfg, requestedEnvironment, regionInput) {
+  const environment = normalizeConfigEnvironment(requestedEnvironment, 'test');
+  const originalIds = normalizeRegionIds(appCfg);
+  const originalNames = normalizeRegionNames(appCfg, originalIds);
+  const environments = appCfg.integrationRegionEnvironments &&
+    typeof appCfg.integrationRegionEnvironments === 'object' &&
+    !Array.isArray(appCfg.integrationRegionEnvironments)
+    ? Object.assign({}, appCfg.integrationRegionEnvironments)
+    : {};
+  environments[environment] = {
+    regions: regionInput.ids.slice(),
+    regionNames: Object.assign({}, regionInput.names)
+  };
+  appCfg.integrationRegionEnvironments = environments;
+  const ids = [];
+  const names = {};
+  const seen = new Set();
+  for (const candidate of CONFIG_ENVIRONMENTS) {
+    const entry = Object.prototype.hasOwnProperty.call(environments, candidate)
+      ? appRegionsForEnvironment(appCfg, candidate)
+      : (() => {
+          const selected = selectRegionIdsForEnvironment(originalIds, candidate, {
+            appName: appCfg.name,
+            regionNames: originalNames
+          });
+          const selectedNames = {};
+          for (const id of selected) selectedNames[id] = originalNames[id] || id;
+          return { ids: selected, names: selectedNames };
+        })();
+    for (const id of entry.ids) {
+      if (!seen.has(id)) {
+        seen.add(id);
+        ids.push(id);
+      }
+      names[id] = entry.names[id] || names[id] || id;
+    }
+  }
+  appCfg.regions = ids;
+  appCfg.regionNames = names;
+  appCfg.region = ids[0] || '';
+  appCfg.regionName = appCfg.region ? names[appCfg.region] || appCfg.region : '';
+}
+
 function publicAppConfig(appCfg, requestedEnvironment = 'test') {
   const a = normalizeAppConfig(appCfg);
   const environment = normalizeConfigEnvironment(requestedEnvironment, 'test');
@@ -548,13 +619,12 @@ function publicAppConfig(appCfg, requestedEnvironment = 'test') {
   a.configEnvironment = environment;
   a.bundleEnvironment = environment;
   if (a.scope === 'region') {
-    a.regions = selectRegionIdsForEnvironment(a.regions, environment, {
-      appName: a.name,
-      regionNames: a.regionNames
-    });
+    const environmentRegions = appRegionsForEnvironment(a, environment);
+    a.regions = environmentRegions.ids;
     const names = {};
     for (const id of a.regions) {
-      names[id] = resolveRegionName(id, a.regionNames[id], { appName: a.name }) || a.regionNames[id] || id;
+      names[id] = resolveRegionName(id, environmentRegions.names[id], { appName: a.name }) ||
+        environmentRegions.names[id] || id;
     }
     a.regionNames = names;
     a.region = a.regions[0] || '';
@@ -568,6 +638,9 @@ function publicAppConfig(appCfg, requestedEnvironment = 'test') {
   delete a.bundleExcludeUrls;
   delete a.bundleResourceMetrics;
   delete a.bundleMaxSizeKB;
+  delete a.integrationRegionEnvironments;
+  delete a.bundleResourceEnvironments;
+  delete a.bundleResourceReleases;
   return a;
 }
 
@@ -656,11 +729,11 @@ function configRegions(apps, environment = '') {
   for (const appCfg of apps || []) {
     const a = normalizeAppConfig(appCfg);
     if (a.scope !== 'region') continue;
-    const regionIds = environment
-      ? selectRegionIdsForEnvironment(a.regions, environment, { appName: a.name, regionNames: a.regionNames })
-      : a.regions;
+    const environmentRegions = environment ? appRegionsForEnvironment(a, environment) : null;
+    const regionIds = environmentRegions ? environmentRegions.ids : a.regions;
     for (const region of regionIds) {
-      const name = displayRegionName(region, a.regionNames[region], {
+      const configuredName = environmentRegions ? environmentRegions.names[region] : a.regionNames[region];
+      const name = displayRegionName(region, configuredName, {
         appName: a.name,
         viewEnvironment: environment
       });
@@ -673,11 +746,24 @@ function configRegions(apps, environment = '') {
 }
 
 // ——————————————— 缓存构建程序触发 ———————————————
-function runCacheBuilder(mode, appIdOrConfig, requestedEnvironment = LEGACY_BUNDLE_ENVIRONMENT) {
+function runCacheBuilder(
+  mode,
+  appIdOrConfig,
+  requestedEnvironment = LEGACY_BUNDLE_ENVIRONMENT,
+  bundlesDirectory = ''
+) {
   const environment = normalizeConfigEnvironment(requestedEnvironment, LEGACY_BUNDLE_ENVIRONMENT);
-  const appArg = appIdOrConfig && typeof appIdOrConfig === 'object'
-    ? JSON.stringify(appIdOrConfig)
-    : String(appIdOrConfig || '');
+  const builderBundlesDirectory = bundlesDirectory
+    ? path.resolve(bundlesDirectory)
+    : bundleRoot(environment);
+  let builderApp = appIdOrConfig;
+  if (typeof appIdOrConfig === 'string') {
+    const configuredApp = (loadConfig().apps || []).find((item) => item && item.id === appIdOrConfig);
+    if (configuredApp) builderApp = integrationBundleBuilderApp(configuredApp, environment);
+  }
+  const appArg = builderApp && typeof builderApp === 'object'
+    ? JSON.stringify(builderApp)
+    : String(builderApp || '');
   return new Promise((resolve, reject) => {
     execFile(process.execPath, [CACHE_BUILDER, mode, appArg], {
       cwd: __dirname,
@@ -685,7 +771,7 @@ function runCacheBuilder(mode, appIdOrConfig, requestedEnvironment = LEGACY_BUND
       timeout: 10 * 60 * 1000,
       maxBuffer: 10 * 1024 * 1024,
       env: Object.assign({}, process.env, {
-        BUNDLES_DIR: bundleRoot(environment),
+        BUNDLES_DIR: builderBundlesDirectory,
         WEBACCEL_BUNDLE_ENVIRONMENT: environment
       })
     }, (err, stdout, stderr) => {
@@ -976,7 +1062,9 @@ function integrationTokenOf(req) {
 }
 
 function integrationAuth(req, res, next) {
-  if (!INTEGRATION_API_TOKEN) {
+  const environment = req.integrationEnvironment;
+  const expectedToken = INTEGRATION_API_TOKENS[environment] || '';
+  if (!expectedToken) {
     return res.status(503).json({
       ok: false,
       code: 'integration_api_disabled',
@@ -984,18 +1072,32 @@ function integrationAuth(req, res, next) {
     });
   }
   const token = integrationTokenOf(req);
-  if (!safeTokenEquals(token, INTEGRATION_API_TOKEN)) {
+  if (!safeTokenEquals(token, expectedToken)) {
     return res.status(401).json({ ok: false, code: 'unauthorized', error: 'unauthorized' });
   }
-  req.integrationTokenId = crypto.createHash('sha256').update(token).digest('hex').slice(0, 12);
+  req.integrationTokenId = `${environment}:${crypto.createHash('sha256').update(token).digest('hex').slice(0, 12)}`;
   next();
 }
 
 function integrationTestEnvironment(req, res, next) {
+  const pathMatch = String(req.path || '').match(/^\/(test|pre|prod)(?:\/|$)/);
+  const pathEnvironment = pathMatch ? pathMatch[1] : '';
   const requested = String(
     req.body && req.body.environment || req.query && req.query.environment ||
       req.headers['x-webaccel-environment'] || ''
   ).trim().toLowerCase();
+  if (pathEnvironment) {
+    if (requested && requested !== pathEnvironment) {
+      return res.status(409).json({
+        ok: false,
+        code: 'environment_mismatch',
+        error: `path environment ${pathEnvironment} does not match declared environment ${requested}`
+      });
+    }
+    req.integrationEnvironment = pathEnvironment;
+    req.integrationLegacyRoute = false;
+    return next();
+  }
   if (!requested) {
     return res.status(400).json({
       ok: false,
@@ -1011,6 +1113,7 @@ function integrationTestEnvironment(req, res, next) {
     });
   }
   req.integrationEnvironment = INTEGRATION_API_ENVIRONMENT;
+  req.integrationLegacyRoute = true;
   next();
 }
 
@@ -1095,9 +1198,21 @@ function integrationIdempotency(req, res, next) {
   next();
 }
 
-app.use('/api/integration/v1', integrationAuth, integrationAudit, integrationTestEnvironment, integrationIdempotency);
+app.use('/api/integration/v1', integrationTestEnvironment, integrationAuth, integrationAudit, integrationIdempotency);
+
+function integrationRoutes(suffix) {
+  return [
+    `/api/integration/v1${suffix}`,
+    `/api/integration/v1/:integrationEnvironment(test|pre|prod)${suffix}`
+  ];
+}
 
 function integrationProtectedState(appCfg, appId) {
+  // Every environment now has an isolated integration path, token, JSON partition,
+  // resource directory and resource metadata partition. Cross-environment writes no
+  // longer need the old test-only shared-state guard.
+  return [];
+  /* c8 ignore next */
   const reasons = [];
   const id = String(appId || appCfg && appCfg.id || '').trim();
   if (appCfg) {
@@ -1166,57 +1281,180 @@ function integrationRegions(value) {
   return { ids, names };
 }
 
-function integrationAppView(appCfg) {
+function integrationConfigJsonSyncInput(value, previousValue = {}) {
+  const raw = value && typeof value === 'object' && !Array.isArray(value) ? value : {};
+  const encoded = JSON.stringify(raw);
+  if (Buffer.byteLength(encoded, 'utf8') > 128 * 1024) {
+    throw new Error('configJsonSync 不能超过 128KB');
+  }
+  const prepared = Object.assign({}, raw);
+  for (const key of ['loginBody', 'configBody']) {
+    if (prepared[key] !== undefined && prepared[key] !== null && typeof prepared[key] !== 'string') {
+      prepared[key] = JSON.stringify(prepared[key]);
+    }
+    if (Buffer.byteLength(String(prepared[key] || ''), 'utf8') > 64 * 1024) {
+      throw new Error(`${key} 不能超过 64KB`);
+    }
+  }
+  const sync = normalizeConfigJsonSync(prepared);
+  const previous = normalizeConfigJsonSync(previousValue);
+  if (sync.loginBody === '******') sync.loginBody = previous.loginBody;
+  if (sync.configBody === '******') sync.configBody = previous.configBody;
+  sync.loginHeaders = mergeMaskedObject(sync.loginHeaders, previous.loginHeaders);
+  sync.configHeaders = mergeMaskedObject(sync.configHeaders, previous.configHeaders);
+  return sync;
+}
+
+function integrationConfigJsonSyncView(value) {
+  return Object.assign({ configured: hasConfigJsonSyncSource(value) }, redactConfigJsonSync(value));
+}
+
+function integrationResourceConfig(appCfg, requestedEnvironment) {
+  const environment = normalizeConfigEnvironment(requestedEnvironment, 'test');
+  const environments = appCfg && appCfg.bundleResourceEnvironments;
+  if (environments && typeof environments === 'object' && !Array.isArray(environments) &&
+      Object.prototype.hasOwnProperty.call(environments, environment)) {
+    const entry = environments[environment] && typeof environments[environment] === 'object'
+      ? environments[environment]
+      : {};
+    return {
+      bundleExtraUrls: Array.isArray(entry.bundleExtraUrls) ? entry.bundleExtraUrls.slice() : [],
+      bundleExcludeUrls: Array.isArray(entry.bundleExcludeUrls) ? entry.bundleExcludeUrls.slice() : [],
+      bundleResourceMetrics: entry.bundleResourceMetrics && typeof entry.bundleResourceMetrics === 'object'
+        ? Object.assign({}, entry.bundleResourceMetrics)
+        : {},
+      bundleMaxSizeKB: entry.bundleMaxSizeKB,
+      staticCache: entry.staticCache || null
+    };
+  }
+  return {
+    bundleExtraUrls: Array.isArray(appCfg && appCfg.bundleExtraUrls) ? appCfg.bundleExtraUrls.slice() : [],
+    bundleExcludeUrls: Array.isArray(appCfg && appCfg.bundleExcludeUrls) ? appCfg.bundleExcludeUrls.slice() : [],
+    bundleResourceMetrics: appCfg && appCfg.bundleResourceMetrics && typeof appCfg.bundleResourceMetrics === 'object'
+      ? Object.assign({}, appCfg.bundleResourceMetrics)
+      : {},
+    bundleMaxSizeKB: appCfg && appCfg.bundleMaxSizeKB,
+    staticCache: appCfg && appCfg.staticCache || null
+  };
+}
+
+function setIntegrationResourceConfig(appCfg, requestedEnvironment, resourceConfig) {
+  const environment = normalizeConfigEnvironment(requestedEnvironment, 'test');
+  const environments = appCfg.bundleResourceEnvironments &&
+    typeof appCfg.bundleResourceEnvironments === 'object' &&
+    !Array.isArray(appCfg.bundleResourceEnvironments)
+    ? Object.assign({}, appCfg.bundleResourceEnvironments)
+    : {};
+  environments[environment] = {
+    bundleExtraUrls: Array.isArray(resourceConfig.bundleExtraUrls) ? resourceConfig.bundleExtraUrls.slice() : [],
+    bundleExcludeUrls: Array.isArray(resourceConfig.bundleExcludeUrls) ? resourceConfig.bundleExcludeUrls.slice() : [],
+    bundleResourceMetrics: resourceConfig.bundleResourceMetrics && typeof resourceConfig.bundleResourceMetrics === 'object'
+      ? Object.assign({}, resourceConfig.bundleResourceMetrics)
+      : {},
+    bundleMaxSizeKB: resourceConfig.bundleMaxSizeKB,
+    staticCache: resourceConfig.staticCache || null
+  };
+  appCfg.bundleResourceEnvironments = environments;
+}
+
+function integrationResourceReleaseView(appCfg, requestedEnvironment) {
+  const environment = normalizeConfigEnvironment(requestedEnvironment, 'test');
+  const releases = appCfg && appCfg.bundleResourceReleases;
+  const release = releases && typeof releases === 'object' && !Array.isArray(releases)
+    ? releases[environment]
+    : null;
+  if (!release || typeof release !== 'object' || Array.isArray(release)) return null;
+  return {
+    releaseId: String(release.releaseId || ''),
+    digest: String(release.digest || ''),
+    publishedAt: String(release.publishedAt || ''),
+    resourceCount: Number(release.resourceCount || 0),
+    totalBytes: Number(release.totalBytes || 0)
+  };
+}
+
+function integrationManagedEnvironments(appCfg) {
+  const source = Array.isArray(appCfg && appCfg.integrationManagedEnvironments)
+    ? appCfg.integrationManagedEnvironments
+    : [];
+  const result = source.filter((environment) => CONFIG_ENVIRONMENTS.includes(environment));
+  if (appCfg && appCfg.integrationManaged === true && source.length === 0 && !result.includes('test')) result.push('test');
+  return result;
+}
+
+function integrationAppBelongsToEnvironment(appCfg, requestedEnvironment) {
+  if (!appCfg) return false;
+  const environment = normalizeConfigEnvironment(requestedEnvironment, 'test');
+  if (integrationManagedEnvironments(appCfg).includes(environment)) return true;
+  if (normalizeBundleEnvironments(appCfg).includes(environment)) return true;
+  const envConfig = configJsonEnvironmentOf(appCfg, environment);
+  if (envConfig.configJson || envConfig.configJsonFileName || envConfig.configJsonSyncedAt ||
+      hasConfigJsonSyncSource(envConfig.configJsonSync)) return true;
+  const regions = appCfg.integrationRegionEnvironments;
+  return !!(regions && typeof regions === 'object' && Object.prototype.hasOwnProperty.call(regions, environment));
+}
+
+function integrationAppView(appCfg, requestedEnvironment) {
+  const environment = normalizeConfigEnvironment(requestedEnvironment, 'test');
   const app = normalizeAppConfig(appCfg);
-  const testConfig = configJsonEnvironmentOf(app, INTEGRATION_API_ENVIRONMENT);
+  const envConfig = configJsonEnvironmentOf(app, environment);
+  const environmentRegions = app.scope === 'region'
+    ? appRegionsForEnvironment(app, environment)
+    : { ids: [], names: {} };
   return {
     id: app.id,
     name: app.name,
     url: app.url,
     scope: app.scope,
-    regions: app.regions,
-    regionNames: app.regionNames,
+    regions: environmentRegions.ids,
+    regionNames: environmentRegions.names,
     routes: Array.isArray(app.routes) ? app.routes : [],
     appId: app.appId || '',
     appVersion: app.appVersion || '',
     priority: app.priority,
     bundle: app.bundle === true,
     bundleEnvironments: normalizeBundleEnvironments(app),
-    bundlePaused: bundlePausedInEnvironment(app, INTEGRATION_API_ENVIRONMENT),
-    configJson: testConfig.configJson,
-    configJsonFileName: testConfig.configJsonFileName,
-    configJsonSyncedAt: testConfig.configJsonSyncedAt,
+    bundlePaused: bundlePausedInEnvironment(app, environment),
+    configJson: envConfig.configJson,
+    configJsonFileName: envConfig.configJsonFileName,
+    configJsonSyncedAt: envConfig.configJsonSyncedAt,
+    configJsonSync: integrationConfigJsonSyncView(envConfig.configJsonSync),
     integrationManaged: app.integrationManaged === true,
-    offlineBundle: bundleInfo(app.id, app, INTEGRATION_API_ENVIRONMENT)
+    integrationManagedEnvironments: integrationManagedEnvironments(app),
+    resourceRelease: integrationResourceReleaseView(app, environment),
+    offlineBundle: bundleInfo(app.id, app, environment)
   };
 }
 
-function integrationBundleBuilderApp(appCfg) {
+function integrationBundleBuilderApp(appCfg, requestedEnvironment) {
+  const resources = integrationResourceConfig(appCfg, requestedEnvironment);
   return {
     id: appCfg.id,
     name: appCfg.name,
     url: appCfg.url,
     userAgent: appCfg.userAgent,
-    bundleExtraUrls: Array.isArray(appCfg.bundleExtraUrls) ? appCfg.bundleExtraUrls : [],
-    bundleExcludeUrls: Array.isArray(appCfg.bundleExcludeUrls) ? appCfg.bundleExcludeUrls : [],
-    bundleResourceMetrics: appCfg.bundleResourceMetrics || {},
-    bundleMaxSizeKB: appCfg.bundleMaxSizeKB,
-    staticCache: appCfg.staticCache || null
+    routes: Array.isArray(appCfg.routes) ? appCfg.routes : [],
+    swrDoc: appCfg.swrDoc === true,
+    bundleExtraUrls: resources.bundleExtraUrls,
+    bundleExcludeUrls: resources.bundleExcludeUrls,
+    bundleResourceMetrics: resources.bundleResourceMetrics,
+    bundleMaxSizeKB: resources.bundleMaxSizeKB,
+    staticCache: resources.staticCache
   };
 }
 
-function applyIntegrationResourceMetadata(appCfg, imported, inputByUrl, defaultSource) {
+function applyIntegrationResourceMetadata(appCfg, imported, inputByUrl, defaultSource, requestedEnvironment) {
+  const environment = normalizeConfigEnvironment(requestedEnvironment, 'test');
+  const resources = integrationResourceConfig(appCfg, environment);
   const importedUrls = imported.map((item) => item.url);
-  const extra = new Set(Array.isArray(appCfg.bundleExtraUrls) ? appCfg.bundleExtraUrls : []);
+  const extra = new Set(resources.bundleExtraUrls);
   for (const url of importedUrls) extra.add(url);
-  appCfg.bundleExtraUrls = Array.from(extra);
-  if (Array.isArray(appCfg.bundleExcludeUrls)) {
+  resources.bundleExtraUrls = Array.from(extra);
+  if (Array.isArray(resources.bundleExcludeUrls)) {
     const importedSet = new Set(importedUrls);
-    appCfg.bundleExcludeUrls = appCfg.bundleExcludeUrls.filter((url) => !importedSet.has(url));
+    resources.bundleExcludeUrls = resources.bundleExcludeUrls.filter((url) => !importedSet.has(url));
   }
-  const metrics = appCfg.bundleResourceMetrics && typeof appCfg.bundleResourceMetrics === 'object'
-    ? Object.assign({}, appCfg.bundleResourceMetrics)
-    : {};
+  const metrics = Object.assign({}, resources.bundleResourceMetrics);
   for (const item of imported) {
     const input = inputByUrl.get(item.url) || {};
     metrics[item.url] = {
@@ -1228,16 +1466,65 @@ function applyIntegrationResourceMetadata(appCfg, imported, inputByUrl, defaultS
       measuredAt: new Date().toISOString()
     };
   }
-  appCfg.bundleResourceMetrics = metrics;
-  enableBundleEnvironment(appCfg, INTEGRATION_API_ENVIRONMENT);
+  resources.bundleResourceMetrics = metrics;
+  setIntegrationResourceConfig(appCfg, environment, resources);
+  if (appCfg.bundleResourceReleases && typeof appCfg.bundleResourceReleases === 'object' &&
+      !Array.isArray(appCfg.bundleResourceReleases)) {
+    const releases = Object.assign({}, appCfg.bundleResourceReleases);
+    delete releases[environment];
+    appCfg.bundleResourceReleases = releases;
+  }
+  enableBundleEnvironment(appCfg, environment);
   // 资源自动更新不能覆盖管理员在网页设置的“暂停下发”状态。
 }
 
-function integrationAppForWrite(raw, previous, id) {
+function applyIntegrationResourceSnapshotMetadata(appCfg, imported, inputByUrl, release, requestedEnvironment) {
+  const environment = normalizeConfigEnvironment(requestedEnvironment, 'test');
+  const resources = integrationResourceConfig(appCfg, environment);
+  const importedUrls = imported.map((item) => item.url);
+  const importedSet = new Set(importedUrls);
+  resources.bundleExtraUrls = importedUrls;
+  if (Array.isArray(resources.bundleExcludeUrls)) {
+    resources.bundleExcludeUrls = resources.bundleExcludeUrls.filter((url) => !importedSet.has(url));
+  }
+  const metrics = {};
+  for (const item of imported) {
+    const input = inputByUrl.get(item.url) || {};
+    metrics[item.url] = {
+      size: item.size,
+      measuredSize: Number(input.size) > 0 ? Number(input.size) : item.size,
+      mime: item.mime || '',
+      costMs: Number(input.costMs) > 0 ? Number(input.costMs) : 0,
+      source: String(input.source || 'integration-content-snapshot'),
+      measuredAt: release.publishedAt
+    };
+  }
+  resources.bundleResourceMetrics = metrics;
+  setIntegrationResourceConfig(appCfg, environment, resources);
+  const releases = appCfg.bundleResourceReleases && typeof appCfg.bundleResourceReleases === 'object' &&
+    !Array.isArray(appCfg.bundleResourceReleases)
+    ? Object.assign({}, appCfg.bundleResourceReleases)
+    : {};
+  releases[environment] = Object.assign({}, release);
+  appCfg.bundleResourceReleases = releases;
+  enableBundleEnvironment(appCfg, environment);
+  // A snapshot replaces resource metadata but keeps the administrator's paused-delivery state.
+}
+
+function removeIntegrationBundleWorkPath(root, target) {
+  const resolvedRoot = path.resolve(root);
+  const resolvedTarget = path.resolve(target);
+  if (resolvedTarget === resolvedRoot || !resolvedTarget.startsWith(resolvedRoot + path.sep)) {
+    throw new Error(`refusing to remove path outside bundle root: ${resolvedTarget}`);
+  }
+  fs.rmSync(resolvedTarget, { recursive: true, force: true });
+}
+
+function integrationAppForWrite(raw, previous, id, requestedEnvironment) {
+  const environment = normalizeConfigEnvironment(requestedEnvironment, 'test');
   const base = previous ? Object.assign({}, previous) : {};
   const allowed = [
-    'name', 'url', 'scope', 'appId', 'appVersion', 'priority', 'userAgent',
-    'bundleMaxSizeKB', 'staticCache', 'bundleExcludeUrls'
+    'name', 'url', 'scope', 'appId', 'appVersion', 'priority', 'userAgent'
   ];
   for (const key of allowed) {
     if (Object.prototype.hasOwnProperty.call(raw, key)) base[key] = raw[key];
@@ -1246,42 +1533,83 @@ function integrationAppForWrite(raw, previous, id) {
   base.routes = Object.prototype.hasOwnProperty.call(raw, 'routes')
     ? integrationStringList(raw.routes, 200)
     : integrationStringList(base.routes, 200);
-  const regionInput = Object.prototype.hasOwnProperty.call(raw, 'regions')
-    ? integrationRegions(raw.regions)
-    : { ids: normalizeRegionIds(base), names: normalizeRegionNames(base, normalizeRegionIds(base)) };
   base.scope = normalizeScope(base.scope);
-  base.regions = base.scope === 'region' ? regionInput.ids : [];
-  base.regionNames = base.scope === 'region' ? Object.assign({}, base.regionNames || {}, regionInput.names) : {};
-  base.region = base.regions[0] || '';
-  base.bundle = Object.prototype.hasOwnProperty.call(raw, 'bundle') ? raw.bundle !== false : (previous ? previous.bundle === true : true);
-  base.bundleEnvironments = base.bundle ? [INTEGRATION_API_ENVIRONMENT] : [];
-  base.bundlePausedEnvironments = normalizeBundlePausedEnvironments(base)
-    .filter((environment) => environment === INTEGRATION_API_ENVIRONMENT);
+  if (base.scope === 'region' && Object.prototype.hasOwnProperty.call(raw, 'regions')) {
+    setAppRegionsForEnvironment(base, environment, integrationRegions(raw.regions));
+  } else if (base.scope !== 'region') {
+    base.regions = [];
+    base.regionNames = {};
+    base.integrationRegionEnvironments = {};
+  }
+  const bundleEnvironments = new Set(normalizeBundleEnvironments(base));
+  const enableBundle = Object.prototype.hasOwnProperty.call(raw, 'bundle')
+    ? raw.bundle !== false
+    : true;
+  if (enableBundle) bundleEnvironments.add(environment);
+  else bundleEnvironments.delete(environment);
+  base.bundleEnvironments = CONFIG_ENVIRONMENTS.filter((item) => bundleEnvironments.has(item));
+  base.bundle = base.bundleEnvironments.length > 0;
+  base.bundlePausedEnvironments = normalizeBundlePausedEnvironments(base);
+  const resources = integrationResourceConfig(base, environment);
+  if (Object.prototype.hasOwnProperty.call(raw, 'bundleMaxSizeKB')) resources.bundleMaxSizeKB = raw.bundleMaxSizeKB;
+  if (Object.prototype.hasOwnProperty.call(raw, 'staticCache')) resources.staticCache = raw.staticCache;
+  if (Object.prototype.hasOwnProperty.call(raw, 'bundleExcludeUrls')) {
+    resources.bundleExcludeUrls = integrationStringList(raw.bundleExcludeUrls, 500);
+  }
+  setIntegrationResourceConfig(base, environment, resources);
   base.configJsonEnvironments = previous
     ? normalizeConfigJsonEnvironments(previous)
     : normalizeConfigJsonEnvironments({});
+  const managedEnvironments = new Set(integrationManagedEnvironments(base));
+  managedEnvironments.add(environment);
+  base.integrationManagedEnvironments = CONFIG_ENVIRONMENTS.filter((item) => managedEnvironments.has(item));
   base.integrationManaged = true;
   return normalizeAppConfig(base);
 }
 
-app.get('/api/integration/v1/apps/:id', (req, res) => {
+function integrationSharedIdentityConflicts(raw, previous, requestedEnvironment) {
+  if (!previous) return [];
+  const environment = normalizeConfigEnvironment(requestedEnvironment, 'test');
+  const usedElsewhere = CONFIG_ENVIRONMENTS.some((candidate) =>
+    candidate !== environment && integrationAppBelongsToEnvironment(previous, candidate));
+  if (!usedElsewhere) return [];
+  const conflicts = [];
+  for (const key of ['name', 'url', 'scope', 'appId', 'appVersion']) {
+    if (!Object.prototype.hasOwnProperty.call(raw, key)) continue;
+    const nextValue = key === 'scope' ? normalizeScope(raw[key]) : String(raw[key] ?? '').trim();
+    const currentValue = key === 'scope' ? normalizeScope(previous[key]) : String(previous[key] ?? '').trim();
+    if (nextValue !== currentValue) conflicts.push(key);
+  }
+  if (Object.prototype.hasOwnProperty.call(raw, 'routes') &&
+      stableJson(integrationStringList(raw.routes, 200)) !== stableJson(integrationStringList(previous.routes, 200))) {
+    conflicts.push('routes');
+  }
+  if (Object.prototype.hasOwnProperty.call(raw, 'userAgent') &&
+      String(raw.userAgent || '').trim() !== String(previous.userAgent || '').trim()) {
+    conflicts.push('userAgent');
+  }
+  if (Object.prototype.hasOwnProperty.call(raw, 'priority') &&
+      Number(raw.priority) !== Number(previous.priority)) {
+    conflicts.push('priority');
+  }
+  return conflicts;
+}
+
+app.get(integrationRoutes('/apps/:id'), (req, res) => {
   req.integrationAction = 'app.get';
+  const environment = req.integrationEnvironment;
   const id = String(req.params.id || '').trim();
   const appCfg = (loadConfig().apps || []).find((item) => item && item.id === id);
-  const testConfig = appCfg ? configJsonEnvironmentOf(appCfg, INTEGRATION_API_ENVIRONMENT) : null;
-  const belongsToTest = appCfg && (
-    appCfg.integrationManaged === true ||
-    normalizeBundleEnvironments(appCfg).includes(INTEGRATION_API_ENVIRONMENT) ||
-    testConfig && (testConfig.configJson || testConfig.configJsonFileName || testConfig.configJsonSyncedAt)
-  );
+  const belongsToTest = integrationAppBelongsToEnvironment(appCfg, environment);
   if (!belongsToTest) {
     return res.status(404).json({ ok: false, code: 'app_not_found', error: 'test 应用不存在' });
   }
-  res.json({ ok: true, environment: INTEGRATION_API_ENVIRONMENT, app: integrationAppView(appCfg) });
+  res.json({ ok: true, environment, app: integrationAppView(appCfg, environment) });
 });
 
-app.put('/api/integration/v1/apps/:id', (req, res) => {
+app.put(integrationRoutes('/apps/:id'), (req, res) => {
   req.integrationAction = 'app.upsert';
+  const environment = req.integrationEnvironment;
   const id = String(req.params.id || '').trim();
   if (!/^[A-Za-z0-9_-]+$/.test(id)) {
     return res.status(400).json({ ok: false, code: 'invalid_app_id', error: '应用 ID 只能包含英文、数字、下划线和短横线' });
@@ -1296,6 +1624,15 @@ app.put('/api/integration/v1/apps/:id', (req, res) => {
   const apps = Array.isArray(c.apps) ? c.apps.slice() : [];
   const index = apps.findIndex((item) => item && item.id === id);
   const previous = index >= 0 ? normalizeAppConfig(apps[index]) : null;
+  const identityConflicts = integrationSharedIdentityConflicts(raw, previous, environment);
+  if (identityConflicts.length) {
+    return res.status(409).json({
+      ok: false,
+      code: 'shared_app_identity_conflict',
+      error: 'this app is already used by another environment; shared identity fields must stay identical',
+      fields: identityConflicts
+    });
+  }
   const protectedState = integrationProtectedState(previous, id);
   if (protectedState.length) {
     return res.status(409).json({
@@ -1305,7 +1642,7 @@ app.put('/api/integration/v1/apps/:id', (req, res) => {
       protectedState
     });
   }
-  const appCfg = integrationAppForWrite(raw, previous, id);
+  const appCfg = integrationAppForWrite(raw, previous, id, environment);
   if (!appCfg.name || !appCfg.url) {
     return res.status(400).json({ ok: false, code: 'invalid_app', error: 'name 和 url 必填' });
   }
@@ -1321,14 +1658,15 @@ app.put('/api/integration/v1/apps/:id', (req, res) => {
   res.status(previous ? 200 : 201).json({
     ok: true,
     operation: previous ? 'updated' : 'created',
-    environment: INTEGRATION_API_ENVIRONMENT,
+    environment,
     version: saved.version,
-    app: integrationAppView(appCfg)
+    app: integrationAppView(appCfg, environment)
   });
 });
 
-app.put('/api/integration/v1/apps/:id/regions', (req, res) => {
+app.put(integrationRoutes('/apps/:id/regions'), (req, res) => {
   req.integrationAction = 'app.regions.replace';
+  const environment = req.integrationEnvironment;
   const id = String(req.params.id || '').trim();
   const c = loadConfig();
   const index = (c.apps || []).findIndex((item) => item && item.id === id);
@@ -1348,23 +1686,120 @@ app.put('/api/integration/v1/apps/:id/regions', (req, res) => {
     return res.status(400).json({ ok: false, code: 'regions_required', error: 'regions 至少包含一个有效地区 ID' });
   }
   appCfg.scope = 'region';
-  appCfg.regions = parsed.ids;
-  appCfg.regionNames = parsed.names;
-  appCfg.region = parsed.ids[0];
+  setAppRegionsForEnvironment(appCfg, environment, parsed);
   c.apps[index] = normalizeAppConfig(appCfg);
   const error = validateAppConfigForWebsdk(c.apps[index]);
   if (error) return res.status(400).json({ ok: false, code: 'invalid_regions', error });
   const saved = saveIntegrationConfig(c);
   res.json({
     ok: true,
-    environment: INTEGRATION_API_ENVIRONMENT,
+    environment,
     version: saved.version,
-    app: integrationAppView(c.apps[index])
+    app: integrationAppView(c.apps[index], environment)
   });
 });
 
-app.put('/api/integration/v1/apps/:id/config-json', (req, res) => {
+app.put(integrationRoutes('/apps/:id/config-json-sync'), (req, res) => {
+  req.integrationAction = 'app.config-json-sync.put';
+  const environment = req.integrationEnvironment;
+  const id = String(req.params.id || '').trim();
+  const c = loadConfig();
+  const index = (c.apps || []).findIndex((item) => item && item.id === id);
+  if (index < 0) return res.status(404).json({ ok: false, code: 'app_not_found', error: 'app not found' });
+  const originalApp = c.apps[index];
+  const appCfg = normalizeAppConfig(originalApp);
+  const protectedState = integrationProtectedState(appCfg, id);
+  if (protectedState.length) {
+    return res.status(409).json({
+      ok: false,
+      code: 'protected_environment_state',
+      error: '应用已关联 pre/prod，测试集成接口拒绝修改共享 JSON 同步配置',
+      protectedState
+    });
+  }
+  const input = req.body && req.body.configJsonSync && typeof req.body.configJsonSync === 'object'
+    ? req.body.configJsonSync
+    : req.body;
+  let sync;
+  try {
+    sync = integrationConfigJsonSyncInput(input, appCfg.configJsonEnvironments[environment].configJsonSync);
+  } catch (error) {
+    return res.status(400).json({
+      ok: false,
+      code: 'invalid_config_json_sync',
+      error: String(error && error.message || error)
+    });
+  }
+  if (!hasConfigJsonSyncSource(sync)) {
+    return res.status(400).json({
+      ok: false,
+      code: 'config_json_sync_source_required',
+      error: 'loginUrl 和 configUrl 都是必填项'
+    });
+  }
+  const envConfig = appCfg.configJsonEnvironments[environment];
+  envConfig.configJsonSync = sync;
+  if (req.body && req.body.fileName) {
+    envConfig.configJsonFileName = safeConfigJsonFileName(req.body.fileName, `${id}-${environment}`);
+  }
+  const originalEnvironments = originalApp.configJsonEnvironments &&
+    typeof originalApp.configJsonEnvironments === 'object' && !Array.isArray(originalApp.configJsonEnvironments)
+    ? originalApp.configJsonEnvironments
+    : {};
+  c.apps[index] = Object.assign({}, originalApp, {
+    configJsonEnvironments: Object.assign({}, originalEnvironments, {
+      [environment]: envConfig
+    })
+  });
+  const error = validateAppConfigForWebsdk(c.apps[index]);
+  if (error) return res.status(400).json({ ok: false, code: 'invalid_config_json_sync', error });
+  const saved = saveIntegrationConfig(c);
+  res.json({
+    ok: true,
+    environment,
+    version: saved.version,
+    automaticSyncIntervalSeconds: Math.round(CONFIG_JSON_SYNC_INTERVAL_MS / 1000),
+    configJsonSync: integrationConfigJsonSyncView(sync),
+    app: integrationAppView(c.apps[index], environment)
+  });
+});
+
+app.post(integrationRoutes('/apps/:id/config-json-sync/run'), async (req, res) => {
+  req.integrationAction = 'app.config-json-sync.run';
+  const environment = req.integrationEnvironment;
+  const id = String(req.params.id || '').trim();
+  const source = (loadConfig().apps || []).find((item) => item && item.id === id);
+  if (!source) return res.status(404).json({ ok: false, code: 'app_not_found', error: 'app not found' });
+  const appCfg = normalizeAppConfig(source);
+  const sync = appCfg.configJsonEnvironments[environment].configJsonSync;
+  if (!hasConfigJsonSyncSource(sync)) {
+    return res.status(409).json({
+      ok: false,
+      code: 'config_json_sync_not_configured',
+      error: '请先提交 loginUrl、登录凭据和 configUrl'
+    });
+  }
+  const log = await runConfigJsonSyncForApp('integration', id, environment);
+  const result = Array.isArray(log.results) ? log.results[0] : null;
+  const latest = (loadConfig().apps || []).find((item) => item && item.id === id);
+  const latestView = latest ? integrationAppView(latest, environment) : null;
+  const ok = !!result && result.ok === true && result.skipped !== true;
+  res.status(ok ? 200 : 502).json({
+    ok,
+    environment,
+    result,
+    affectedRegionCount: latestView ? latestView.regions.length : 0,
+    affectedRegions: latestView ? latestView.regions.map((regionId) => ({
+      id: regionId,
+      name: latestView.regionNames[regionId] || regionId
+    })) : [],
+    app: latestView
+  });
+});
+
+app.put(integrationRoutes('/apps/:id/config-json'), (req, res) => {
   req.integrationAction = 'app.config-json.put';
+  const environment = req.integrationEnvironment;
   const id = String(req.params.id || '').trim();
   const c = loadConfig();
   const index = (c.apps || []).findIndex((item) => item && item.id === id);
@@ -1389,9 +1824,9 @@ app.put('/api/integration/v1/apps/:id/config-json', (req, res) => {
       error: String(error && error.message || error)
     });
   }
-  const envConfig = appCfg.configJsonEnvironments[INTEGRATION_API_ENVIRONMENT];
+  const envConfig = appCfg.configJsonEnvironments[environment];
   envConfig.configJson = text;
-  envConfig.configJsonFileName = safeConfigJsonFileName(req.body && req.body.fileName, `${id}-test`);
+  envConfig.configJsonFileName = safeConfigJsonFileName(req.body && req.body.fileName, `${id}-${environment}`);
   envConfig.configJsonSyncedAt = new Date().toISOString();
   const originalEnvironments = originalApp.configJsonEnvironments &&
     typeof originalApp.configJsonEnvironments === 'object' && !Array.isArray(originalApp.configJsonEnvironments)
@@ -1399,20 +1834,29 @@ app.put('/api/integration/v1/apps/:id/config-json', (req, res) => {
     : {};
   c.apps[index] = Object.assign({}, originalApp, {
     configJsonEnvironments: Object.assign({}, originalEnvironments, {
-      [INTEGRATION_API_ENVIRONMENT]: envConfig
+      [environment]: envConfig
     })
   });
   const saved = saveIntegrationConfig(c);
+  const updatedApp = integrationAppView(c.apps[index], environment);
   res.json({
     ok: true,
-    environment: INTEGRATION_API_ENVIRONMENT,
+    environment,
     version: saved.version,
-    configJson: configJsonInfo(appCfg, INTEGRATION_API_ENVIRONMENT)
+    configJson: configJsonInfo(appCfg, environment),
+    // configJson 按“应用 + 环境”保存一份；应用关联的全部地区共同读取这份内容。
+    affectedRegionCount: updatedApp.regions.length,
+    affectedRegions: updatedApp.regions.map((regionId) => ({
+      id: regionId,
+      name: updatedApp.regionNames[regionId] || regionId
+    })),
+    app: updatedApp
   });
 });
 
-app.post('/api/integration/v1/apps/:id/resources/import-urls', async (req, res) => {
+app.post(integrationRoutes('/apps/:id/resources/import-urls'), async (req, res) => {
   req.integrationAction = 'app.resources.import-urls';
+  const environment = req.integrationEnvironment;
   const id = String(req.params.id || '').trim();
   const c = loadConfig();
   const index = (c.apps || []).findIndex((item) => item && item.id === id);
@@ -1433,7 +1877,7 @@ app.post('/api/integration/v1/apps/:id/resources/import-urls', async (req, res) 
   }
   const maxResourceKB = integrationMaxResourceKB(req.body && req.body.maxResourceKB);
   const maxResourceBytes = maxResourceKB * 1024;
-  const dir = path.join(bundleRoot(INTEGRATION_API_ENVIRONMENT), id);
+  const dir = path.join(bundleRoot(environment), id);
   fs.mkdirSync(dir, { recursive: true });
   const results = [];
   const inputByUrl = new Map(imports.map((item) => [item.url, item]));
@@ -1448,13 +1892,13 @@ app.post('/api/integration/v1/apps/:id/resources/import-urls', async (req, res) 
   if (!imported.length) {
     return res.status(400).json({ ok: false, imported: 0, failed: results.length, results });
   }
-  applyIntegrationResourceMetadata(appCfg, imported, inputByUrl, 'integration-url-import');
+  applyIntegrationResourceMetadata(appCfg, imported, inputByUrl, 'integration-url-import', environment);
   let manifest;
   try {
     manifest = await runCacheBuilder(
       'manifest',
-      integrationBundleBuilderApp(appCfg),
-      INTEGRATION_API_ENVIRONMENT
+      integrationBundleBuilderApp(appCfg, environment),
+      environment
     );
   } catch (error) {
     return res.status(500).json({
@@ -1469,18 +1913,19 @@ app.post('/api/integration/v1/apps/:id/resources/import-urls', async (req, res) 
   const saved = saveIntegrationConfig(c);
   res.json({
     ok: true,
-    environment: INTEGRATION_API_ENVIRONMENT,
+    environment,
     version: saved.version,
     imported: imported.length,
     failed: results.length - imported.length,
     results,
     manifest,
-    bundle: bundleInfo(id, appCfg, INTEGRATION_API_ENVIRONMENT)
+    bundle: bundleInfo(id, appCfg, environment)
   });
 });
 
-app.post('/api/integration/v1/apps/:id/resources/upload', async (req, res) => {
+app.post(integrationRoutes('/apps/:id/resources/upload'), async (req, res) => {
   req.integrationAction = 'app.resources.upload';
+  const environment = req.integrationEnvironment;
   const id = String(req.params.id || '').trim();
   const c = loadConfig();
   const index = (c.apps || []).findIndex((item) => item && item.id === id);
@@ -1502,7 +1947,7 @@ app.post('/api/integration/v1/apps/:id/resources/upload', async (req, res) => {
   const maxResourceKB = integrationMaxResourceKB(req.body && req.body.maxResourceKB);
   const maxResourceBytes = maxResourceKB * 1024;
   const maxTotalBytes = 12 * 1024 * 1024;
-  const dir = path.join(bundleRoot(INTEGRATION_API_ENVIRONMENT), id);
+  const dir = path.join(bundleRoot(environment), id);
   const prepared = [];
   const inputByUrl = new Map();
   const seenUrls = new Set();
@@ -1548,13 +1993,13 @@ app.post('/api/integration/v1/apps/:id/resources/upload', async (req, res) => {
   fs.mkdirSync(dir, { recursive: true });
   for (const item of prepared) fs.writeFileSync(item.target, item.buf);
   const imported = prepared.map(({ buf, target, ...item }) => item);
-  applyIntegrationResourceMetadata(appCfg, imported, inputByUrl, 'integration-content-upload');
+  applyIntegrationResourceMetadata(appCfg, imported, inputByUrl, 'integration-content-upload', environment);
   let manifest;
   try {
     manifest = await runCacheBuilder(
       'manifest',
-      integrationBundleBuilderApp(appCfg),
-      INTEGRATION_API_ENVIRONMENT
+      integrationBundleBuilderApp(appCfg, environment),
+      environment
     );
   } catch (error) {
     return res.status(500).json({
@@ -1568,17 +2013,271 @@ app.post('/api/integration/v1/apps/:id/resources/upload', async (req, res) => {
   const saved = saveIntegrationConfig(c);
   res.json({
     ok: true,
-    environment: INTEGRATION_API_ENVIRONMENT,
+    environment,
     version: saved.version,
     imported: imported.length,
     totalBytes,
     resources: imported,
     manifest,
-    bundle: bundleInfo(id, appCfg, INTEGRATION_API_ENVIRONMENT)
+    bundle: bundleInfo(id, appCfg, environment)
   });
 });
 
 // 当前登录用户
+const integrationResourceSnapshotLocks = new Set();
+
+app.put(integrationRoutes('/apps/:id/resources/snapshot'), async (req, res) => {
+  req.integrationAction = 'app.resources.snapshot.replace';
+  const environment = req.integrationEnvironment;
+  const id = String(req.params.id || '').trim();
+  if (!/^[A-Za-z0-9_-]+$/.test(id)) {
+    return res.status(400).json({ ok: false, code: 'invalid_app_id', error: 'invalid app id' });
+  }
+  const lockKey = `${environment}:${id}`;
+  if (integrationResourceSnapshotLocks.has(lockKey)) {
+    return res.status(409).json({
+      ok: false,
+      code: 'resource_snapshot_in_progress',
+      error: 'another resource snapshot is being published for this app'
+    });
+  }
+  integrationResourceSnapshotLocks.add(lockKey);
+
+  try {
+    const c = loadConfig();
+    const index = (c.apps || []).findIndex((item) => item && item.id === id);
+    if (index < 0) return res.status(404).json({ ok: false, code: 'app_not_found', error: 'app not found' });
+    const appCfg = normalizeAppConfig(c.apps[index]);
+    const protectedState = integrationProtectedState(appCfg, id);
+    if (protectedState.length) {
+      return res.status(409).json({
+        ok: false,
+        code: 'protected_environment_state',
+        error: 'the app is linked to pre/prod; the test integration API cannot replace shared resources',
+        protectedState
+      });
+    }
+
+    const releaseId = String(req.body && req.body.releaseId || '').trim();
+    if (!/^[A-Za-z0-9._:-]{1,128}$/.test(releaseId)) {
+      return res.status(400).json({
+        ok: false,
+        code: 'invalid_release_id',
+        error: 'releaseId is required and may contain only letters, numbers, dot, underscore, colon, and hyphen'
+      });
+    }
+    const currentRelease = integrationResourceReleaseView(appCfg, environment);
+    if (Object.prototype.hasOwnProperty.call(req.body || {}, 'expectedReleaseId')) {
+      const expectedReleaseId = String(req.body.expectedReleaseId || '').trim();
+      const currentReleaseId = currentRelease ? currentRelease.releaseId : '';
+      if (expectedReleaseId !== currentReleaseId) {
+        return res.status(409).json({
+          ok: false,
+          code: 'resource_release_changed',
+          error: 'the current resource release does not match expectedReleaseId',
+          expectedReleaseId,
+          currentRelease
+        });
+      }
+    }
+
+    const input = req.body && req.body.resources;
+    if (!Array.isArray(input) || input.length === 0) {
+      return res.status(400).json({ ok: false, code: 'resources_required', error: 'resources is required' });
+    }
+    if (input.length > 200) {
+      return res.status(400).json({
+        ok: false,
+        code: 'too_many_resources',
+        error: 'a resource snapshot may contain at most 200 resources'
+      });
+    }
+
+    const maxResourceKB = integrationMaxResourceKB(req.body && req.body.maxResourceKB);
+    const maxResourceBytes = maxResourceKB * 1024;
+    const maxTotalBytes = 10 * 1024 * 1024;
+    const prepared = [];
+    const inputByUrl = new Map();
+    const seenUrls = new Set();
+    const seenFiles = new Map();
+    let totalBytes = 0;
+    try {
+      for (const item of input) {
+        const parsedUrl = new URL(String(item && item.url || '').trim());
+        if (parsedUrl.protocol !== 'http:' && parsedUrl.protocol !== 'https:') {
+          throw new Error('unsupported URL protocol');
+        }
+        const url = parsedUrl.href;
+        if (seenUrls.has(url)) throw new Error(`duplicate resource URL: ${url}`);
+        const encoded = String(item && item.contentBase64 || '').replace(/\s+/g, '');
+        if (!encoded || encoded.length % 4 !== 0 || !/^[A-Za-z0-9+/]*={0,2}$/.test(encoded)) {
+          throw new Error(`invalid base64 content: ${url}`);
+        }
+        const buf = Buffer.from(encoded, 'base64');
+        const canonicalInput = encoded.replace(/=+$/, '');
+        const canonicalDecoded = buf.toString('base64').replace(/=+$/, '');
+        if (!buf.length || canonicalInput !== canonicalDecoded) throw new Error(`invalid base64 content: ${url}`);
+        if (buf.length > maxResourceBytes) throw new Error(`resource exceeds ${maxResourceKB}KB limit: ${url}`);
+        totalBytes += buf.length;
+        if (totalBytes > maxTotalBytes) throw new Error('snapshot exceeds 10MB decoded-content limit');
+        const expectedHash = String(item && item.sha256 || '').trim().toLowerCase();
+        const hash = crypto.createHash('sha256').update(buf).digest('hex');
+        if (expectedHash && (!/^[a-f0-9]{64}$/.test(expectedHash) || expectedHash !== hash)) {
+          throw new Error(`sha256 mismatch: ${url}`);
+        }
+        const file = fileNameForUrl(url);
+        const previousUrl = seenFiles.get(file);
+        if (previousUrl && previousUrl !== url) throw new Error(`resource file collision: ${previousUrl} / ${url}`);
+        const mime = String(item && item.mime || '').split(';')[0].trim().toLowerCase().slice(0, 200) || mimeOfPath(url);
+        prepared.push({ ok: true, url, file, mime, size: buf.length, hash, buf });
+        inputByUrl.set(url, item || {});
+        seenUrls.add(url);
+        seenFiles.set(file, url);
+      }
+    } catch (error) {
+      return res.status(400).json({
+        ok: false,
+        code: 'invalid_resource_snapshot',
+        error: String(error && error.message || error)
+      });
+    }
+
+    const digestEntries = prepared
+      .map((item) => ({
+        url: item.url,
+        sha256: item.hash,
+        size: item.size,
+        mime: item.mime,
+        costMs: Number((inputByUrl.get(item.url) || {}).costMs || 0)
+      }))
+      .sort((a, b) => a.url.localeCompare(b.url));
+    const digest = crypto.createHash('sha256').update(stableJson(digestEntries)).digest('hex');
+    if (currentRelease && currentRelease.releaseId === releaseId && currentRelease.digest && currentRelease.digest !== digest) {
+      return res.status(409).json({
+        ok: false,
+        code: 'resource_release_conflict',
+        error: 'the same releaseId cannot be reused for different resource content',
+        currentRelease
+      });
+    }
+
+    const publishedAt = new Date().toISOString();
+    const release = {
+      releaseId,
+      digest,
+      publishedAt,
+      resourceCount: prepared.length,
+      totalBytes
+    };
+    const nextAppCfg = normalizeAppConfig(appCfg);
+    const imported = prepared.map(({ buf, ...item }) => item);
+    applyIntegrationResourceSnapshotMetadata(nextAppCfg, imported, inputByUrl, release, environment);
+
+    const environmentRoot = bundleRoot(environment);
+    const targetDir = safeBundlePath(environmentRoot, id);
+    if (!targetDir) {
+      return res.status(400).json({ ok: false, code: 'invalid_app_id', error: 'invalid bundle target' });
+    }
+    const workId = `${process.pid}-${Date.now()}-${crypto.randomBytes(4).toString('hex')}`;
+    const stagingRoot = path.join(environmentRoot, `.${id}.snapshot-stage-${workId}`);
+    const stagingDir = path.join(stagingRoot, id);
+    const backupDir = path.join(environmentRoot, `.${id}.snapshot-backup-${workId}`);
+    const oldManifestFile = path.join(targetDir, 'manifest.json');
+    const oldManifestUrls = fs.existsSync(oldManifestFile)
+      ? readJsonArray(oldManifestFile).map((item) => String(item && item.url || '')).filter(Boolean)
+      : integrationResourceConfig(appCfg, environment).bundleExtraUrls;
+    const nextUrls = new Set(imported.map((item) => item.url));
+    const removedResources = Array.from(new Set(oldManifestUrls)).filter((url) => !nextUrls.has(url));
+
+    let manifest;
+    try {
+      fs.mkdirSync(stagingDir, { recursive: true });
+      for (const item of prepared) {
+        const target = safeBundlePath(stagingDir, item.file);
+        if (!target) throw new Error(`bad target file: ${item.url}`);
+        fs.writeFileSync(target, item.buf);
+      }
+      manifest = await runCacheBuilder(
+        'manifest',
+        integrationBundleBuilderApp(nextAppCfg, environment),
+        environment,
+        stagingRoot
+      );
+      if (Number(manifest && manifest.count) !== prepared.length || Number(manifest && manifest.skippedByBudget || 0) > 0) {
+        const incomplete = new Error('the complete snapshot does not fit the bundle budget');
+        incomplete.code = 'resource_snapshot_incomplete';
+        throw incomplete;
+      }
+    } catch (error) {
+      try { removeIntegrationBundleWorkPath(environmentRoot, stagingRoot); } catch {}
+      return res.status(error && error.code === 'resource_snapshot_incomplete' ? 422 : 500).json({
+        ok: false,
+        code: error && error.code || 'resource_snapshot_build_failed',
+        error: String(error && error.message || error),
+        currentRelease
+      });
+    }
+
+    let hadPreviousBundle = false;
+    let publishedBundle = false;
+    let saved;
+    try {
+      if (fs.existsSync(targetDir)) {
+        fs.renameSync(targetDir, backupDir);
+        hadPreviousBundle = true;
+      }
+      fs.renameSync(stagingDir, targetDir);
+      publishedBundle = true;
+      c.apps[index] = nextAppCfg;
+      saved = saveIntegrationConfig(c);
+    } catch (error) {
+      let rollbackError = null;
+      try {
+        if (publishedBundle && fs.existsSync(targetDir)) {
+          removeIntegrationBundleWorkPath(environmentRoot, targetDir);
+        }
+        if (hadPreviousBundle && fs.existsSync(backupDir)) fs.renameSync(backupDir, targetDir);
+      } catch (rollbackFailure) {
+        rollbackError = String(rollbackFailure && rollbackFailure.message || rollbackFailure);
+      }
+      try { removeIntegrationBundleWorkPath(environmentRoot, stagingRoot); } catch {}
+      return res.status(500).json({
+        ok: false,
+        code: 'resource_snapshot_publish_failed',
+        error: String(error && error.message || error),
+        rollbackError
+      });
+    }
+
+    try {
+      if (hadPreviousBundle && fs.existsSync(backupDir)) {
+        removeIntegrationBundleWorkPath(environmentRoot, backupDir);
+      }
+      if (fs.existsSync(stagingRoot)) removeIntegrationBundleWorkPath(environmentRoot, stagingRoot);
+    } catch (cleanupError) {
+      console.warn('[integration] resource snapshot cleanup failed:', cleanupError && cleanupError.message || cleanupError);
+    }
+
+    res.json({
+      ok: true,
+      operation: 'replaced',
+      environment,
+      version: saved.version,
+      release,
+      previousReleaseId: currentRelease ? currentRelease.releaseId : '',
+      imported: imported.length,
+      removed: removedResources.length,
+      removedResources,
+      totalBytes,
+      resources: imported,
+      manifest,
+      bundle: bundleInfo(id, nextAppCfg, environment)
+    });
+  } finally {
+    integrationResourceSnapshotLocks.delete(lockKey);
+  }
+});
+
 app.get('/api/admin/me', (req, res) => res.json({ username: req.user }));
 
 // DB(MySQL)状态:联调验证用 —— 连上没、votes 表多少行
@@ -2095,7 +2794,7 @@ async function syncConfigJsonForApp(appCfg, requestedEnvironment) {
 }
 
 // 独立任务：每个 app/environment 单独轮询，不能被其它站点的慢请求阻塞。
-async function runConfigJsonSyncTargetOnce(appId, environment) {
+async function runConfigJsonSyncTargetOnce(appId, environment, preserveUnrelatedApps = false) {
   const key = `${environment}:${appId}`;
   if (configJsonSyncKeys.has(key)) {
     return {
@@ -2148,7 +2847,8 @@ async function runConfigJsonSyncTargetOnce(appId, environment) {
       // 成功拉取后无论内容是否变化都刷新时间，方便运营确认「已经刷过」。
       envConfig.configJsonSyncedAt = checkedAt;
       latest.apps[idx] = normalized;
-      saveConfig(latest);
+      if (preserveUnrelatedApps) saveIntegrationConfig(latest);
+      else saveConfig(latest);
       item.regionsCount = Array.isArray(normalized.regions) ? normalized.regions.length : 0;
     }
     item.bytes = synced.bytes;
@@ -2166,11 +2866,12 @@ async function runConfigJsonSyncTargetOnce(appId, environment) {
 }
 
 async function runConfigJsonSyncTarget(trigger, appId, environment) {
-  let last = await runConfigJsonSyncTargetOnce(appId, environment);
+  const preserveUnrelatedApps = trigger === 'integration';
+  let last = await runConfigJsonSyncTargetOnce(appId, environment, preserveUnrelatedApps);
   if (!shouldRetryConfigJsonSyncItem(last)) return last;
   for (let attempt = 2; attempt <= 1 + CONFIG_JSON_SYNC_TARGET_RETRIES; attempt++) {
     await sleep(1000 * (attempt - 1));
-    last = await runConfigJsonSyncTargetOnce(appId, environment);
+    last = await runConfigJsonSyncTargetOnce(appId, environment, preserveUnrelatedApps);
     if (!shouldRetryConfigJsonSyncItem(last)) {
       if (last.ok && !last.skipped) {
         last.detail = `${last.detail}（第 ${attempt} 次自动拉取成功）`;

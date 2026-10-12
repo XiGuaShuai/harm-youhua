@@ -1,5 +1,5 @@
 <script setup>
-import { ref, onMounted, computed, watch } from 'vue';
+import { ref, onMounted, onBeforeUnmount, computed, watch } from 'vue';
 import { storeToRefs } from 'pinia';
 import { useRouter } from 'vue-router';
 import { ElMessage, ElMessageBox } from 'element-plus';
@@ -21,7 +21,6 @@ const { apps } = storeToRefs(store);
 
 const dialog = ref(false);
 const editing = ref(null);
-const activeGroup = ref('top');
 const activeDialogTab = ref('base');
 const appQuery = ref('');
 const groupQuery = ref('');
@@ -29,8 +28,10 @@ const pathLocked = adminViewLocked();
 const pathShowsAll = adminShowsAll();
 // 地区名称按业务后台真实 ID 解析。美国/加拿大等在测试、预发、正式是三套不同 ID，显示时必须带环境后缀。
 const viewEnvironment = ref(defaultViewEnvironment());
-// 测试环境由集成 API 维护业务数据，管理页仅保留下发开关和只读状态入口。
-const testDeliveryOnly = computed(() => !pathShowsAll && viewEnvironment.value === 'test');
+// 分环境入口统一使用简洁的只读状态与下发控制布局；测试环境另外支持集成 API 托管。
+const managedEnvironmentView = computed(() => pathLocked);
+const testIntegrationView = computed(() => managedEnvironmentView.value && viewEnvironment.value === 'test');
+const activeGroup = ref(managedEnvironmentView.value ? 'all' : 'top');
 const activeConfigEnvironment = ref('test');
 const activeConfigEnvironmentName = computed(() =>
   CONFIG_ENVIRONMENT_OPTIONS.find((item) => item.id === activeConfigEnvironment.value)?.name || activeConfigEnvironment.value
@@ -39,6 +40,8 @@ const form = ref(emptyForm());
 const detecting = ref(false);
 
 const bundleMap = ref({});
+let bundleLoadTimer = 0;
+let bundleLoadSequence = 0;
 
 function emptyConfigEnvironment() {
   return {
@@ -170,8 +173,10 @@ function viewRegionIdsOf(row, environment = viewEnvironment.value) {
 
 function appInViewEnvironment(app, environment = viewEnvironment.value) {
   if (pathShowsAll) return true;
+  if (environment === 'test' && app?.integrationManaged === true) return true;
   const environments = Array.isArray(app?.bundleEnvironments) ? app.bundleEnvironments : [];
-  return environments.includes(environment);
+  if (environments.includes(environment)) return true;
+  return !!String(configEnvironmentsOf(app)[environment]?.configJson || '').trim();
 }
 
 function regionNamesOf(row) {
@@ -211,9 +216,63 @@ const regionOptions = computed(() => {
     .sort((a, b) => String(a.name).localeCompare(String(b.name)));
 });
 
+function manifestBundle(app, environment, manifest, headers = {}) {
+  const resources = (Array.isArray(manifest) ? manifest : []).map((item) => ({
+    ...item,
+    storedFile: item.file,
+    storedSize: Number(item.size || 0),
+    storedSizeKB: Math.round(Number(item.size || 0) / 102.4) / 10,
+    enabled: true,
+    inManifest: true
+  }));
+  const sizeBytes = resources.reduce((total, item) => total + Number(item.size || 0), 0);
+  return {
+    id: app.id,
+    environment,
+    count: resources.length,
+    sizeBytes,
+    sizeKB: Math.round(sizeBytes / 102.4) / 10,
+    builtAt: headers['last-modified'] || new Date().toISOString(),
+    manifestUrl: `/${environment}/bundles/${app.id}/manifest.json`,
+    resources
+  };
+}
+
+async function loadTestBundleManifests(sequence) {
+  const environment = viewEnvironment.value;
+  const candidates = environmentApps.value.filter((app) =>
+    Array.isArray(app?.bundleEnvironments) && app.bundleEnvironments.includes(environment)
+  );
+  const next = {};
+  let cursor = 0;
+  const worker = async () => {
+    while (cursor < candidates.length) {
+      const app = candidates[cursor++];
+      try {
+        const response = await api.get(`/${environment}/bundles/${encodeURIComponent(app.id)}/manifest.json`);
+        if (sequence !== bundleLoadSequence) return;
+        next[app.id] = manifestBundle(app, environment, response.data, response.headers);
+        bundleMap.value = { ...next };
+      } catch (error) {
+        if (error.response?.status !== 404) throw error;
+      }
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(6, candidates.length) }, () => worker()));
+  if (sequence === bundleLoadSequence) bundleMap.value = { ...next };
+}
+
 async function loadBundles() {
+  const sequence = ++bundleLoadSequence;
   try {
-    const responses = await Promise.all(CONFIG_ENVIRONMENT_OPTIONS.map(({ id }) =>
+    if (managedEnvironmentView.value) {
+      await loadTestBundleManifests(sequence);
+      return;
+    }
+    const environments = pathShowsAll
+      ? CONFIG_ENVIRONMENT_OPTIONS.map(({ id }) => id)
+      : [viewEnvironment.value];
+    const responses = await Promise.all(environments.map((id) =>
       api.get('/api/admin/bundles', { params: { environment: id } })
     ));
     const m = {};
@@ -221,22 +280,36 @@ async function loadBundles() {
       (data || []).forEach((b) => {
         if (!b.builtAt) return;
         const app = apps.value.find((item) => item.id === b.id);
-        if (app && bundleEnvironmentOf(app) === b.environment) m[b.id] = b;
+        if (app && (!pathShowsAll || bundleEnvironmentOf(app) === b.environment)) m[b.id] = b;
       });
     });
-    bundleMap.value = m;
+    if (sequence === bundleLoadSequence) bundleMap.value = m;
   } catch (e) {
-    ElMessage.warning('离线包状态刷新失败');
+    if (sequence === bundleLoadSequence) ElMessage.warning('离线资源状态刷新失败');
   }
 }
 
-onMounted(loadBundles);
+function scheduleBundleLoad(delay = 120) {
+  if (bundleLoadTimer) window.clearTimeout(bundleLoadTimer);
+  bundleLoadTimer = window.setTimeout(loadBundles, delay);
+}
+
+onMounted(() => scheduleBundleLoad());
+onBeforeUnmount(() => {
+  if (bundleLoadTimer) window.clearTimeout(bundleLoadTimer);
+  bundleLoadSequence++;
+});
+
+watch(() => apps.value.length, (count, previous) => {
+  if (count && count !== previous) scheduleBundleLoad(40);
+});
 
 watch(viewEnvironment, (environment) => {
   activeConfigEnvironment.value = environment;
   if (!groupList.value.some((group) => group.key === activeGroup.value)) {
     activeGroup.value = 'top';
   }
+  scheduleBundleLoad(40);
 });
 
 function groupOf(row) {
@@ -247,6 +320,7 @@ function groupOf(row) {
 }
 
 function appInGroup(app, groupKey) {
+  if (groupKey === 'all') return true;
   if (groupKey === 'top') return (app?.scope || 'top') !== 'region';
   if (!groupKey?.startsWith('region:') || app?.scope !== 'region') return false;
   return viewRegionIdsOf(app).includes(groupKey.slice('region:'.length));
@@ -262,15 +336,23 @@ const groupList = computed(() => {
     if ((app.scope || 'top') !== 'region') return;
     viewRegionIdsOf(app).forEach((id) => regionMap.set(id, regionMetaOf(app, id)));
   });
-  const groups = [
-    {
-      key: 'top',
-      name: 'TOP 常驻',
-      desc: 'SDK 初始化后自动下载并长期保留',
+  const groups = [];
+  if (managedEnvironmentView.value) {
+    groups.push({
+      key: 'all',
+      name: '全部应用',
+      desc: `当前${environmentLabel(viewEnvironment.value)}环境的全部应用`,
       id: '',
-      count: environmentApps.value.filter((a) => (a.scope || 'top') !== 'region').length
-    }
-  ];
+      count: environmentApps.value.length
+    });
+  }
+  groups.push({
+    key: 'top',
+    name: 'TOP 常驻',
+    desc: 'SDK 初始化后自动下载并长期保留',
+    id: '',
+    count: environmentApps.value.filter((a) => (a.scope || 'top') !== 'region').length
+  });
   Array.from(regionMap.entries()).sort((a, b) => String(a[1].shortTitle).localeCompare(String(b[1].shortTitle))).forEach(([id, meta]) => {
     groups.push({
       key: `region:${id}`,
@@ -282,6 +364,13 @@ const groupList = computed(() => {
   });
   return groups;
 });
+
+// 当前环境没有 TOP 应用时，自动选中第一个有应用的地区，避免概览有应用而管理页看起来为空。
+watch(groupList, (groups) => {
+  const current = groups.find((group) => group.key === activeGroup.value);
+  if (current && current.count > 0) return;
+  activeGroup.value = groups.find((group) => group.count > 0)?.key || 'top';
+}, { immediate: true });
 
 const activeGroupInfo = computed(() => groupList.value.find((g) => g.key === activeGroup.value) || groupList.value[0]);
 const visibleGroupList = computed(() => {
@@ -314,7 +403,7 @@ const summary = computed(() => {
   environmentApps.value.forEach((app) => {
     if ((app.scope || 'top') === 'region') viewRegionIdsOf(app).forEach((id) => regionSet.add(id));
     if (packDeliveringInView(app)) bundleEnabled++;
-    if (hasAnyConfigJson(app)) jsonCount++;
+    if (String(configEnvironmentsOf(app)[viewEnvironment.value]?.configJson || '').trim()) jsonCount++;
     if (packDeliveringInView(app) && bundleMap.value[app.id]) readyCount++;
   });
   return {
@@ -601,6 +690,13 @@ function bundleSizeText(row) {
 
 function configTag(row) {
   const environments = configEnvironmentsOf(row);
+  if (!pathShowsAll) {
+    const text = environments[viewEnvironment.value].configJson;
+    if (!text) return { type: 'info', text: '未上传' };
+    return inspectConfigJson(text, row.url).ok
+      ? { type: 'success', text: '已上传' }
+      : { type: 'danger', text: 'JSON 异常' };
+  }
   let valid = 0;
   let invalid = 0;
   CONFIG_ENVIRONMENT_OPTIONS.forEach(({ id }) => {
@@ -745,7 +841,8 @@ const syncingJson = ref('');
 const pausing = ref('');
 
 function packConfiguredInView(row, environment = viewEnvironment.value) {
-  return !!row?.bundle && appInViewEnvironment(row, environment);
+  const environments = Array.isArray(row?.bundleEnvironments) ? row.bundleEnvironments : [];
+  return !!row?.bundle && environments.includes(environment);
 }
 
 function packPausedInView(row, environment = viewEnvironment.value) {
@@ -778,17 +875,12 @@ async function toggleBundlePause(row, paused) {
     return;
   }
   const envName = CONFIG_ENVIRONMENT_OPTIONS.find((item) => item.id === viewEnvironment.value)?.name || viewEnvironment.value;
-  if (paused) {
-    await ElMessageBox.confirm(
-      `暂停后，${envName}环境设备不再下载和命中「${row.name || row.id}」的离线包。服务器上的包文件保留，可随时恢复。`,
-      `暂停${envName}环境离线包`,
-      { type: 'warning', confirmButtonText: '暂停下发', cancelButtonText: '取消' }
-    );
-  }
   pausing.value = row.id;
   try {
     await store.pauseBundle(row.id, viewEnvironment.value, paused);
-    ElMessage.success(paused ? `已暂停${envName}环境离线包下发` : `已恢复${envName}环境离线包下发`);
+    if (!managedEnvironmentView.value) {
+      ElMessage.success(paused ? `已暂停${envName}环境离线包下发` : `已恢复${envName}环境离线包下发`);
+    }
   } catch (e) {
     if (e === 'cancel' || e === 'close') return;
     ElMessage.error((paused ? '暂停失败:' : '恢复失败:') + (e.response?.data?.error || e.message));
@@ -903,40 +995,33 @@ async function syncConfigJson(row) {
 </script>
 
 <template>
-  <div class="apps-page">
-    <div class="page-head">
+  <div class="apps-page" :class="{ 'managed-apps-page': managedEnvironmentView }">
+    <div class="page-head" :class="{ 'managed-page-head': managedEnvironmentView }">
       <div>
-        <div class="eyebrow">WebAccel 配置</div>
-        <h2>应用管理</h2>
+        <div class="eyebrow">{{ managedEnvironmentView ? environmentLabel(viewEnvironment) : 'WebAccel 配置' }}</div>
+        <h2>{{ managedEnvironmentView ? '应用与离线资源下发' : '应用管理' }}</h2>
         <p v-if="pathShowsAll">备份总览：显示全部应用和三个环境状态。按环境查看请用 /test、/pre、/prod。</p>
-        <p v-else-if="testDeliveryOnly">测试应用由接口自动维护；网页只展示状态并控制是否下发离线资源。</p>
+        <p v-else-if="managedEnvironmentView">
+          {{ testIntegrationView ? '测试应用由接口自动维护；' : '' }}网页只展示{{ environmentLabel(viewEnvironment) }}环境状态并控制是否下发离线资源。
+        </p>
         <p v-else-if="pathLocked">当前只显示{{ environmentLabel(viewEnvironment) }}环境已配置的应用和地区。</p>
         <p v-else>测试、预发、正式分开查看。当前只显示该环境已启用的应用和地区。</p>
       </div>
       <div class="head-actions">
         <el-tag v-if="pathShowsAll" type="warning" effect="plain">备份总览</el-tag>
-        <el-tag v-else-if="pathLocked" type="warning" effect="plain">{{ environmentLabel(viewEnvironment) }}环境</el-tag>
-        <el-radio-group v-else v-model="viewEnvironment" size="default" class="env-switch">
+        <el-tag v-else-if="pathLocked && !managedEnvironmentView" type="warning" effect="plain">{{ environmentLabel(viewEnvironment) }}环境</el-tag>
+        <el-radio-group v-if="!pathShowsAll && !pathLocked" v-model="viewEnvironment" size="default" class="env-switch">
           <el-radio-button v-for="option in CONFIG_ENVIRONMENT_OPTIONS" :key="option.id" :label="option.id">
             {{ option.name }}
           </el-radio-button>
         </el-radio-group>
         <el-input v-model="appQuery" class="search-input" clearable :prefix-icon="Search" placeholder="搜索 ID / 名称 / URL" />
         <el-button :icon="Refresh" @click="loadBundles">刷新状态</el-button>
-        <el-button v-if="!testDeliveryOnly" type="primary" :icon="Plus" @click="openAdd">新增网址</el-button>
+        <el-button v-if="!managedEnvironmentView" type="primary" :icon="Plus" @click="openAdd">新增网址</el-button>
       </div>
     </div>
 
-    <el-alert
-      v-if="testDeliveryOnly"
-      type="info"
-      :closable="false"
-      show-icon
-      title="测试环境采用接口托管"
-      description="应用、地区、JSON 和离线资源由接口上传更新；需要人工操作时，只切换应用是否向设备下发离线资源。"
-    />
-
-    <div class="summary-grid">
+    <div class="summary-grid" :class="{ 'managed-summary-grid': managedEnvironmentView }">
       <div class="summary-item">
         <span>应用总数</span>
         <b>{{ summary.total }}</b>
@@ -959,7 +1044,108 @@ async function syncConfigJson(row) {
       </div>
     </div>
 
-    <div class="region-layout">
+    <template v-if="managedEnvironmentView">
+      <section class="managed-apps-shell">
+        <div class="managed-group-bar">
+          <div class="managed-group-scroll">
+            <button
+              v-for="group in groupList.filter((item) => item.count > 0)"
+              :key="group.key"
+              class="managed-group-chip"
+              :class="{ active: activeGroup === group.key }"
+              @click="activeGroup = group.key"
+            >
+              <span>{{ group.name }}</span>
+              <b>{{ group.count }}</b>
+            </button>
+          </div>
+          <span class="managed-result-count">当前显示 {{ filteredApps.length }} 个应用</span>
+        </div>
+
+        <div v-if="filteredApps.length" class="managed-app-grid">
+          <article v-for="row in filteredApps" :key="row.id" class="managed-app-card">
+            <div class="managed-app-head">
+              <div class="managed-app-identity">
+                <span class="managed-app-mark">{{ String(row.name || row.id).slice(0, 1).toUpperCase() }}</span>
+                <div>
+                  <div class="managed-app-name">
+                    <b>{{ row.name || row.id }}</b>
+                    <span class="managed-app-id">{{ row.id }}</span>
+                  </div>
+                  <a :href="row.url" target="_blank" rel="noreferrer" class="managed-app-url">{{ row.url }}</a>
+                </div>
+              </div>
+              <span v-if="packPausedInView(row)" class="managed-status is-paused"><i></i>已暂停</span>
+              <span v-else-if="bundleOf(row)" class="managed-status is-active"><i></i>下发中</span>
+              <span v-else class="managed-status is-waiting"><i></i>等待资源</span>
+            </div>
+
+            <div class="managed-app-meta">
+              <div class="managed-meta-item">
+                <span class="managed-meta-icon is-region">地</span>
+                <div class="managed-meta-copy">
+                  <span>适用地区</span>
+                  <div v-if="row.scope === 'region'" class="region-tags">
+                    <el-tag v-for="item in visibleRegions(row)" :key="item.id" size="small" type="success" effect="plain">
+                      {{ item.name }}
+                    </el-tag>
+                    <el-tooltip v-if="hiddenRegionCount(row)" :content="regionTooltip(row)" placement="top">
+                      <el-tag size="small" type="info" effect="plain">+{{ hiddenRegionCount(row) }}</el-tag>
+                    </el-tooltip>
+                  </div>
+                  <el-tag v-else size="small" type="info" effect="plain">TOP 常驻</el-tag>
+                </div>
+              </div>
+              <div class="managed-meta-item">
+                <span class="managed-meta-icon is-json">{ }</span>
+                <div class="managed-meta-copy">
+                  <span>配置 JSON</span>
+                  <el-tag size="small" :type="configTag(row).type" effect="plain">{{ configTag(row).text }}</el-tag>
+                </div>
+              </div>
+              <div class="managed-meta-item">
+                <span class="managed-meta-icon is-bundle">包</span>
+                <div class="managed-meta-copy">
+                  <span>离线资源</span>
+                  <b v-if="bundleOf(row)">
+                    {{ bundleOf(row).count }} 个资源{{ bundleSizeText(row) === '-' ? '' : ` · ${bundleSizeText(row)}` }}
+                  </b>
+                  <b v-else>尚未上传</b>
+                </div>
+              </div>
+            </div>
+
+            <div class="managed-app-foot">
+              <div class="managed-delivery-control" :class="{ 'is-enabled': packDeliveringInView(row) }">
+                <div class="managed-delivery-copy">
+                  <i></i>
+                  <div>
+                    <b>离线资源下发</b>
+                    <span>{{ packDeliveringInView(row) ? `${environmentLabel(viewEnvironment)}设备可以获取并使用当前资源` : `当前不会向${environmentLabel(viewEnvironment)}设备下发资源` }}</span>
+                  </div>
+                </div>
+                <el-switch
+                  v-if="packConfiguredInView(row)"
+                  class="managed-delivery-switch"
+                  :model-value="packDeliveringInView(row)"
+                  :loading="pausing === row.id"
+                  :disabled="rowBusy(row)"
+                  inline-prompt
+                  active-text="开"
+                  inactive-text="停"
+                  @change="(enabled) => toggleBundlePause(row, !enabled)"
+                />
+                <el-tag v-else size="small" type="info" effect="plain">未配置</el-tag>
+              </div>
+              <el-button type="primary" plain :icon="Box" @click="openBundle(row)">查看离线资源</el-button>
+            </div>
+          </article>
+        </div>
+        <el-empty v-else :description="`当前分组没有匹配的${environmentLabel(viewEnvironment)}应用`" :image-size="90" />
+      </section>
+    </template>
+
+    <div v-else class="region-layout">
       <aside class="region-pane">
         <div class="pane-title-row">
           <div>
@@ -1068,11 +1254,11 @@ async function syncConfigJson(row) {
               </div>
             </template>
           </el-table-column>
-          <el-table-column label="操作" :width="testDeliveryOnly ? 120 : 360" fixed="right">
+          <el-table-column label="操作" :width="managedEnvironmentView ? 120 : 360" fixed="right">
             <template #default="{ row }">
               <div class="op-row compact-actions">
-                <el-button size="small" type="primary" plain :icon="Box" @click="openBundle(row)">{{ testDeliveryOnly ? '查看资源' : '资源' }}</el-button>
-                <template v-if="!testDeliveryOnly">
+                <el-button size="small" type="primary" plain :icon="Box" @click="openBundle(row)">{{ managedEnvironmentView ? '查看资源' : '资源' }}</el-button>
+                <template v-if="!managedEnvironmentView">
                   <el-button
                     size="small"
                     type="warning"
@@ -1106,7 +1292,7 @@ async function syncConfigJson(row) {
       </section>
     </div>
 
-    <el-dialog v-if="!testDeliveryOnly" v-model="dialog" :title="editing ? '编辑网址应用' : '新增网址应用'" width="960px" destroy-on-close>
+    <el-dialog v-if="!managedEnvironmentView" v-model="dialog" :title="editing ? '编辑网址应用' : '新增网址应用'" width="960px" destroy-on-close>
       <div class="dialog-head">
         <div>
           <b>{{ form.name || form.id || '未命名应用' }}</b>
@@ -1350,6 +1536,19 @@ async function syncConfigJson(row) {
   color: #747b8f;
   font-size: 13px;
 }
+.managed-page-head {
+  align-items: center;
+  padding: 16px 20px;
+  border-color: #e9ecf4;
+  background: #fff;
+  box-shadow: 0 4px 16px rgba(31, 36, 51, .035);
+}
+.managed-page-head h2 {
+  font-size: 19px;
+}
+.managed-apps-page {
+  gap: 14px;
+}
 .head-actions {
   display: flex;
   align-items: center;
@@ -1396,6 +1595,332 @@ async function syncConfigJson(row) {
   margin-top: 8px;
   font-size: 24px;
   line-height: 1;
+}
+.managed-summary-grid {
+  gap: 8px;
+}
+.managed-summary-grid .summary-item {
+  min-height: 64px;
+  padding: 12px 15px;
+  border-radius: 10px;
+  box-shadow: none;
+}
+.managed-summary-grid .summary-item::before {
+  width: 2px;
+}
+.managed-summary-grid .summary-item b {
+  margin-top: 5px;
+  font-size: 20px;
+}
+.managed-apps-shell {
+  padding: 14px;
+  border: 1px solid #e8eaf2;
+  border-radius: 18px;
+  background: #fff;
+  box-shadow: 0 12px 34px rgba(30, 38, 72, .05);
+}
+.managed-group-bar {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 0 2px 14px;
+  border-bottom: 1px solid #edf0f6;
+}
+.managed-group-scroll {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  min-width: 0;
+  padding: 2px;
+}
+.managed-group-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  flex: none;
+  height: 36px;
+  padding: 0 12px;
+  border: 1px solid #e2e6f0;
+  border-radius: 10px;
+  color: #5d6476;
+  background: #fff;
+  cursor: pointer;
+}
+.managed-group-chip b {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 21px;
+  height: 21px;
+  padding: 0 6px;
+  border-radius: 999px;
+  color: #697086;
+  background: #f0f2f7;
+  font-size: 11px;
+}
+.managed-group-chip:hover,
+.managed-group-chip.active {
+  border-color: #7d86e7;
+  color: #4651c8;
+  background: #f2f3ff;
+}
+.managed-group-chip.active b {
+  color: #fff;
+  background: #5964dc;
+}
+.managed-result-count {
+  flex: none;
+  padding-top: 10px;
+  color: #8a90a2;
+  font-size: 12px;
+}
+.managed-app-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(460px, 1fr));
+  gap: 12px;
+  margin-top: 14px;
+}
+.managed-app-card {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  border: 1px solid #e5e8f1;
+  border-radius: 16px;
+  background: #fff;
+  box-shadow: 0 4px 14px rgba(31, 41, 85, .04);
+  overflow: hidden;
+  transition: border-color .18s ease, box-shadow .18s ease, transform .18s ease;
+}
+.managed-app-card:hover {
+  border-color: #cfd4f5;
+  box-shadow: 0 12px 30px rgba(57, 65, 147, .09);
+  transform: translateY(-1px);
+}
+.managed-app-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 14px;
+  padding: 15px;
+}
+.managed-app-identity,
+.managed-app-name,
+.managed-delivery-control {
+  display: flex;
+  align-items: center;
+}
+.managed-app-identity {
+  min-width: 0;
+  gap: 12px;
+}
+.managed-app-mark {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: none;
+  width: 44px;
+  height: 44px;
+  border-radius: 13px;
+  color: #fff;
+  background: linear-gradient(135deg, #5964dc, #8b5cf6);
+  box-shadow: 0 8px 18px rgba(89, 100, 220, .22);
+  font-size: 18px;
+  font-weight: 800;
+}
+.managed-app-name {
+  gap: 7px;
+  min-width: 0;
+}
+.managed-app-name b {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: #252a3a;
+  font-size: 16px;
+}
+.managed-app-id {
+  display: inline-flex;
+  align-items: center;
+  height: 22px;
+  padding: 0 8px;
+  border: 1px solid #e2e5ee;
+  border-radius: 6px;
+  color: #7c8397;
+  background: #f8f9fc;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 11px;
+}
+.managed-app-url {
+  display: block;
+  max-width: 360px;
+  margin-top: 5px;
+  overflow: hidden;
+  color: #8a90a2;
+  font-size: 12px;
+  text-decoration: none;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.managed-app-url:hover {
+  color: #4f5bd5;
+}
+.managed-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  flex: none;
+  height: 28px;
+  padding: 0 10px;
+  border-radius: 999px;
+  font-size: 12px;
+  font-weight: 600;
+}
+.managed-status i {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+}
+.managed-status.is-active {
+  color: #159447;
+  background: #eefaf1;
+}
+.managed-status.is-active i {
+  background: #22b455;
+  box-shadow: 0 0 0 4px rgba(34, 180, 85, .12);
+}
+.managed-status.is-paused {
+  color: #b36b00;
+  background: #fff7e9;
+}
+.managed-status.is-paused i {
+  background: #f3a11a;
+}
+.managed-status.is-waiting {
+  color: #7b8190;
+  background: #f3f4f7;
+}
+.managed-status.is-waiting i {
+  background: #a7adba;
+}
+.managed-app-meta {
+  display: grid;
+  grid-template-columns: 1.15fr .8fr 1fr;
+  gap: 10px;
+  padding: 0 15px 15px;
+}
+.managed-meta-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+  min-height: 64px;
+  padding: 11px 12px;
+  border: 1px solid #eef0f5;
+  border-radius: 12px;
+  background: #fafbfc;
+}
+.managed-meta-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: none;
+  width: 32px;
+  height: 32px;
+  border-radius: 9px;
+  font-size: 11px;
+  font-weight: 700;
+}
+.managed-meta-icon.is-region {
+  color: #18895d;
+  background: #e9f8f1;
+}
+.managed-meta-icon.is-json {
+  color: #4f5bd5;
+  background: #eef0ff;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+.managed-meta-icon.is-bundle {
+  color: #b06b0a;
+  background: #fff4e2;
+}
+.managed-meta-copy {
+  min-width: 0;
+}
+.managed-meta-copy > span {
+  display: block;
+  margin-bottom: 6px;
+  color: #969cad;
+  font-size: 11px;
+}
+.managed-meta-copy > b {
+  display: block;
+  overflow: hidden;
+  color: #343a4e;
+  font-size: 13px;
+  font-weight: 650;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.managed-app-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  padding: 11px 15px;
+  border-top: 1px solid #eef0f5;
+  background: #fbfcfe;
+}
+.managed-delivery-control {
+  justify-content: space-between;
+  gap: 18px;
+  min-width: 360px;
+  padding: 8px 10px;
+  border: 1px solid #e7eaf1;
+  border-radius: 11px;
+  background: #fff;
+  transition: border-color .18s ease, background .18s ease;
+}
+.managed-delivery-control.is-enabled {
+  border-color: #d8eadf;
+  background: #f8fcf9;
+}
+.managed-delivery-copy {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+}
+.managed-delivery-copy > i {
+  flex: none;
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  background: #b8bdc9;
+}
+.managed-delivery-control.is-enabled .managed-delivery-copy > i {
+  background: #21ad52;
+  box-shadow: 0 0 0 4px rgba(33, 173, 82, .11);
+}
+.managed-delivery-copy b,
+.managed-delivery-copy span {
+  display: block;
+}
+.managed-delivery-copy b {
+  color: #353b4e;
+  font-size: 12px;
+}
+.managed-delivery-copy span {
+  margin-top: 3px;
+  overflow: hidden;
+  color: #969cad;
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.managed-delivery-switch {
+  flex: none;
 }
 .region-layout {
   display: grid;
@@ -1694,6 +2219,9 @@ async function syncConfigJson(row) {
   font-size: 12px;
 }
 @media (max-width: 1100px) {
+  .managed-app-grid {
+    grid-template-columns: 1fr;
+  }
   .summary-grid {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
