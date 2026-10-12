@@ -52,6 +52,11 @@ test('isolates config overlays and offline bundles by environment', async (t) =>
       scope: 'top',
       bundle: true,
       bundleEnvironments: ['test', 'prod'],
+      bundleExtraUrls: ['https://legacy.example/stale.js'],
+      bundleResourceEnvironments: {
+        test: { bundleExtraUrls: [], bundleExcludeUrls: [], bundleResourceMetrics: {} },
+        prod: { bundleExtraUrls: [], bundleExcludeUrls: [], bundleResourceMetrics: {} }
+      },
       configJson: testJson,
       configJsonFileName: 'legacy-test.json',
       configJsonSync: {
@@ -141,6 +146,14 @@ test('isolates config overlays and offline bundles by environment', async (t) =>
   assert.equal(adminConfig.apps[0].configJsonEnvironments.test.configJsonSync.loginBody, '******');
   assert.equal(adminConfig.apps[0].configJsonEnvironments.test.configJsonSync.configBody, '******');
   assert.equal(adminConfig.apps[0].configJsonEnvironments.test.configJsonSync.tokenPrefix, 'Bearer ');
+  const testSummary = await requestJson(`${baseUrl}/api/admin/environment-summary?environment=test`, { headers: adminHeaders });
+  assert.equal(testSummary.environment, 'test');
+  assert.equal(testSummary.apps.length, 1);
+  assert.equal(testSummary.apps[0].offlineBundle.count, 1);
+  assert.equal(testSummary.apps[0].offlineBundle.manifestUrl, '/test/bundles/sample/manifest.json');
+  assert.equal(testSummary.apps[0].configJsonEnvironments.test.configJson, JSON.stringify({ url: 'https://example.com/app' }));
+  assert.equal(JSON.stringify(testSummary).includes('secret-value'), false);
+  assert.ok(JSON.stringify(testSummary).length < JSON.stringify(adminConfig).length);
   const fifaApp = {
     id: 'app_fifaworldcup',
     name: 'FIFA World Cup 2026',

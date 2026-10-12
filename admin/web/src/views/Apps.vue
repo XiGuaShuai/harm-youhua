@@ -266,7 +266,11 @@ async function loadBundles() {
   const sequence = ++bundleLoadSequence;
   try {
     if (managedEnvironmentView.value) {
-      await loadTestBundleManifests(sequence);
+      const next = {};
+      environmentApps.value.forEach((app) => {
+        if (app?.offlineBundle?.builtAt) next[app.id] = app.offlineBundle;
+      });
+      if (sequence === bundleLoadSequence) bundleMap.value = next;
       return;
     }
     const environments = pathShowsAll
@@ -287,6 +291,11 @@ async function loadBundles() {
   } catch (e) {
     if (sequence === bundleLoadSequence) ElMessage.warning('离线资源状态刷新失败');
   }
+}
+
+async function refreshStatus() {
+  if (managedEnvironmentView.value) await store.load();
+  await loadBundles();
 }
 
 function scheduleBundleLoad(delay = 120) {
@@ -1016,7 +1025,7 @@ async function syncConfigJson(row) {
           </el-radio-button>
         </el-radio-group>
         <el-input v-model="appQuery" class="search-input" clearable :prefix-icon="Search" placeholder="搜索 ID / 名称 / URL" />
-        <el-button :icon="Refresh" @click="loadBundles">刷新状态</el-button>
+        <el-button :icon="Refresh" @click="refreshStatus">刷新状态</el-button>
         <el-button v-if="!managedEnvironmentView" type="primary" :icon="Plus" @click="openAdd">新增网址</el-button>
       </div>
     </div>
@@ -1137,7 +1146,6 @@ async function syncConfigJson(row) {
                 />
                 <el-tag v-else size="small" type="info" effect="plain">未配置</el-tag>
               </div>
-              <el-button type="primary" plain :icon="Box" @click="openBundle(row)">查看离线资源</el-button>
             </div>
           </article>
         </div>

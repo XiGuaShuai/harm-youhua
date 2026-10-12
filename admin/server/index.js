@@ -46,6 +46,8 @@ const FETCH_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (
 const IMPORT_TIMEOUT_MS = 60 * 1000;
 // 可选「主令牌」:仅当显式设置 ADMIN_TOKEN 时生效(给脚本/CI 用),默认不开,走账号密码登录
 const MASTER_TOKEN = process.env.ADMIN_TOKEN || '';
+// 仅供本机交互演示。即使开启，也只允许环回地址免登录，远程请求仍需正常鉴权。
+const LOCAL_DEMO_NO_AUTH = process.env.LOCAL_DEMO_NO_AUTH === '1';
 // 对外集成接口使用独立令牌，不复用后台管理员会话。首版硬限制为 test 环境。
 const INTEGRATION_API_LEGACY_TOKEN = String(process.env.INTEGRATION_API_TOKEN || '');
 const INTEGRATION_API_TOKENS = {
@@ -1044,8 +1046,22 @@ function tokenOf(req) {
   return match ? decodeURIComponent(match[1]) : '';
 }
 
+function isLoopbackRequest(req) {
+  const address = String(req.socket && req.socket.remoteAddress || '');
+  return address === '127.0.0.1' || address === '::1' || address === '::ffff:127.0.0.1';
+}
+
+app.get('/api/auth-mode', (req, res) => {
+  const localDemo = LOCAL_DEMO_NO_AUTH && isLoopbackRequest(req);
+  res.json({ ok: true, required: !localDemo, localDemo });
+});
+
 // 后台鉴权:会话 token 或(显式开启的)主令牌
 function auth(req, res, next) {
+  if (LOCAL_DEMO_NO_AUTH && isLoopbackRequest(req)) {
+    req.user = 'local-demo';
+    return next();
+  }
   const t = tokenOf(req);
   if (MASTER_TOKEN && t === MASTER_TOKEN) { req.user = INITIAL_ADMIN_USER || 'token-admin'; return next(); }
   const user = sessionUser(t);
@@ -2350,6 +2366,21 @@ app.post('/api/admin/password', (req, res) => {
   res.json({ ok: true });
 });
 
+// 分环境后台只负责查看状态和控制下发开关，不应下载包含三套完整
+// configJson 的管理配置。这个接口只返回卡片渲染需要的轻量摘要。
+app.get('/api/admin/environment-summary', (req, res) => {
+  const environment = requestBundleEnvironment(req);
+  const c = loadConfig();
+  const apps = (c.apps || [])
+    .filter((appCfg) => integrationAppBelongsToEnvironment(appCfg, environment))
+    .map((appCfg) => adminEnvironmentAppSummary(appCfg, environment));
+  res.json({
+    version: c.version || '',
+    environment,
+    apps
+  });
+});
+
 app.get('/api/admin/config', (req, res) => {
   const c = loadConfig();
   const apps = (c.apps || []).map((a) => {
@@ -2529,7 +2560,7 @@ app.put('/api/admin/apps/:id/bundle-pause', (req, res) => {
     environment,
     paused: bundlePausedInEnvironment(responseApp, environment),
     enabled: bundleEnabledInEnvironment(responseApp, environment),
-    app: responseApp
+    app: adminEnvironmentAppSummary(responseApp, environment)
   });
 });
 
@@ -3311,8 +3342,74 @@ function matchesAny(url, patterns) {
   return Array.isArray(patterns) && patterns.some((p) => matchesPattern(url, p));
 }
 
+function fastBundleSummary(id, requestedEnvironment = DEFAULT_CONFIG_ENVIRONMENT) {
+  const environment = normalizeConfigEnvironment(requestedEnvironment, DEFAULT_CONFIG_ENVIRONMENT);
+  const dir = path.join(bundleRoot(environment), id);
+  const manifestFile = path.join(dir, 'manifest.json');
+  if (!fs.existsSync(manifestFile)) return null;
+  const stat = fs.statSync(manifestFile);
+  const resources = readJsonArray(manifestFile);
+  const sizeBytes = resources.reduce((sum, item) => sum + Math.max(0, Number(item && item.size || 0)), 0);
+  return {
+    id,
+    environment,
+    count: resources.length,
+    sizeBytes,
+    sizeKB: Math.round(sizeBytes / 102.4) / 10,
+    builtAt: stat.mtime,
+    manifestUrl: `/${environment}/bundles/${id}/manifest.json`
+  };
+}
+
+function adminEnvironmentAppSummary(appCfg, requestedEnvironment = DEFAULT_CONFIG_ENVIRONMENT) {
+  const environment = normalizeConfigEnvironment(requestedEnvironment, DEFAULT_CONFIG_ENVIRONMENT);
+  const app = normalizeAppConfig(appCfg);
+  const regions = app.scope === 'region'
+    ? appRegionsForEnvironment(app, environment)
+    : { ids: [], names: {} };
+  const envConfig = configJsonEnvironmentOf(app, environment);
+  const configJsonEnvironments = {
+    [environment]: {
+      // The environment page only needs a valid/empty status marker. Returning
+      // the real multi-megabyte JSON was the main reason that the page was slow.
+      configJson: envConfig.configJson ? JSON.stringify({ url: app.url }) : '',
+      configJsonFileName: envConfig.configJsonFileName,
+      configJsonSyncedAt: envConfig.configJsonSyncedAt,
+      configJsonSync: integrationConfigJsonSyncView(envConfig.configJsonSync)
+    }
+  };
+  return {
+    id: app.id,
+    name: app.name,
+    url: app.url,
+    scope: app.scope,
+    regions: regions.ids,
+    regionNames: regions.names,
+    region: regions.ids[0] || '',
+    regionName: regions.ids[0] ? regions.names[regions.ids[0]] || regions.ids[0] : '',
+    bundle: app.bundle === true,
+    bundleEnvironments: normalizeBundleEnvironments(app),
+    bundlePausedEnvironments: normalizeBundlePausedEnvironments(app),
+    integrationManaged: app.integrationManaged === true,
+    integrationManagedEnvironments: integrationManagedEnvironments(app),
+    configJsonEnvironments,
+    resourceRelease: integrationResourceReleaseView(app, environment),
+    offlineBundle: fastBundleSummary(app.id, environment)
+  };
+}
+
 function bundleInfo(id, appCfg, requestedEnvironment = DEFAULT_CONFIG_ENVIRONMENT) {
   const environment = normalizeConfigEnvironment(requestedEnvironment, DEFAULT_CONFIG_ENVIRONMENT);
+  // Resource metadata is partitioned by environment. Reading the legacy
+  // top-level arrays here makes an empty test manifest appear to contain
+  // pre/prod or historical URLs, and causes monitors to upload repeatedly.
+  const resourceConfig = appCfg ? integrationResourceConfig(appCfg, environment) : {
+    bundleExtraUrls: [],
+    bundleExcludeUrls: [],
+    bundleResourceMetrics: {},
+    bundleMaxSizeKB: undefined,
+    staticCache: null
+  };
   const dir = path.join(bundleRoot(environment), id);
   const mf = path.join(dir, 'manifest.json');
   if (!fs.existsSync(mf)) return null;
@@ -3326,7 +3423,7 @@ function bundleInfo(id, appCfg, requestedEnvironment = DEFAULT_CONFIG_ENVIRONMEN
   }
   const resources = [];
   const byUrl = new Set();
-  const excludes = appCfg && Array.isArray(appCfg.bundleExcludeUrls) ? appCfg.bundleExcludeUrls : [];
+  const excludes = resourceConfig.bundleExcludeUrls;
   let resourceBytes = 0;
   let compressedResourceBytes = 0;
   let compressibleBytes = 0;
@@ -3378,7 +3475,7 @@ function bundleInfo(id, appCfg, requestedEnvironment = DEFAULT_CONFIG_ENVIRONMEN
       costMs: item.costMs || 0,
       enabled: !(appCfg && matchesAny(item.url || '', excludes)),
       inManifest: true,
-      configured: appCfg && Array.isArray(appCfg.bundleExtraUrls) ? matchesAny(item.url || '', appCfg.bundleExtraUrls) : false,
+      configured: matchesAny(item.url || '', resourceConfig.bundleExtraUrls),
       compressible,
       gzipSize,
       gzipKB: gzipSize ? Math.round(gzipSize / 102.4) / 10 : 0,
@@ -3387,7 +3484,7 @@ function bundleInfo(id, appCfg, requestedEnvironment = DEFAULT_CONFIG_ENVIRONMEN
     });
   }
   const configuredUrls = [
-    ...(appCfg && Array.isArray(appCfg.bundleExtraUrls) ? appCfg.bundleExtraUrls : []),
+    ...resourceConfig.bundleExtraUrls,
     ...excludes
   ];
   for (const url of configuredUrls) {
@@ -3441,8 +3538,8 @@ function bundleInfo(id, appCfg, requestedEnvironment = DEFAULT_CONFIG_ENVIRONMEN
     compressedSizeBytes: compressedResourceBytes,
     compressedSizeKB: Math.round(compressedResourceBytes / 102.4) / 10,
     serverSizeKB: Math.round(serverBytes / 102.4) / 10,
-    bundleMaxSizeKB: appCfg && appCfg.bundleMaxSizeKB ? appCfg.bundleMaxSizeKB : 5120,
-    configuredExtraCount: appCfg && Array.isArray(appCfg.bundleExtraUrls) ? appCfg.bundleExtraUrls.length : 0,
+    bundleMaxSizeKB: resourceConfig.bundleMaxSizeKB || 5120,
+    configuredExtraCount: resourceConfig.bundleExtraUrls.length,
     builtAt: stat.mtime,
     manifestUrl: `/${environment}/bundles/${id}/manifest.json`,
     config: {
@@ -3460,10 +3557,10 @@ function bundleInfo(id, appCfg, requestedEnvironment = DEFAULT_CONFIG_ENVIRONMEN
       configJsonEnvironments: cfgJsonEnvironments,
       swrDoc: appCfg ? appCfg.swrDoc !== false : false,
       prerender: appCfg ? appCfg.prerender !== false : false,
-      bundleMaxSizeKB: appCfg && appCfg.bundleMaxSizeKB ? appCfg.bundleMaxSizeKB : 5120,
-      bundleExtraUrls: appCfg && Array.isArray(appCfg.bundleExtraUrls) ? appCfg.bundleExtraUrls : [],
-      bundleExcludeUrls: appCfg && Array.isArray(appCfg.bundleExcludeUrls) ? appCfg.bundleExcludeUrls : [],
-      staticCache: appCfg && appCfg.staticCache ? appCfg.staticCache : null
+      bundleMaxSizeKB: resourceConfig.bundleMaxSizeKB || 5120,
+      bundleExtraUrls: resourceConfig.bundleExtraUrls,
+      bundleExcludeUrls: resourceConfig.bundleExcludeUrls,
+      staticCache: resourceConfig.staticCache
     },
     compression: {
       compressibleKB: Math.round(compressibleBytes / 102.4) / 10,
@@ -4022,6 +4119,7 @@ app.listen(PORT, () => {
   console.log(`  离线包托管:      http://localhost:${PORT}/bundles/<id>/manifest.json`);
   console.log(`  JSON同步状态页:  http://localhost:${PORT}/config-json-sync.html`);
   console.log('  后台登录:        账号文件已加载;首次启动必须设置 ADMIN_USER/ADMIN_PASS');
+  if (LOCAL_DEMO_NO_AUTH) console.log('  本地演示:        环回地址免登录（LOCAL_DEMO_NO_AUTH=1）');
   if (MASTER_TOKEN) console.log(`  主令牌已开启:    X-Admin-Token: <ADMIN_TOKEN>(脚本用)`);
   if (process.env.DISABLE_SCHEDULERS !== '1') {
     persistRepairedRegionNames();

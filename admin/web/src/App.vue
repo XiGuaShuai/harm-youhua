@@ -17,7 +17,7 @@ const router = useRouter();
 const store = useConfigStore();
 const auth = useAuthStore();
 const { version } = storeToRefs(store);
-const { authed, username } = storeToRefs(auth);
+const { authed, username, ready: authReady, localDemo } = storeToRefs(auth);
 
 const pwDialog = ref(false);
 const pathLocked = adminViewLocked();
@@ -25,14 +25,17 @@ const pathShowsAll = adminShowsAll();
 const pathEnvName = environmentLabel(defaultViewEnvironment());
 const environmentView = pathLocked;
 
-const menus = [
+const allMenus = [
   { path: '/dashboard', title: '概览', icon: Odometer },
   { path: '/apps', title: '应用管理', icon: Grid },
   { path: '/config-json', title: '更新 JSON', icon: Document },
   { path: '/blocklist', title: '过滤黑名单', icon: CircleClose },
   { path: '/bundles', title: '离线包', icon: Box },
   { path: '/settings', title: '全局设置', icon: Setting }
-].filter((item) => !(environmentView && item.path === '/settings'));
+];
+const menus = environmentView
+  ? allMenus.filter((item) => item.path === '/apps')
+  : allMenus;
 
 const pageTitle = computed(() => environmentView && route.path === '/config-json' ? '更新 JSON' : route.meta.title);
 const pageDescription = computed(() => environmentView && route.path === '/config-json'
@@ -42,7 +45,7 @@ const pageDescription = computed(() => environmentView && route.path === '/confi
 watch(
   () => route.path,
   (path) => {
-    if (environmentView && path === '/settings') router.replace('/apps');
+    if (environmentView && path !== '/apps') router.replace('/apps');
   },
   { immediate: true }
 );
@@ -50,15 +53,17 @@ watch(
 function onLoggedIn() { store.load(); }
 function logout() { auth.logout().then(() => { /* authed 变 false 自动回登录页 */ }); }
 
-onMounted(() => {
+onMounted(async () => {
   if (environmentView) document.body.classList.add('environment-admin');
+  await auth.bootstrap();
   if (authed.value) store.load();
 });
 onBeforeUnmount(() => document.body.classList.remove('environment-admin'));
 </script>
 
 <template>
-  <LoginView v-if="!authed" @done="onLoggedIn" />
+  <div v-if="!authReady"></div>
+  <LoginView v-else-if="!authed" @done="onLoggedIn" />
 
   <el-container v-else class="layout">
     <!-- 侧边栏 -->
@@ -89,7 +94,8 @@ onBeforeUnmount(() => document.body.classList.remove('environment-admin'));
           <el-tag size="small" type="info" effect="plain" round>
             配置版本 {{ version ? version.slice(0, 19).replace('T', ' ') : '-' }}
           </el-tag>
-          <el-dropdown trigger="click">
+          <el-tag v-if="localDemo" size="small" type="success" effect="plain" round>本地免登录</el-tag>
+          <el-dropdown v-else trigger="click">
             <span class="user">
               <el-avatar :size="30" class="avatar">{{ (username || 'A').charAt(0).toUpperCase() }}</el-avatar>
               <span class="uname">{{ username || 'admin' }}</span>

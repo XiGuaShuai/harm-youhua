@@ -1,6 +1,7 @@
 import { defineStore, acceptHMRUpdate } from 'pinia';
 import { ref } from 'vue';
 import api from '../api';
+import { adminViewLocked, defaultViewEnvironment } from '../adminPath';
 
 // Setup Store:管理后台配置(应用 / 黑名单 / 设置 / 版本)
 export const useConfigStore = defineStore('config', () => {
@@ -16,7 +17,9 @@ export const useConfigStore = defineStore('config', () => {
     if (loadRequest) return loadRequest;
     loading.value = true;
     loadRequest = (async () => {
-      const { data } = await api.get('/api/admin/config');
+      const { data } = adminViewLocked()
+        ? await api.get('/api/admin/environment-summary', { params: { environment: defaultViewEnvironment() } })
+        : await api.get('/api/admin/config');
       apps.value = data.apps || [];
       blockHosts.value = data.blockHosts || [];
       settings.value = { ...defaultSettings, ...(data.settings || {}) };
@@ -74,7 +77,7 @@ export const useConfigStore = defineStore('config', () => {
     });
     version.value = data.version;
     const idx = apps.value.findIndex((item) => item.id === id);
-    if (idx >= 0 && data.app) apps.value[idx] = data.app;
+    if (idx >= 0 && data.app) apps.value[idx] = { ...apps.value[idx], ...data.app };
     else await load();
     return data;
   }

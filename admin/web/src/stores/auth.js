@@ -7,7 +7,26 @@ import api from '../api';
 export const useAuthStore = defineStore('auth', () => {
   const token = ref(localStorage.getItem('admin_token') || '');
   const username = ref(localStorage.getItem('admin_user') || '');
+  const ready = ref(false);
+  const localDemo = ref(false);
   const authed = computed(() => !!token.value);
+
+  async function bootstrap() {
+    try {
+      const { data } = await axios.get('/api/auth-mode');
+      localDemo.value = data.localDemo === true;
+      if (localDemo.value) {
+        token.value = 'local-demo';
+        username.value = '本地演示';
+        localStorage.setItem('admin_token', token.value);
+        localStorage.setItem('admin_user', username.value);
+      }
+    } catch {
+      localDemo.value = false;
+    } finally {
+      ready.value = true;
+    }
+  }
 
   async function login(u, p) {
     const { data } = await axios.post('/api/login', { username: u, password: p });
@@ -30,7 +49,7 @@ export const useAuthStore = defineStore('auth', () => {
     await api.post('/api/admin/password', { oldPassword, newPassword });
   }
 
-  return { token, username, authed, login, logout, changePassword };
+  return { token, username, ready, localDemo, authed, bootstrap, login, logout, changePassword };
 });
 
 if (import.meta.hot) {
