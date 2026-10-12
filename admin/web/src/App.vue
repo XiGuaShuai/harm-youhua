@@ -1,6 +1,6 @@
 <script setup>
-import { computed, ref, onBeforeUnmount, onMounted } from 'vue';
-import { useRoute } from 'vue-router';
+import { computed, ref, onBeforeUnmount, onMounted, watch } from 'vue';
+import { useRoute, useRouter } from 'vue-router';
 import { storeToRefs } from 'pinia';
 import {
   Odometer, Grid, Document, CircleClose, Box, Setting,
@@ -13,6 +13,7 @@ import LoginView from './components/LoginView.vue';
 import ChangePassword from './components/ChangePassword.vue';
 
 const route = useRoute();
+const router = useRouter();
 const store = useConfigStore();
 const auth = useAuthStore();
 const { version } = storeToRefs(store);
@@ -33,13 +34,21 @@ const allMenus = [
   { path: '/settings', title: '全局设置', icon: Setting }
 ];
 const menus = environmentView
-  ? allMenus.filter((item) => item.path !== '/settings')
+  ? allMenus.filter((item) => item.path === '/apps')
   : allMenus;
 
 const pageTitle = computed(() => environmentView && route.path === '/config-json' ? '更新 JSON' : route.meta.title);
 const pageDescription = computed(() => environmentView && route.path === '/config-json'
   ? `通过已配置账号和接口更新${pathEnvName}环境应用 JSON，并同步覆盖应用关联的全部地区`
   : route.meta.desc);
+
+watch(
+  () => route.path,
+  (path) => {
+    if (environmentView && path !== '/apps') router.replace('/apps');
+  },
+  { immediate: true }
+);
 
 function onLoggedIn() { store.load(); }
 function logout() { auth.logout().then(() => { /* authed 变 false 自动回登录页 */ }); }
